@@ -6209,7 +6209,15 @@ private struct RPCSliderControlRow: View {
     @State private var didMoveSliderDuringEditing = false
     @State private var lastSentAt = Date.distantPast
     @State private var pendingSendWorkItem: DispatchWorkItem?
+    @State private var minimumDraftText = ""
+    @State private var maximumDraftText = ""
     @FocusState private var isValueFieldFocused: Bool
+    @FocusState private var focusedBoundsField: BoundsField?
+
+    private enum BoundsField {
+        case minimum
+        case maximum
+    }
     private let sliderBoundFieldWidth: CGFloat = 76
     private let sliderValueFieldWidth: CGFloat = 118
 
@@ -6239,11 +6247,13 @@ private struct RPCSliderControlRow: View {
                     .frame(maxWidth: .infinity)
 
                 HStack(spacing: 0) {
-                    TextField("Min", value: minimumBinding, format: .number)
+                    TextField("Min", text: $minimumDraftText)
                         .textFieldStyle(.roundedBorder)
                         .multilineTextAlignment(.trailing)
                         .monospacedDigit()
                         .frame(width: sliderBoundFieldWidth)
+                        .focused($focusedBoundsField, equals: .minimum)
+                        .onSubmit(commitMinimumDraft)
                         .help("Minimum slider value")
 
                     Spacer(minLength: 8)
@@ -6253,11 +6263,13 @@ private struct RPCSliderControlRow: View {
 
                     Spacer(minLength: 8)
 
-                    TextField("Max", value: maximumBinding, format: .number)
+                    TextField("Max", text: $maximumDraftText)
                         .textFieldStyle(.roundedBorder)
                         .multilineTextAlignment(.trailing)
                         .monospacedDigit()
                         .frame(width: sliderBoundFieldWidth)
+                        .focused($focusedBoundsField, equals: .maximum)
+                        .onSubmit(commitMaximumDraft)
                         .help("Maximum slider value")
                 }
             }
@@ -6266,6 +6278,7 @@ private struct RPCSliderControlRow: View {
                 observedRPCValueRevision = bridge.rpcValueRevision(id: rpc.id)
                 refreshMaximumRPC()
                 syncValueDraft(for: rpc, force: true)
+                syncBoundsDrafts()
             }
             .onDisappear {
                 pendingSendWorkItem?.cancel()
@@ -6274,6 +6287,18 @@ private struct RPCSliderControlRow: View {
                 guard oldValue, !newValue else { return }
                 updateValueDraftIfChanged(for: latestRPC(fallback: rpc))
             }
+            .onChange(of: focusedBoundsField) { oldValue, newValue in
+                // Commit on focus loss; never coerce mid-edit.
+                if oldValue == .minimum, newValue != .minimum {
+                    commitMinimumDraft()
+                }
+                if oldValue == .maximum, newValue != .maximum {
+                    commitMaximumDraft()
+                }
+            }
+            .onChange(of: slider) { _, _ in
+                syncBoundsDrafts()
+            }
             .onChange(of: rpc.value) { _, newValue in
                 if newValue != nil {
                     syncValueDraft(for: latestRPC(fallback: rpc))
@@ -6281,6 +6306,9 @@ private struct RPCSliderControlRow: View {
             }
             .onChange(of: bridge.rpcValueChangeToken) { _, _ in
                 syncValueDraftIfRPCValueChanged()
+                // The slider maximum can follow a device-reported `<name>.max`
+                // RPC; refresh the Max draft when that value arrives.
+                syncBoundsDrafts()
             }
             .onChange(of: rpcFloatPrecisionPPM) { _, _ in
                 let latest = latestRPC(fallback: rpc)
@@ -6335,28 +6363,52 @@ private struct RPCSliderControlRow: View {
             .help("Setting value")
     }
 
-    private var minimumBinding: Binding<Double> {
-        Binding(
-            get: { slider.minimum },
-            set: { value in
-                let minimum = value.isFinite ? value : slider.minimum
-                slider.minimum = minimum
-                if effectiveMaximum <= minimum {
-                    slider.maximum = minimum + 1
-                    slider.maximumEdited = true
-                }
-            }
-        )
+    /// Refresh both bounds drafts from the model, leaving whichever field the
+    /// user is actively editing untouched so external updates (or the other
+    /// field's coercion) never rewrite text mid-edit.
+    private func syncBoundsDrafts() {
+        if focusedBoundsField != .minimum {
+            minimumDraftText = formatBoundsValue(slider.minimum)
+        }
+        if focusedBoundsField != .maximum {
+            maximumDraftText = formatBoundsValue(effectiveMaximum)
+        }
     }
 
-    private var maximumBinding: Binding<Double> {
-        Binding(
-            get: { effectiveMaximum },
-            set: { value in
-                slider.maximum = value.isFinite ? value : effectiveMaximum
-                slider.maximumEdited = true
-            }
-        )
+    private func commitMinimumDraft() {
+        defer { syncBoundsDrafts() }
+        guard let value = parseBoundsValue(minimumDraftText), value.isFinite else {
+            minimumDraftText = formatBoundsValue(slider.minimum)
+            return
+        }
+        slider.minimum = value
+        if effectiveMaximum <= value {
+            slider.maximum = value + 1
+            slider.maximumEdited = true
+        }
+    }
+
+    private func commitMaximumDraft() {
+        defer { syncBoundsDrafts() }
+        guard let value = parseBoundsValue(maximumDraftText), value.isFinite else {
+            maximumDraftText = formatBoundsValue(effectiveMaximum)
+            return
+        }
+        slider.maximum = value
+        slider.maximumEdited = true
+    }
+
+    private func formatBoundsValue(_ value: Double) -> String {
+        value.formatted(.number.grouping(.never))
+    }
+
+    private func parseBoundsValue(_ text: String) -> Double? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let value = try? Double(trimmed, format: .number) {
+            return value
+        }
+        return Double(trimmed)
     }
 
     private var effectiveMaximum: Double {
