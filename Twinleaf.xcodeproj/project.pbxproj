@@ -1,0 +1,721 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A00000000000000000000511 /* Sources/Twinleaf/TwinleafApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000411 /* Sources/Twinleaf/TwinleafApp.swift */; };
+		A00000000000000000000512 /* Sources/Twinleaf/MainWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000412 /* Sources/Twinleaf/MainWindow.swift */; };
+		A00000000000000000000513 /* Sources/Twinleaf/TioLogDocument.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000413 /* Sources/Twinleaf/TioLogDocument.swift */; };
+		A00000000000000000000514 /* Sources/Twinleaf/Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000414 /* Sources/Twinleaf/Models.swift */; };
+		A00000000000000000000515 /* Sources/Twinleaf/PlotCanvas.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000415 /* Sources/Twinleaf/PlotCanvas.swift */; };
+		A00000000000000000000516 /* Sources/Twinleaf/NumericDisplayPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000416 /* Sources/Twinleaf/NumericDisplayPolicy.swift */; };
+		A00000000000000000000517 /* Sources/Twinleaf/TwinleafCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000417 /* Sources/Twinleaf/TwinleafCommands.swift */; };
+		A00000000000000000000518 /* Sources/Twinleaf/BridgeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000418 /* Sources/Twinleaf/BridgeClient.swift */; };
+		A00000000000000000000519 /* Sources/Twinleaf/RustRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000419 /* Sources/Twinleaf/RustRuntime.swift */; };
+		A00000000000000000000520 /* Sources/Twinleaf/TwinleafSceneActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000420 /* Sources/Twinleaf/TwinleafSceneActions.swift */; };
+		A00000000000000000000521 /* Sources/Twinleaf/BridgeSessionRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000421 /* Sources/Twinleaf/BridgeSessionRegistry.swift */; };
+		A00000000000000000000531 /* Sources/Twinleaf/Resources/Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000431 /* Sources/Twinleaf/Resources/Assets.xcassets */; };
+		A00000000000000000000533 /* Sources/Twinleaf/Resources/TwinleafApp.icns in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000433 /* Sources/Twinleaf/Resources/TwinleafApp.icns */; platformFilters = (macos, ); };
+		A00000000000000000000534 /* Sources/Twinleaf/Resources/TwinleafDocument.icns in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000434 /* Sources/Twinleaf/Resources/TwinleafDocument.icns */; platformFilters = (macos, ); };
+		A00000000000000000000540 /* Sources/TwinleafQuickLook/PreviewProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000422 /* Sources/TwinleafQuickLook/PreviewProvider.swift */; };
+		A00000000000000000000541 /* TwinleafQuickLook.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = A00000000000000000000203 /* TwinleafQuickLook.appex */; platformFilters = (macos, ); settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A00000000000000000000113 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A00000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A00000000000000000000103;
+			remoteInfo = TwinleafQuickLook;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A00000000000000000000309 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				A00000000000000000000541 /* TwinleafQuickLook.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		A00000000000000000000201 /* Twinleaf.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Twinleaf.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000203 /* TwinleafQuickLook.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = TwinleafQuickLook.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000401 /* Package.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Package.swift; sourceTree = "<group>"; };
+		A00000000000000000000402 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		A00000000000000000000411 /* Sources/Twinleaf/TwinleafApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/TwinleafApp.swift; sourceTree = "<group>"; };
+		A00000000000000000000412 /* Sources/Twinleaf/MainWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/MainWindow.swift; sourceTree = "<group>"; };
+		A00000000000000000000413 /* Sources/Twinleaf/TioLogDocument.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/TioLogDocument.swift; sourceTree = "<group>"; };
+		A00000000000000000000414 /* Sources/Twinleaf/Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/Models.swift; sourceTree = "<group>"; };
+		A00000000000000000000415 /* Sources/Twinleaf/PlotCanvas.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/PlotCanvas.swift; sourceTree = "<group>"; };
+		A00000000000000000000416 /* Sources/Twinleaf/NumericDisplayPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/NumericDisplayPolicy.swift; sourceTree = "<group>"; };
+		A00000000000000000000417 /* Sources/Twinleaf/TwinleafCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/TwinleafCommands.swift; sourceTree = "<group>"; };
+		A00000000000000000000418 /* Sources/Twinleaf/BridgeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/BridgeClient.swift; sourceTree = "<group>"; };
+		A00000000000000000000419 /* Sources/Twinleaf/RustRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/RustRuntime.swift; sourceTree = "<group>"; };
+		A00000000000000000000420 /* Sources/Twinleaf/TwinleafSceneActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/TwinleafSceneActions.swift; sourceTree = "<group>"; };
+		A00000000000000000000421 /* Sources/Twinleaf/BridgeSessionRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/BridgeSessionRegistry.swift; sourceTree = "<group>"; };
+		A00000000000000000000422 /* Sources/TwinleafQuickLook/PreviewProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/TwinleafQuickLook/PreviewProvider.swift; sourceTree = "<group>"; };
+		A00000000000000000000431 /* Sources/Twinleaf/Resources/Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Sources/Twinleaf/Resources/Assets.xcassets; sourceTree = "<group>"; };
+		A00000000000000000000433 /* Sources/Twinleaf/Resources/TwinleafApp.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = Sources/Twinleaf/Resources/TwinleafApp.icns; sourceTree = "<group>"; };
+		A00000000000000000000434 /* Sources/Twinleaf/Resources/TwinleafDocument.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = Sources/Twinleaf/Resources/TwinleafDocument.icns; sourceTree = "<group>"; };
+		A00000000000000000000441 /* Packaging/Twinleaf-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Packaging/Twinleaf-Info.plist"; sourceTree = "<group>"; };
+		A00000000000000000000442 /* Packaging/TwinleafPad-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Packaging/TwinleafPad-Info.plist"; sourceTree = "<group>"; };
+		A00000000000000000000443 /* Packaging/TwinleafQuickLook-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Packaging/TwinleafQuickLook-Info.plist"; sourceTree = "<group>"; };
+		A00000000000000000000444 /* Packaging/TwinleafQuickLook.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Packaging/TwinleafQuickLook.entitlements; sourceTree = "<group>"; };
+		A00000000000000000000451 /* scripts/xcode-build-rust.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "scripts/xcode-build-rust.sh"; sourceTree = "<group>"; };
+		A00000000000000000000452 /* scripts/build-ios-rust.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "scripts/build-ios-rust.sh"; sourceTree = "<group>"; };
+		A00000000000000000000461 /* rust/tio-bridge/Cargo.toml */ = {isa = PBXFileReference; lastKnownFileType = text; path = "rust/tio-bridge/Cargo.toml"; sourceTree = "<group>"; };
+		A00000000000000000000462 /* rust/tio-bridge/Cargo.lock */ = {isa = PBXFileReference; lastKnownFileType = text; path = "rust/tio-bridge/Cargo.lock"; sourceTree = "<group>"; };
+		A00000000000000000000463 /* rust/tio-bridge/src/lib.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = "rust/tio-bridge/src/lib.rs"; sourceTree = "<group>"; };
+		A00000000000000000000464 /* rust/tio-bridge/src/main.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = "rust/tio-bridge/src/main.rs"; sourceTree = "<group>"; };
+		A00000000000000000000465 /* vendor/twinleaf-rust */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "vendor/twinleaf-rust"; sourceTree = "<group>"; };
+		A00000000000000000000466 /* rust/tio-bridge/include/twinleaf_core.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "rust/tio-bridge/include/twinleaf_core.h"; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A00000000000000000000303 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A0000000000000000000030A /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A00000000000000000000002 = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000401 /* Package.swift */,
+				A00000000000000000000402 /* README.md */,
+				A00000000000000000000004 /* Sources */,
+				A00000000000000000000007 /* Packaging */,
+				A00000000000000000000008 /* Scripts */,
+				A00000000000000000000009 /* Rust */,
+				A00000000000000000000003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A00000000000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000201 /* Twinleaf.app */,
+				A00000000000000000000203 /* TwinleafQuickLook.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000004 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000005 /* Twinleaf */,
+				A0000000000000000000000D /* TwinleafQuickLook */,
+			);
+			name = Sources;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000005 /* Twinleaf */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000411 /* Sources/Twinleaf/TwinleafApp.swift */,
+				A00000000000000000000412 /* Sources/Twinleaf/MainWindow.swift */,
+				A00000000000000000000413 /* Sources/Twinleaf/TioLogDocument.swift */,
+				A00000000000000000000414 /* Sources/Twinleaf/Models.swift */,
+				A00000000000000000000415 /* Sources/Twinleaf/PlotCanvas.swift */,
+				A00000000000000000000416 /* Sources/Twinleaf/NumericDisplayPolicy.swift */,
+				A00000000000000000000417 /* Sources/Twinleaf/TwinleafCommands.swift */,
+				A00000000000000000000420 /* Sources/Twinleaf/TwinleafSceneActions.swift */,
+				A00000000000000000000421 /* Sources/Twinleaf/BridgeSessionRegistry.swift */,
+				A00000000000000000000418 /* Sources/Twinleaf/BridgeClient.swift */,
+				A00000000000000000000419 /* Sources/Twinleaf/RustRuntime.swift */,
+				A0000000000000000000000C /* Resources */,
+			);
+			name = Twinleaf;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000007 /* Packaging */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000441 /* Packaging/Twinleaf-Info.plist */,
+				A00000000000000000000442 /* Packaging/TwinleafPad-Info.plist */,
+				A00000000000000000000443 /* Packaging/TwinleafQuickLook-Info.plist */,
+				A00000000000000000000444 /* Packaging/TwinleafQuickLook.entitlements */,
+			);
+			name = Packaging;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000008 /* Scripts */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000451 /* scripts/xcode-build-rust.sh */,
+				A00000000000000000000452 /* scripts/build-ios-rust.sh */,
+			);
+			name = Scripts;
+			sourceTree = "<group>";
+		};
+		A00000000000000000000009 /* Rust */ = {
+			isa = PBXGroup;
+			children = (
+				A0000000000000000000000A /* tio-bridge */,
+				A00000000000000000000465 /* vendor/twinleaf-rust */,
+			);
+			name = Rust;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000000A /* tio-bridge */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000461 /* rust/tio-bridge/Cargo.toml */,
+				A00000000000000000000462 /* rust/tio-bridge/Cargo.lock */,
+				A00000000000000000000466 /* rust/tio-bridge/include/twinleaf_core.h */,
+				A0000000000000000000000B /* src */,
+			);
+			name = "tio-bridge";
+			sourceTree = "<group>";
+		};
+		A0000000000000000000000B /* src */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000463 /* rust/tio-bridge/src/lib.rs */,
+				A00000000000000000000464 /* rust/tio-bridge/src/main.rs */,
+			);
+			name = src;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000000C /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000431 /* Sources/Twinleaf/Resources/Assets.xcassets */,
+				A00000000000000000000433 /* Sources/Twinleaf/Resources/TwinleafApp.icns */,
+				A00000000000000000000434 /* Sources/Twinleaf/Resources/TwinleafDocument.icns */,
+			);
+			name = Resources;
+			sourceTree = "<group>";
+		};
+		A0000000000000000000000D /* TwinleafQuickLook */ = {
+			isa = PBXGroup;
+			children = (
+				A00000000000000000000422 /* Sources/TwinleafQuickLook/PreviewProvider.swift */,
+			);
+			name = TwinleafQuickLook;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A00000000000000000000101 /* Twinleaf */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A00000000000000000000610 /* Build configuration list for PBXNativeTarget "Twinleaf" */;
+			buildPhases = (
+				A00000000000000000000304 /* Build Rust Core */,
+				A00000000000000000000301 /* Sources */,
+				A00000000000000000000303 /* Frameworks */,
+				A00000000000000000000302 /* Resources */,
+				A00000000000000000000309 /* Embed App Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A00000000000000000000112 /* PBXTargetDependency */,
+			);
+			name = Twinleaf;
+			productName = Twinleaf;
+			productReference = A00000000000000000000201 /* Twinleaf.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A00000000000000000000103 /* TwinleafQuickLook */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A00000000000000000000630 /* Build configuration list for PBXNativeTarget "TwinleafQuickLook" */;
+			buildPhases = (
+				A0000000000000000000030B /* Sources */,
+				A0000000000000000000030A /* Frameworks */,
+				A0000000000000000000030C /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = TwinleafQuickLook;
+			productName = TwinleafQuickLook;
+			productReference = A00000000000000000000203 /* TwinleafQuickLook.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A00000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2640;
+				LastUpgradeCheck = 2640;
+				TargetAttributes = {
+					A00000000000000000000101 = {
+						CreatedOnToolsVersion = 26.4.1;
+					};
+					A00000000000000000000103 = {
+						CreatedOnToolsVersion = 26.4.1;
+					};
+				};
+			};
+			buildConfigurationList = A00000000000000000000600 /* Build configuration list for PBXProject "Twinleaf" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A00000000000000000000002;
+			productRefGroup = A00000000000000000000003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A00000000000000000000101 /* Twinleaf */,
+				A00000000000000000000103 /* TwinleafQuickLook */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A00000000000000000000302 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000531 /* Sources/Twinleaf/Resources/Assets.xcassets in Resources */,
+				A00000000000000000000533 /* Sources/Twinleaf/Resources/TwinleafApp.icns in Resources */,
+				A00000000000000000000534 /* Sources/Twinleaf/Resources/TwinleafDocument.icns in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A0000000000000000000030C /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A00000000000000000000304 /* Build Rust Core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Core";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -euo pipefail\ncase \"${SDK_NAME:-}\" in\n\tmacosx*)\n\t\t\"${SRCROOT}/scripts/xcode-build-rust.sh\"\n\t\t;;\n\tiphoneos*|iphonesimulator*)\n\t\tIOS_RUST_MODE=staticlib \"${SRCROOT}/scripts/build-ios-rust.sh\" \"${CONFIGURATION}\"\n\t\t;;\n\t*)\n\t\techo \"error: unsupported SDK_NAME for Rust build: ${SDK_NAME:-unknown}\" >&2\n\t\texit 64\n\t\t;;\nesac\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A00000000000000000000301 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000511 /* Sources/Twinleaf/TwinleafApp.swift in Sources */,
+				A00000000000000000000512 /* Sources/Twinleaf/MainWindow.swift in Sources */,
+				A00000000000000000000513 /* Sources/Twinleaf/TioLogDocument.swift in Sources */,
+				A00000000000000000000514 /* Sources/Twinleaf/Models.swift in Sources */,
+				A00000000000000000000515 /* Sources/Twinleaf/PlotCanvas.swift in Sources */,
+				A00000000000000000000516 /* Sources/Twinleaf/NumericDisplayPolicy.swift in Sources */,
+				A00000000000000000000517 /* Sources/Twinleaf/TwinleafCommands.swift in Sources */,
+				A00000000000000000000520 /* Sources/Twinleaf/TwinleafSceneActions.swift in Sources */,
+				A00000000000000000000521 /* Sources/Twinleaf/BridgeSessionRegistry.swift in Sources */,
+				A00000000000000000000518 /* Sources/Twinleaf/BridgeClient.swift in Sources */,
+				A00000000000000000000519 /* Sources/Twinleaf/RustRuntime.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A0000000000000000000030B /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00000000000000000000540 /* Sources/TwinleafQuickLook/PreviewProvider.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A00000000000000000000112 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			platformFilters = (macos, );
+			target = A00000000000000000000103 /* TwinleafQuickLook */;
+			targetProxy = A00000000000000000000113 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		A00000000000000000000601 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		A00000000000000000000602 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		A00000000000000000000611 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 6MFC6VKTVX;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "Packaging/Twinleaf-Info.plist";
+				"INFOPLIST_FILE[sdk=iphoneos*]" = "Packaging/TwinleafPad-Info.plist";
+				"INFOPLIST_FILE[sdk=iphonesimulator*]" = "Packaging/TwinleafPad-Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = Twinleaf;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				"LD_RUNPATH_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LD_RUNPATH_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-ltwinleaf_core",
+					"-framework",
+					IOKit,
+				);
+				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"-ltwinleaf_core",
+					"-framework",
+					IOKit,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.twinleaf.Twinleaf;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphoneos*]" = com.twinleaf.TwinleafPad;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphonesimulator*]" = com.twinleaf.TwinleafPad;
+				PRODUCT_NAME = Twinleaf;
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SDKROOT = auto;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphoneos*]" = "DEBUG TWINLEAF_STATIC_RUST";
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphonesimulator*]" = "DEBUG TWINLEAF_STATIC_RUST";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A00000000000000000000612 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 6MFC6VKTVX;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "Packaging/Twinleaf-Info.plist";
+				"INFOPLIST_FILE[sdk=iphoneos*]" = "Packaging/TwinleafPad-Info.plist";
+				"INFOPLIST_FILE[sdk=iphonesimulator*]" = "Packaging/TwinleafPad-Info.plist";
+				INFOPLIST_KEY_CFBundleDisplayName = Twinleaf;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				"LD_RUNPATH_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LD_RUNPATH_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)",
+				);
+				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-ltwinleaf_core",
+					"-framework",
+					IOKit,
+				);
+				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"-ltwinleaf_core",
+					"-framework",
+					IOKit,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.twinleaf.Twinleaf;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphoneos*]" = com.twinleaf.TwinleafPad;
+				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphonesimulator*]" = com.twinleaf.TwinleafPad;
+				PRODUCT_NAME = Twinleaf;
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SDKROOT = auto;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = YES;
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphoneos*]" = TWINLEAF_STATIC_RUST;
+				"SWIFT_ACTIVE_COMPILATION_CONDITIONS[sdk=iphonesimulator*]" = TWINLEAF_STATIC_RUST;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		A00000000000000000000631 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = Packaging/TwinleafQuickLook.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 6MFC6VKTVX;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "Packaging/TwinleafQuickLook-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.twinleaf.Twinleaf.QuickLook;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		A00000000000000000000632 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = Packaging/TwinleafQuickLook.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 6MFC6VKTVX;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "Packaging/TwinleafQuickLook-Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.twinleaf.Twinleaf.QuickLook;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = macosx;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A00000000000000000000600 /* Build configuration list for PBXProject "Twinleaf" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A00000000000000000000601 /* Debug */,
+				A00000000000000000000602 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A00000000000000000000610 /* Build configuration list for PBXNativeTarget "Twinleaf" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A00000000000000000000611 /* Debug */,
+				A00000000000000000000612 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A00000000000000000000630 /* Build configuration list for PBXNativeTarget "TwinleafQuickLook" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A00000000000000000000631 /* Debug */,
+				A00000000000000000000632 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A00000000000000000000001 /* Project object */;
+}

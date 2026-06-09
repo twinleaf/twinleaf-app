@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# CI for the Twinleaf app. Three jobs cover the three build surfaces:
+#   - rust:      the tio-bridge core with the same features the shipping
+#                macOS app uses (hdf5 included; cmake is preinstalled on
+#                GitHub macOS runners for the static HDF5 build)
+#   - macos-app: the SwiftPM compile of the Swift app target
+#   - ios-app:   the full Xcode build for iPad Simulator, which also
+#                cross-compiles the Rust core via scripts/build-ios-rust.sh
+#
+# macos-26 runners provide Xcode 26 / Swift 6.2, matching the project's
+# macOS 26 / iOS 26 deployment targets.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust core (build + test)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/tio-bridge
+      - name: Build
+        run: cargo build --manifest-path rust/tio-bridge/Cargo.toml --features hdf5
+      - name: Test
+        run: cargo test --manifest-path rust/tio-bridge/Cargo.toml --features hdf5
+
+  macos-app:
+    name: macOS app (swift build)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build Swift app target
+        run: swift build --build-path build/swiftpm --target Twinleaf
+
+  ios-app:
+    name: iPadOS app (xcodebuild)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/tio-bridge
+      - name: Build for iPad Simulator
+        run: |
+          xcodebuild \
+            -project Twinleaf.xcodeproj \
+            -scheme Twinleaf \
+            -destination 'generic/platform=iOS Simulator' \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            build

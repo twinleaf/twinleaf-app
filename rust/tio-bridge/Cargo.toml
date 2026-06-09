@@ -1,0 +1,25 @@
+[package]
+name = "tio-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+name = "twinleaf_core"
+crate-type = ["cdylib", "staticlib", "rlib"]
+path = "src/lib.rs"
+
+[features]
+default = ["serial", "firmware"]
+serial = ["twinleaf/serial"]
+hdf5 = ["twinleaf/hdf5"]
+# Firmware update support: lazy availability check + flashing, backed by the
+# GitHub firmware catalog (pulls in an HTTP client + TLS via twinleaf).
+firmware = ["twinleaf/firmware-update"]
+
+[dependencies]
+crossbeam = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+twinleaf = { version = "1.8", path = "../../vendor/twinleaf-rust/twinleaf", default-features = false }
+welch-sde = "0.1"
