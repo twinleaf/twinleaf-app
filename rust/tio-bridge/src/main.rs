@@ -60,6 +60,9 @@ const RPC_METADATA_RETRY_DELAY: Duration = Duration::from_millis(50);
 const CONNECTION_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECTION_METADATA_RETRY_DELAY: Duration = Duration::from_millis(500);
 const RPC_METADATA_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+/// Minimum spacing between metadata/RPC refreshes triggered by a device reset,
+/// so a device that reboots repeatedly can't keep the session busy refetching.
+const DEVICE_RESET_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
 
 type EventCallback = extern "C" fn(kind: u32, data: *const u8, len: usize, context: usize);
 
@@ -2812,6 +2815,8 @@ fn run_session(
     let mut log_time_reference_start: Option<f64> = None;
     let mut latest_stream_timestamp_by_route: HashMap<DeviceRoute, f64> = HashMap::new();
     let mut last_rpc_metadata_recovery = Instant::now();
+    let mut last_sample_number_by_stream: HashMap<(DeviceRoute, u8), u32> = HashMap::new();
+    let mut last_reset_refresh_by_route: HashMap<DeviceRoute, Instant> = HashMap::new();
 
     loop {
         let loop_start = Instant::now();
@@ -2919,7 +2924,19 @@ fn run_session(
             Ok(Ok(samples)) => {
                 loop_profile.samples = samples.len();
                 let process_start = Instant::now();
+                let mut reset_routes: HashSet<DeviceRoute> = HashSet::new();
                 for (sample, sample_route) in samples {
+                    // A sample counter that goes backward means the device
+                    // rebooted (its counter restarted). Note the route so the
+                    // stale history gets flushed after this batch.
+                    let stream_key = (sample_route.clone(), sample.stream.stream_id);
+                    if let Some(&last_n) = last_sample_number_by_stream.get(&stream_key) {
+                        if sample.n < last_n {
+                            reset_routes.insert(sample_route.clone());
+                        }
+                    }
+                    last_sample_number_by_stream.insert(stream_key, sample.n);
+
                     let sample_start = sample.timestamp_begin();
                     let sample_end = sample.timestamp_end();
                     if sample_start.is_finite() {
@@ -2952,6 +2969,41 @@ fn run_session(
                     );
                 }
                 loop_profile.process_elapsed = process_start.elapsed();
+
+                for route in reset_routes {
+                    emitter.debug(format!(
+                        "sample number went backward on {route}; treating as device reset"
+                    ));
+                    flush_route_history(&route.to_string(), &mut column_states);
+                    fft_workers.clear();
+                    // Drop baselines for the route's other streams so their
+                    // first post-reset sample doesn't re-trigger.
+                    last_sample_number_by_stream.retain(|(r, _), _| r != &route);
+
+                    let refresh_due = last_reset_refresh_by_route
+                        .get(&route)
+                        .is_none_or(|at| at.elapsed() >= DEVICE_RESET_REFRESH_COOLDOWN);
+                    if refresh_due {
+                        last_reset_refresh_by_route.insert(route.clone(), Instant::now());
+                        emitter.status(
+                            "metadata",
+                            format!("Device on {route} restarted; reloading settings"),
+                        );
+                        if refresh_route_metadata(
+                            &proxy,
+                            &url,
+                            &route,
+                            &root_route,
+                            &emitter,
+                            &mut discovery,
+                            &mut column_states,
+                            &mut rpc_index,
+                        ) {
+                            emit_metadata_devices(&emitter, &discovery.devices);
+                        }
+                        emitter.status("streaming", format!("Streaming from {url}"));
+                    }
+                }
             }
             Ok(Err(err)) => {
                 emitter.error(format!("Twinleaf stream error: {err:?}"));
@@ -3094,6 +3146,92 @@ fn emit_metadata_devices(emitter: &Emitter, devices: &[DeviceDto]) {
         "type": "metadata",
         "devices": devices
     }));
+}
+
+/// Drop all buffered plot history for a route. Used when the device resets:
+/// pre-reset points would otherwise bridge the discontinuity on screen. The
+/// FPCS state rebuilds lazily from the (now empty) raw buffer on the next
+/// sample.
+fn flush_route_history(route: &str, column_states: &mut HashMap<ColumnKeyDto, ColumnState>) {
+    for (key, state) in column_states.iter_mut() {
+        if key.route == route {
+            state.raw.clear();
+            state.fpcs_by_pane.clear();
+            state.display_value = None;
+            state.display_value_x = None;
+        }
+    }
+}
+
+/// Re-fetch stream metadata and the RPC list for a route whose device
+/// restarted, replacing its entry in the running session state. Returns true
+/// when the refreshed device was applied (the caller then re-emits `metadata`,
+/// which also prompts the app to reload all readable RPC values).
+fn refresh_route_metadata(
+    proxy: &Arc<proxy::Interface>,
+    url: &str,
+    route: &DeviceRoute,
+    root_route: &DeviceRoute,
+    emitter: &Emitter,
+    discovery: &mut DeviceDiscoveryResult,
+    column_states: &mut HashMap<ColumnKeyDto, ColumnState>,
+    rpc_index: &mut HashMap<(String, String), RpcDto>,
+) -> bool {
+    let fetched = match panic::catch_unwind(AssertUnwindSafe(|| {
+        fetch_device(proxy, url, route, emitter, false)
+    })) {
+        Ok(Ok(fetched)) => fetched,
+        Ok(Err(err)) => {
+            emitter.debug(format!("post-reset refresh of {route} failed: {err}"));
+            return false;
+        }
+        Err(err) => {
+            emitter.debug(format!(
+                "post-reset refresh of {route} panicked: {}",
+                panic_message(err)
+            ));
+            return false;
+        }
+    };
+
+    let route_str = route.to_string();
+    if fetched.rpc_metadata_complete {
+        discovery.incomplete_rpc_routes.remove(route);
+    } else {
+        discovery.incomplete_rpc_routes.insert(route.clone());
+    }
+
+    for stream in &fetched.device.streams {
+        for column in &stream.columns {
+            let label = format!(
+                "{} {}.{}",
+                fetched.device.meta.name, stream.name, column.name
+            );
+            column_states.entry(column.key.clone()).or_insert_with(|| {
+                ColumnState::new(label, column.units.clone(), stream.effective_sampling_rate)
+            });
+        }
+    }
+
+    rpc_index.retain(|(r, _), _| r != &route_str);
+    for rpc in &fetched.device.rpcs {
+        rpc_index.insert(
+            (fetched.device.route.clone(), rpc.name.clone()),
+            rpc.clone(),
+        );
+    }
+
+    if let Some(existing) = discovery
+        .devices
+        .iter_mut()
+        .find(|device| device.route == route_str)
+    {
+        *existing = fetched.device;
+    } else {
+        discovery.devices.push(fetched.device);
+        sort_devices_leaf_first(&mut discovery.devices, Some(root_route));
+    }
+    true
 }
 
 #[cfg(not(feature = "firmware"))]
