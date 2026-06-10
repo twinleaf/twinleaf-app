@@ -68,10 +68,9 @@ if [[ "$MODE" == "staticlib" && -z "${IOS_RUST_TARGETS:-}" ]]; then
 					arm64)
 						append_target aarch64-apple-ios-sim
 						;;
-					x86_64)
-						append_target x86_64-apple-ios
-						;;
 					*)
+						# Intel (x86_64) builds are not supported; the project
+						# pins ARCHS = arm64.
 						echo "error: unsupported simulator Rust arch: $arch" >&2
 						exit 64
 						;;

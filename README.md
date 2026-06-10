@@ -2,7 +2,7 @@
 
 Twinleaf is a native SwiftUI document app for plotting and logging Twinleaf sensor data.
 
-The macOS app currently targets macOS 26 or newer so it can use the latest SwiftUI app and toolbar controls. The iPad app is an active port of the same document and plotting surface.
+The macOS app currently targets macOS 26 or newer on Apple Silicon (the project builds arm64 only) so it can use the latest SwiftUI app and toolbar controls. The iPad app is an active port of the same document and plotting surface.
 
 The app links against Rust for the Twinleaf hardware boundary:
 
@@ -57,7 +57,7 @@ The `Twinleaf` Xcode scheme builds the native `Twinleaf.app` bundle for the sele
 For iPadOS, the same target runs `scripts/build-ios-rust.sh` in static-library mode. That script builds `rust/tio-bridge` with serial support disabled and firmware update support enabled, links the resulting `libtwinleaf_core.a` into the app, and supports both iPad devices and iPad simulators. Install the Rust standard libraries once before building for iPad:
 
 ```sh
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 ```
 
 The iPad app declares local-network usage because live connections use nearby Twinleaf devices or local TIO proxies.

@@ -58,6 +58,7 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
+          # The app is arm64-only (project pins ARCHS = arm64).
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@v2
         with:
