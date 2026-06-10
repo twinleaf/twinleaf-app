@@ -72,8 +72,33 @@ cp "$CORE_DYLIB" "$FRAMEWORKS_DIR/libtwinleaf_core.dylib"
 cp "$BRIDGE_TOOL" "$MACOS_DIR/tio-bridge"
 chmod +x "$FRAMEWORKS_DIR/libtwinleaf_core.dylib" "$MACOS_DIR/tio-bridge"
 
+# App Store Connect requires a dSYM for every executable in an uploaded
+# archive. Release cargo builds emit packed .dSYM bundles (Cargo.toml sets
+# split-debuginfo = "packed"); for profiles that leave debug info unpacked,
+# generate the bundle here. During Archive builds DWARF_DSYM_FOLDER_PATH
+# points inside the .xcarchive's dSYMs directory.
+ensure_dsym() {
+	local binary="$1"
+	if [[ ! -d "$binary.dSYM" ]] && command -v dsymutil >/dev/null 2>&1; then
+		dsymutil "$binary" -o "$binary.dSYM" || true
+	fi
+}
+
+ensure_dsym "$CORE_DYLIB"
+ensure_dsym "$BRIDGE_TOOL"
+
+if [[ -n "${DWARF_DSYM_FOLDER_PATH:-}" ]]; then
+	mkdir -p "$DWARF_DSYM_FOLDER_PATH"
+	for dsym in "$CORE_DYLIB.dSYM" "$BRIDGE_TOOL.dSYM"; do
+		if [[ -d "$dsym" ]]; then
+			ditto "$dsym" "$DWARF_DSYM_FOLDER_PATH/$(basename "$dsym")"
+		fi
+	done
+fi
+
 sign_rust_artifact() {
 	local path="$1"
+	local entitlements="${2:-}"
 
 	if ! command -v codesign >/dev/null 2>&1; then
 		return
@@ -94,8 +119,13 @@ sign_rust_artifact() {
 	if [[ "${ENABLE_HARDENED_RUNTIME:-NO}" == "YES" ]]; then
 		args+=(--options runtime)
 	fi
+	if [[ -n "$entitlements" ]]; then
+		args+=(--entitlements "$entitlements")
+	fi
 	codesign "${args[@]}" "$path" >/dev/null
 }
 
 sign_rust_artifact "$FRAMEWORKS_DIR/libtwinleaf_core.dylib"
-sign_rust_artifact "$MACOS_DIR/tio-bridge"
+# tio-bridge is a standalone executable in the bundle; App Store validation
+# requires it to carry the App Sandbox entitlement like the main app.
+sign_rust_artifact "$MACOS_DIR/tio-bridge" "$ROOT_DIR/Packaging/TioBridge.entitlements"

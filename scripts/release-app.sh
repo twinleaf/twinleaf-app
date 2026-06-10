@@ -14,6 +14,8 @@ SIGN_IDENTITY="${SIGN_IDENTITY:-${MACOS_SIGN_IDENTITY:-}}"
 INSTALLER_IDENTITY="${INSTALLER_SIGN_IDENTITY:-${MACOS_INSTALLER_SIGN_IDENTITY:-}}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-${TWINLEAF_NOTARY_PROFILE:-}}"
 QUICKLOOK_ENTITLEMENTS="$ROOT_DIR/Packaging/TwinleafQuickLook.entitlements"
+APP_ENTITLEMENTS="$ROOT_DIR/Packaging/Twinleaf.entitlements"
+BRIDGE_ENTITLEMENTS="$ROOT_DIR/Packaging/TioBridge.entitlements"
 BUILD_MACOS=1
 BUILD_IOS=1
 IOS_SCHEME="${IOS_SCHEME:-Twinleaf}"
@@ -532,14 +534,16 @@ QUICKLOOK_APPEX="$APP_DIR/Contents/PlugIns/TwinleafQuickLook.appex"
 [[ -f "$BRIDGE_TOOL" ]] || fail "missing Rust bridge tool: $BRIDGE_TOOL"
 [[ -d "$QUICKLOOK_APPEX" ]] || fail "Quick Look extension not found: $QUICKLOOK_APPEX"
 [[ -f "$QUICKLOOK_ENTITLEMENTS" ]] || fail "Quick Look entitlements not found: $QUICKLOOK_ENTITLEMENTS"
+[[ -f "$APP_ENTITLEMENTS" ]] || fail "app entitlements not found: $APP_ENTITLEMENTS"
+[[ -f "$BRIDGE_ENTITLEMENTS" ]] || fail "tio-bridge entitlements not found: $BRIDGE_ENTITLEMENTS"
 
 echo "Normalizing Rust dylib install name"
 install_name_tool -id "@rpath/libtwinleaf_core.dylib" "$CORE_DYLIB"
 
 sign_code "$CORE_DYLIB"
-sign_code "$BRIDGE_TOOL"
+sign_code "$BRIDGE_TOOL" --entitlements "$BRIDGE_ENTITLEMENTS"
 sign_code "$QUICKLOOK_APPEX" --entitlements "$QUICKLOOK_ENTITLEMENTS"
-sign_code "$APP_DIR"
+sign_code "$APP_DIR" --entitlements "$APP_ENTITLEMENTS"
 
 codesign --verify --strict --verbose=2 "$QUICKLOOK_APPEX"
 codesign --verify --strict --verbose=2 "$APP_DIR"
