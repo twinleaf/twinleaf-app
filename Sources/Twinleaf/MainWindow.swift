@@ -4614,6 +4614,7 @@ private struct DevicePicker: View {
     @State private var selection: AvailableDevice.ID?
     @State private var isAddingURL = false
     @State private var editingRememberedURL: String?
+    @State private var urlDraft = ""
     @AppStorage(ViewPreferenceKeys.showAllSerialPorts) private var showAllSerialPorts = true
 
     var body: some View {
@@ -4644,46 +4645,79 @@ private struct DevicePicker: View {
             .padding(.top, 16)
             .padding(.bottom, 12)
 
-            List(selection: $selection) {
-                if isAddingURL {
-                    DevicePickerURLInlineRow(
-                        title: "New Device URL",
-                        initialURL: "",
-                        commitTitle: "Add",
-                        onCommit: addRememberedURL,
-                        onCancel: cancelInlineURLEditing
+            if bridge.connectionProgress.isVisible {
+                // Once a connection attempt starts, collapse the list to the
+                // row being connected so the status panel below gets the room.
+                if let device = connectingDevice {
+                    DevicePickerRow(
+                        device: device,
+                        isSelected: true,
+                        onSelect: {},
+                        onConnect: {},
+                        onEdit: nil,
+                        onForget: {}
                     )
+                    .allowsHitTesting(false)
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 6)
                 }
 
-                ForEach(bridge.availableDevices) { device in
-                    if editingRememberedURL == device.url, device.kind == "remembered" {
+                if !bridge.connectionProgress.canCancel,
+                   !bridge.connectionProgress.isReadyToDismiss {
+                    // Terminal state (failed/cancelled): offer a way back to
+                    // the full list to pick a different device.
+                    Button {
+                        bridge.clearConnectionProgress()
+                    } label: {
+                        Label("Choose Another Device", systemImage: "chevron.left")
+                    }
+                    .twinleafDevicePickerButtonStyle()
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 6)
+                }
+
+                ConnectionProgressPanel(progress: bridge.connectionProgress)
+                    .padding(.horizontal)
+                    .padding(.bottom, 10)
+
+                Spacer(minLength: 0)
+            } else {
+                List(selection: $selection) {
+                    if isAddingURL {
                         DevicePickerURLInlineRow(
-                            title: "Edit Device URL",
-                            initialURL: device.url,
-                            commitTitle: "Save",
-                            onCommit: { updateRememberedURL(device, to: $0) },
+                            draft: $urlDraft,
+                            initialURL: "",
+                            commitTitle: "Add",
+                            routes: [],
+                            onCommit: addRememberedURL,
                             onCancel: cancelInlineURLEditing
                         )
-                    } else {
-                        DevicePickerRow(
-                            device: device,
-                            isSelected: selection == device.id,
-                            onSelect: { selection = device.id },
-                            onConnect: { connect(device) },
-                            onEdit: device.kind == "remembered" ? { startEditing(device) } : nil,
-                            onForget: { removeRememberedURL(device) }
-                        )
-                        .tag(device.id)
+                    }
+
+                    ForEach(bridge.availableDevices) { device in
+                        if editingRememberedURL == device.url, device.kind == "remembered" {
+                            DevicePickerURLInlineRow(
+                                draft: $urlDraft,
+                                initialURL: device.url,
+                                commitTitle: "Save",
+                                routes: device.routes,
+                                onCommit: { updateRememberedURL(device, to: $0) },
+                                onCancel: cancelInlineURLEditing
+                            )
+                        } else {
+                            DevicePickerRow(
+                                device: device,
+                                isSelected: selection == device.id,
+                                onSelect: { selection = device.id },
+                                onConnect: { connect(device) },
+                                onEdit: device.kind == "remembered" ? { startEditing(device) } : nil,
+                                onForget: { removeRememberedURL(device) }
+                            )
+                            .tag(device.id)
+                        }
                     }
                 }
-            }
-            .frame(minHeight: 260)
-            .disabled(bridge.connectionProgress.canCancel)
-
-            if bridge.connectionProgress.isVisible {
-                ConnectionProgressPanel(progress: bridge.connectionProgress)
-                .padding(.horizontal)
-                .padding(.bottom, 10)
+                .frame(minHeight: 260)
             }
 
             Divider()
@@ -4726,11 +4760,7 @@ private struct DevicePicker: View {
                 .keyboardShortcut(.cancelAction)
 
                 Button(bridge.connectionProgress.isReadyToDismiss ? "Connected" : "Connect") {
-                    let selected = bridge.availableDevices.first { $0.id == selection }
-                        ?? bridge.availableDevices.first
-                    if let selected {
-                        connect(selected)
-                    }
+                    connectCommittingDraft()
                 }
                 .twinleafDevicePickerButtonStyle(.primary)
                 .keyboardShortcut(.defaultAction)
@@ -4771,11 +4801,30 @@ private struct DevicePicker: View {
         .twinleafOnExitCommand {
             cancelOrDismiss()
         }
+        .animation(.easeInOut(duration: 0.18), value: bridge.connectionProgress.isVisible)
+    }
+
+    /// The device the in-flight (or just-finished) connection attempt targets,
+    /// for the collapsed single-row display. Falls back to a synthesized entry
+    /// from the progress fields if the device list no longer contains the URL.
+    private var connectingDevice: AvailableDevice? {
+        let progress = bridge.connectionProgress
+        if let device = bridge.availableDevices.first(where: { $0.url == progress.deviceURL }) {
+            return device
+        }
+        guard !progress.deviceURL.isEmpty else { return nil }
+        return AvailableDevice(
+            url: progress.deviceURL,
+            label: progress.deviceLabel.isEmpty ? progress.deviceURL : progress.deviceLabel,
+            kind: progress.deviceKind,
+            detail: progress.deviceURL
+        )
     }
 
     private func startAddingURL() {
         editingRememberedURL = nil
         isAddingURL = true
+        urlDraft = ""
         selection = nil
     }
 
@@ -4783,7 +4832,9 @@ private struct DevicePicker: View {
         guard device.kind == "remembered" else { return }
         isAddingURL = false
         editingRememberedURL = device.url
-        selection = device.id
+        urlDraft = device.url
+        // Deliberately not changing `selection` here: a selection change makes
+        // the List scroll the row into a new position, clipping the row top.
     }
 
     private func cancelInlineURLEditing() {
@@ -4794,6 +4845,33 @@ private struct DevicePicker: View {
     private func connect(_ device: AvailableDevice) {
         bridge.debugDevicePicker("connect url=\(device.url) kind=\(device.kind)")
         bridge.connect(to: device, logURL: loggingEnabled ? temporaryLogURL : nil)
+    }
+
+    /// Footer Connect button: if a URL is being added or edited, commit the
+    /// draft first and connect to what was typed; otherwise connect to the
+    /// selection.
+    private func connectCommittingDraft() {
+        let trimmed = urlDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if isAddingURL || editingRememberedURL != nil, !trimmed.isEmpty {
+            if let editingURL = editingRememberedURL,
+               let device = bridge.availableDevices.first(where: { $0.url == editingURL }) {
+                updateRememberedURL(device, to: trimmed)
+            } else {
+                addRememberedURL(trimmed)
+            }
+            let target = bridge.availableDevices.first { $0.url == trimmed }
+                ?? AvailableDevice(url: trimmed, label: trimmed, kind: "remembered", detail: trimmed)
+            selection = target.id
+            connect(target)
+            return
+        }
+
+        cancelInlineURLEditing()
+        let selected = bridge.availableDevices.first { $0.id == selection }
+            ?? bridge.availableDevices.first
+        if let selected {
+            connect(selected)
+        }
     }
 
     private func cancelOrDismiss() {
@@ -5138,41 +5216,28 @@ private struct ConnectionProgressRow: View {
 }
 
 private struct DevicePickerURLInlineRow: View {
-    let title: String
+    @Binding var draft: String
     let initialURL: String
     let commitTitle: String
+    let routes: [AvailableDeviceRoute]
     let onCommit: (String) -> Void
     let onCancel: () -> Void
 
     @FocusState private var isURLFieldFocused: Bool
-    @State private var draft: String
-
-    init(
-        title: String,
-        initialURL: String,
-        commitTitle: String,
-        onCommit: @escaping (String) -> Void,
-        onCancel: @escaping () -> Void
-    ) {
-        self.title = title
-        self.initialURL = initialURL
-        self.commitTitle = commitTitle
-        self.onCommit = onCommit
-        self.onCancel = onCancel
-        _draft = State(initialValue: initialURL)
-    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(title)
-                    .font(.headline)
-
+            VStack(alignment: .leading, spacing: 4) {
                 TextField("tcp://localhost", text: $draft)
                     .textFieldStyle(.roundedBorder)
                     .twinleafDeviceURLTextInput()
                     .focused($isURLFieldFocused)
                     .onSubmit(commit)
+
+                if !routes.isEmpty {
+                    DeviceRouteList(routes: routes)
+                        .padding(.top, 2)
+                }
             }
 
             Spacer(minLength: 8)
@@ -5205,9 +5270,6 @@ private struct DevicePickerURLInlineRow: View {
                 isURLFieldFocused = true
             }
         }
-        .onChange(of: initialURL) { _, newURL in
-            draft = newURL
-        }
     }
 
     private var trimmedDraft: String {
@@ -5231,13 +5293,20 @@ private struct DevicePickerRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(device.label)
-                    .font(.headline)
-                Text(device.url)
-                    .font(.callout.monospaced())
-                Text(device.detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if device.kind == "remembered" {
+                    // Remembered entries are just URLs: show the URL as the
+                    // primary line, with known connected devices below.
+                    Text(device.url)
+                        .font(.callout.monospaced().weight(.semibold))
+                } else {
+                    Text(device.label)
+                        .font(.headline)
+                    Text(device.url)
+                        .font(.callout.monospaced())
+                    Text(device.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 if !device.routes.isEmpty {
                     DeviceRouteList(routes: device.routes)
                         .padding(.top, 2)
