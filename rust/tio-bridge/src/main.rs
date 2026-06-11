@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use twinleaf::data::{DeviceDataParser, DeviceFullMetadata, Sample};
 use twinleaf::device::capture::{read_capture, CaptureReadout, CaptureRpc};
 use twinleaf::device::{
-    util::parse_rpc_spec, DeviceEvent, DeviceTree, RpcDescriptor, RpcValueType, TreeEvent,
+    DeviceEvent, DeviceTree, RpcDescriptor, RpcMetaFlags, RpcValueType, TreeEvent,
 };
 #[cfg(feature = "serial")]
 use twinleaf::device::discovery::{self, PortInterface};
@@ -4177,7 +4177,7 @@ fn fetch_rpcs(port: &proxy::Port, route: &DeviceRoute, emitter: &Emitter) -> Rpc
             }
         };
 
-        let descriptor = parse_rpc_spec(meta_bits, name);
+        let descriptor = RpcDescriptor::from_meta(meta_bits, name);
         let arg_type = rpc_arg_type(&descriptor);
         let size = rpc_size(&descriptor);
 
@@ -4188,8 +4188,8 @@ fn fetch_rpcs(port: &proxy::Port, route: &DeviceRoute, emitter: &Emitter) -> Rpc
             permissions: rpc_permissions(&descriptor),
             arg_type,
             readable: rpc_readable(&descriptor),
-            writable: descriptor.writable,
-            persistent: descriptor.persistent,
+            writable: descriptor.meta.flags().contains(RpcMetaFlags::WRITABLE),
+            persistent: descriptor.meta.is_persistent(),
             unknown: rpc_unknown(&descriptor),
             value: None,
         });
@@ -6146,7 +6146,7 @@ fn rpc_base_type(rpc_type: &str) -> &str {
 }
 
 fn rpc_arg_type(descriptor: &RpcDescriptor) -> String {
-    if descriptor.is_unknown() {
+    if descriptor.meta.is_unknown() {
         return if is_capture_rpc_descriptor(descriptor) {
             "capture".to_string()
         } else {
@@ -6158,14 +6158,14 @@ fn rpc_arg_type(descriptor: &RpcDescriptor) -> String {
         return "capture".to_string();
     }
 
-    if descriptor.is_bool {
-        return descriptor.type_str();
+    if descriptor.meta.flags().contains(RpcMetaFlags::BOOL) {
+        return descriptor.meta.type_str();
     }
 
-    match &descriptor.data_kind {
+    match descriptor.meta.kind() {
         RpcValueType::Unit => "unit".to_string(),
         RpcValueType::Raw { .. } => "missing".to_string(),
-        _ => descriptor.type_str(),
+        _ => descriptor.meta.type_str(),
     }
 }
 
@@ -6174,30 +6174,32 @@ fn rpc_size(descriptor: &RpcDescriptor) -> usize {
         return 0;
     }
 
-    match &descriptor.data_kind {
+    match descriptor.meta.kind() {
         RpcValueType::String { max_len } => max_len.map(usize::from).unwrap_or(0),
-        _ => descriptor.size_bytes().unwrap_or(0),
+        _ => descriptor.meta.size_bytes().unwrap_or(0),
     }
 }
 
 fn rpc_permissions(descriptor: &RpcDescriptor) -> String {
-    if descriptor.is_unknown() && is_capture_rpc_descriptor(descriptor) {
+    if descriptor.meta.is_unknown() && is_capture_rpc_descriptor(descriptor) {
         "R--".to_string()
     } else {
-        descriptor.perm_str()
+        descriptor.meta.perm_str()
     }
 }
 
 fn rpc_readable(descriptor: &RpcDescriptor) -> bool {
-    descriptor.readable || is_capture_rpc_descriptor(descriptor)
+    descriptor.meta.flags().contains(RpcMetaFlags::READABLE)
+        || is_capture_rpc_descriptor(descriptor)
 }
 
 fn rpc_unknown(descriptor: &RpcDescriptor) -> bool {
-    descriptor.is_unknown() && !is_capture_rpc_descriptor(descriptor)
+    descriptor.meta.is_unknown() && !is_capture_rpc_descriptor(descriptor)
 }
 
 fn is_capture_rpc_descriptor(descriptor: &RpcDescriptor) -> bool {
-    descriptor.is_capture || is_capture_rpc_name(&descriptor.full_name)
+    descriptor.meta.flags().contains(RpcMetaFlags::CAPTURE)
+        || is_capture_rpc_name(&descriptor.full_name)
 }
 
 fn is_capture_rpc_name(name: &str) -> bool {
@@ -6376,43 +6378,44 @@ mod tests {
         }
     }
 
-    use twinleaf::device::{
-        RPC_META_BOOL, RPC_META_CAPTURE, RPC_META_READABLE, RPC_META_WRITABLE,
-    };
+    use twinleaf::device::RpcMetaFlags;
 
     #[test]
     fn maps_rpc_descriptors_to_bridge_metadata() {
-        let missing = parse_rpc_spec(0, "missing.rpc".to_string());
+        let missing = RpcDescriptor::from_meta(0, "missing.rpc".to_string());
         assert_eq!(rpc_arg_type(&missing), "missing");
         assert_eq!(rpc_size(&missing), 0);
-        assert_eq!(missing.perm_str(), "???");
-        assert!(missing.is_unknown());
+        assert_eq!(missing.meta.perm_str(), "???");
+        assert!(missing.meta.is_unknown());
 
-        let unsupported = parse_rpc_spec(
-            RPC_META_READABLE | (1 << 4) | 2,
+        let unsupported = RpcDescriptor::from_meta(
+            RpcMetaFlags::READABLE.bits() | (1 << 4) | 2,
             "bad.float".to_string(),
         );
         assert_eq!(rpc_arg_type(&unsupported), "missing");
         assert_eq!(rpc_size(&unsupported), 0);
-        assert_eq!(unsupported.perm_str(), "R--");
+        assert_eq!(unsupported.meta.perm_str(), "R--");
 
-        let enabled = parse_rpc_spec(
-            RPC_META_READABLE | RPC_META_WRITABLE | (1 << 4) | RPC_META_BOOL,
+        let enabled = RpcDescriptor::from_meta(
+            RpcMetaFlags::READABLE.bits()
+                | RpcMetaFlags::WRITABLE.bits()
+                | (1 << 4)
+                | RpcMetaFlags::BOOL.bits(),
             "test.enable".to_string(),
         );
         assert_eq!(rpc_arg_type(&enabled), "bool");
         assert_eq!(rpc_size(&enabled), 1);
-        assert_eq!(enabled.perm_str(), "RW-");
-        assert!(enabled.readable);
-        assert!(enabled.writable);
+        assert_eq!(enabled.meta.perm_str(), "RW-");
+        assert!(enabled.meta.flags().contains(RpcMetaFlags::READABLE));
+        assert!(enabled.meta.flags().contains(RpcMetaFlags::WRITABLE));
 
-        let action = parse_rpc_spec(RPC_META_WRITABLE, "test.go".to_string());
+        let action = RpcDescriptor::from_meta(RpcMetaFlags::WRITABLE.bits(), "test.go".to_string());
         assert_eq!(rpc_arg_type(&action), "unit");
         assert_eq!(rpc_size(&action), 0);
-        assert_eq!(action.perm_str(), "-W-");
+        assert_eq!(action.meta.perm_str(), "-W-");
 
-        let capture = parse_rpc_spec(
-            RPC_META_READABLE | RPC_META_CAPTURE,
+        let capture = RpcDescriptor::from_meta(
+            RpcMetaFlags::READABLE.bits() | RpcMetaFlags::CAPTURE.bits(),
             "test.capture".to_string(),
         );
         assert_eq!(rpc_arg_type(&capture), "capture");
@@ -6421,20 +6424,20 @@ mod tests {
         assert!(rpc_readable(&capture));
         assert!(!rpc_unknown(&capture));
 
-        let legacy_capture = parse_rpc_spec(0, "test.capture".to_string());
+        let legacy_capture = RpcDescriptor::from_meta(0, "test.capture".to_string());
         assert_eq!(rpc_arg_type(&legacy_capture), "capture");
         assert_eq!(rpc_size(&legacy_capture), 0);
         assert_eq!(rpc_permissions(&legacy_capture), "R--");
         assert!(rpc_readable(&legacy_capture));
         assert!(!rpc_unknown(&legacy_capture));
 
-        let string = parse_rpc_spec(
-            RPC_META_READABLE | (8 << 4) | 3,
+        let string = RpcDescriptor::from_meta(
+            RpcMetaFlags::READABLE.bits() | (8 << 4) | 3,
             "device.name".to_string(),
         );
         assert_eq!(rpc_arg_type(&string), "string<8>");
         assert_eq!(rpc_size(&string), 8);
-        assert_eq!(string.perm_str(), "R--");
+        assert_eq!(string.meta.perm_str(), "R--");
     }
 
     #[test]
