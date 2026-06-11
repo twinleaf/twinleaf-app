@@ -541,8 +541,6 @@
 					IOKit,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.twinleaf.Twinleaf;
-				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphoneos*]" = com.twinleaf.TwinleafPad;
-				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphonesimulator*]" = com.twinleaf.TwinleafPad;
 				PRODUCT_NAME = Twinleaf;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;
@@ -611,8 +609,6 @@
 					IOKit,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.twinleaf.Twinleaf;
-				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphoneos*]" = com.twinleaf.TwinleafPad;
-				"PRODUCT_BUNDLE_IDENTIFIER[sdk=iphonesimulator*]" = com.twinleaf.TwinleafPad;
 				PRODUCT_NAME = Twinleaf;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SDKROOT = auto;

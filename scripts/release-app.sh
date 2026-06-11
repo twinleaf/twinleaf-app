@@ -246,7 +246,10 @@ ipad_bundle_id() {
 		return
 	fi
 
-	/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$ROOT_DIR/Packaging/TwinleafPad-Info.plist"
+	# iOS and macOS share one bundle identifier (universal purchase). The
+	# Info.plist holds the unexpanded $(PRODUCT_BUNDLE_IDENTIFIER) variable,
+	# so the identifier is stated here rather than read from the plist.
+	printf '%s' "com.twinleaf.Twinleaf"
 }
 
 detect_sign_identity() {
