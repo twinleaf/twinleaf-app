@@ -1696,6 +1696,7 @@ final class BridgeClient: ObservableObject {
                 let streamId = try reader.readUInt8()
                 let columnIndex = Int(try reader.readUInt32())
                 let sampleRate = try reader.readDouble()
+                let seriesFlags = frameVersion >= 3 ? try reader.readUInt8() : 0
                 let pointCount = Int(try reader.readUInt32())
                 let key = ColumnKey(
                     route: route,
@@ -1716,7 +1717,8 @@ final class BridgeClient: ObservableObject {
                     label: metadata.label,
                     units: metadata.units,
                     sampleRate: sampleRate,
-                    points: points
+                    points: points,
+                    isOutsideTimeWindow: (seriesFlags & 0x01) != 0
                 ))
             }
 
@@ -2179,7 +2181,11 @@ final class BridgeClient: ObservableObject {
     }
 
     private static func cleanedDeviceURL(_ rawURL: String) -> String? {
-        let url = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A remembered entry may hold several whitespace-separated URLs (a
+        // multi-sensor mount); canonicalize to single-space separation.
+        let url = rawURL
+            .split(whereSeparator: { $0.isWhitespace || $0.isNewline })
+            .joined(separator: " ")
         return url.isEmpty ? nil : url
     }
 

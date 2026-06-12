@@ -614,7 +614,7 @@ fn write_plot_payload<W: Write>(
 ) -> io::Result<()> {
     write_u8(writer, plot_mode_code(mode))?;
     write_u8(writer, u8::from(viewport_end.is_some()))?;
-    write_u16(writer, 2)?;
+    write_u16(writer, 3)?;
     write_u32(writer, pane_id)?;
     write_u32(writer, series.len())?;
     write_f64(writer, viewport_end.unwrap_or(0.0))?;
@@ -632,6 +632,7 @@ fn write_plot_payload<W: Write>(
         write_u8(writer, item.key.stream_id)?;
         write_u32(writer, item.key.column_index)?;
         write_f64(writer, item.sample_rate)?;
+        write_u8(writer, u8::from(item.outside_window))?;
         write_u32(writer, item.points.len())?;
         item.points.write_to(writer)?;
     }
@@ -863,6 +864,11 @@ struct BinaryPlotSeries<'a> {
     key: &'a ColumnKeyDto,
     sample_rate: f64,
     points: PlotPointSource<'a>,
+    /// True when this column has data, but none of it falls inside the pane's
+    /// displayed time window (its time reference is not compatible with the
+    /// pane's anchor stream). The series is sent with no points so the legend
+    /// can flag it.
+    outside_window: bool,
 }
 
 fn binary_plot_payload_len(series: &[BinaryPlotSeries<'_>]) -> io::Result<usize> {
@@ -876,7 +882,7 @@ fn binary_plot_payload_len(series: &[BinaryPlotSeries<'_>]) -> io::Result<usize>
             ));
         }
         length = length
-            .checked_add(2 + route_len + 1 + 4 + 8 + 4)
+            .checked_add(2 + route_len + 1 + 4 + 8 + 1 + 4)
             .and_then(|value| value.checked_add(item.points.len().checked_mul(16)?))
             .ok_or_else(|| {
                 io::Error::new(
@@ -2710,6 +2716,182 @@ fn interface_detail(interface: &PortInterface) -> String {
 #[cfg(not(feature = "serial"))]
 fn append_serial_devices(_devices: &mut Vec<AvailableDevice>, _include_all: bool) {}
 
+/// Serve several sensors as one device tree on a loopback TCP port: sensor k
+/// is mounted at route /k. The session connects to the returned URL and the
+/// combined tree behaves exactly like a hub. The mount thread runs until the
+/// session's connection closes (or any mounted sensor's proxy thread dies).
+fn start_multi_sensor_mount(urls: Vec<String>, emitter: Emitter) -> Result<String, String> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .map_err(|err| format!("could not bind a loopback port: {err}"))?;
+    let loopback_port = listener
+        .local_addr()
+        .map_err(|err| format!("could not read the loopback address: {err}"))?
+        .port();
+
+    thread::Builder::new()
+        .name("twinleaf-multi-mount".into())
+        .spawn(move || run_multi_sensor_mount(listener, urls, emitter))
+        .map_err(|err| format!("could not spawn the mount thread: {err}"))?;
+
+    Ok(format!("tcp://127.0.0.1:{loopback_port}"))
+}
+
+fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, emitter: Emitter) {
+    struct MountLink {
+        prefix: DeviceRoute,
+        interface: proxy::Interface,
+        status_rx: Receiver<proxy::Event>,
+    }
+
+    let mut links = Vec::with_capacity(urls.len());
+    for (index, sensor_url) in urls.iter().enumerate() {
+        let Ok(prefix) = DeviceRoute::from_str(&format!("/{index}")) else {
+            emitter.debug(format!("multi-mount: invalid route /{index}"));
+            return;
+        };
+        emitter.debug(format!("multi-mount: {sensor_url} at {prefix}"));
+        let (status_tx, status_rx) = channel::bounded(100);
+        let interface = proxy::Interface::new_proxy(
+            sensor_url,
+            Some(CONNECTION_STARTUP_TIMEOUT),
+            Some(status_tx),
+        );
+        links.push(MountLink {
+            prefix,
+            interface,
+            status_rx,
+        });
+    }
+
+    // Open each mount's port right away (before blocking on accept): a proxy
+    // interface with no ports can shut down on an early connection failure,
+    // after which `new_port` is refused.
+    let mut ports = Vec::with_capacity(links.len());
+    for link in &links {
+        match link.interface.new_port(
+            Some(Duration::from_millis(2000)),
+            DeviceRoute::root(),
+            usize::MAX,
+            true,
+            true,
+        ) {
+            Ok(port) => ports.push(port),
+            Err(err) => {
+                emitter.debug(format!(
+                    "multi-mount: could not open a port for {}: {err:?}",
+                    link.prefix
+                ));
+                return;
+            }
+        }
+    }
+
+    // The only client is this process's own session proxy.
+    let Ok((stream, _)) = listener.accept() else {
+        emitter.debug("multi-mount: accept failed");
+        return;
+    };
+    drop(listener);
+
+    let (rx_send, client_rx) =
+        tio::port::Port::rx_channel_custom(proxy::Interface::get_client_tx_channel_size());
+    let client = match tio::port::Port::from_tcp_stream_custom(
+        stream,
+        tio::port::Port::rx_to_channel(rx_send),
+        proxy::Interface::get_client_rx_channel_size(),
+    ) {
+        Ok(client) => client,
+        Err(err) => {
+            emitter.debug(format!(
+                "multi-mount: could not wrap the session stream: {err:?}"
+            ));
+            return;
+        }
+    };
+
+    // Select slots: 0 is the session's traffic; then each link contributes
+    // its sensor packets (slot 1 + 2i) and its proxy status (slot 2 + 2i).
+    let mut sel = channel::Select::new();
+    sel.recv(&client_rx);
+    for (link, port) in links.iter().zip(&ports) {
+        sel.recv(port.receiver());
+        sel.recv(&link.status_rx);
+    }
+
+    let mut dropped_packets: u64 = 0;
+    loop {
+        let oper = sel.select();
+        let slot = oper.index();
+        if slot == 0 {
+            let Ok(Ok(mut pkt)) = oper.recv(&client_rx) else {
+                emitter.debug("multi-mount: session disconnected; shutting down");
+                break;
+            };
+            let mut destination = None;
+            for (link, port) in links.iter().zip(&ports) {
+                if let Ok(relative) = link.prefix.relative_route(&pkt.routing) {
+                    destination = Some((relative, port));
+                    break;
+                }
+            }
+            let Some((relative, port)) = destination else {
+                // Root-addressed heartbeats keep each sensor's link alive
+                // (devices expire clients that go quiet); broadcast them to
+                // every mount, exactly as each sensor would receive over a
+                // direct connection. Other root-addressed packets have no
+                // single destination and are dropped.
+                if pkt.routing.len() == 0 {
+                    if let Payload::Heartbeat(_) = pkt.payload {
+                        for port in &ports {
+                            let _ = port.try_send(pkt.clone());
+                        }
+                    }
+                }
+                continue;
+            };
+            pkt.routing = relative;
+            if port.try_send(pkt).is_err() {
+                emitter.debug("multi-mount: forwarding to a sensor failed");
+                break;
+            }
+        } else {
+            let link_index = (slot - 1) / 2;
+            let link = &links[link_index];
+            if (slot - 1) % 2 == 0 {
+                let Ok(mut pkt) = oper.recv(ports[link_index].receiver()) else {
+                    emitter.debug(format!("multi-mount: lost the sensor at {}", link.prefix));
+                    break;
+                };
+                pkt.routing = link.prefix.absolute_route(&pkt.routing);
+                if pkt.routing.len() > tio::proto::TIO_PACKET_MAX_ROUTING_SIZE {
+                    continue;
+                }
+                match client.try_send(pkt) {
+                    Ok(()) => {}
+                    Err(tio::SendError::Full) => {
+                        dropped_packets += 1;
+                        if dropped_packets.is_power_of_two() {
+                            emitter.debug(format!(
+                                "multi-mount: dropped {dropped_packets} packet(s); session is slow"
+                            ));
+                        }
+                    }
+                    Err(_) => {
+                        emitter.debug("multi-mount: session connection closed");
+                        break;
+                    }
+                }
+            } else {
+                let Ok(event) = oper.recv(&link.status_rx) else {
+                    emitter.debug(format!("multi-mount: proxy ended at {}", link.prefix));
+                    break;
+                };
+                emitter.debug(format!("multi-mount {}: {event:?}", link.prefix));
+            }
+        }
+    }
+}
+
 fn run_session(
     url: String,
     route: Option<String>,
@@ -2733,17 +2915,34 @@ fn run_session(
 
     emitter.status("connecting", format!("Connecting to {url}"));
     emitter.debug(format!("session starting: url={url}, route={root_route}"));
+
+    // Multiple whitespace-separated URLs are mounted at /0, /1, ... behind an
+    // in-process loopback proxy, so the rest of the session sees one combined
+    // device tree exactly as it would behind a hub.
+    let sensor_urls: Vec<String> = url.split_whitespace().map(str::to_string).collect();
+    let connect_url = if sensor_urls.len() > 1 {
+        match start_multi_sensor_mount(sensor_urls, emitter.clone()) {
+            Ok(loopback_url) => loopback_url,
+            Err(err) => {
+                emitter.error(format!("Could not start the multi-sensor mount: {err}"));
+                return;
+            }
+        }
+    } else {
+        url.clone()
+    };
+
     let (proxy_status_tx, proxy_status_rx) = channel::unbounded();
     let (status_tx, status_rx) = channel::unbounded();
     spawn_proxy_status_forwarder(url.clone(), proxy_status_rx, status_tx, emitter.clone());
     let proxy = Arc::new(proxy::Interface::new_proxy(
-        &url,
+        &connect_url,
         Some(CONNECTION_STARTUP_TIMEOUT),
         Some(proxy_status_tx),
     ));
 
     let mut pending_startup_commands = VecDeque::new();
-    let retry_transient_connect_failures = is_retryable_connect_url(&url);
+    let retry_transient_connect_failures = is_retryable_connect_url(&connect_url);
     if !wait_for_proxy_connection(
         &status_rx,
         &command_rx,
@@ -5216,7 +5415,7 @@ fn emit_live_plot(
                 emitter,
                 pane.id,
                 column_states,
-                &pane_columns,
+                &pane.columns,
                 &pane.view,
                 shared_view_end,
             )),
@@ -5252,30 +5451,41 @@ fn emit_live_plot(
     aggregate
 }
 
-fn emit_live_timeseries_plot(
-    emitter: &Emitter,
+/// Build the timeseries series for one pane, anchoring the time window to the
+/// pane's first column that has data. Columns whose time references roughly
+/// agree fall inside the window and plot normally; columns on an incompatible
+/// time base have no points in the window and are sent flagged (and empty) so
+/// the legend can mark them.
+fn build_live_timeseries_series<'a>(
     pane_id: usize,
-    column_states: &HashMap<ColumnKeyDto, ColumnState>,
-    active_columns: &HashSet<ColumnKeyDto>,
+    column_states: &'a HashMap<ColumnKeyDto, ColumnState>,
+    pane_columns: &'a [ColumnKeyDto],
     view: &ViewConfig,
-    view_end: Option<f64>,
-) -> PlotEmitStats {
+    shared_view_end: Option<f64>,
+) -> (Option<f64>, Vec<BinaryPlotSeries<'a>>, usize) {
+    let view_end = pane_columns
+        .iter()
+        .filter_map(|key| resolve_column_state(column_states, key).map(|(_, state)| state))
+        .filter_map(|state| state.raw.back())
+        .map(|point| point.x)
+        .find(|x| x.is_finite())
+        .or(shared_view_end);
+
     let window_start = view_end
         .map(|end| end - view.window_seconds.max(1e-6))
         .unwrap_or(f64::NEG_INFINITY);
     let window_end = view_end.unwrap_or(f64::INFINITY);
-    let mut keys: Vec<_> = active_columns.iter().cloned().collect();
-    keys.sort_by(|a, b| {
-        (&a.route, a.stream_id, a.column_index).cmp(&(&b.route, b.stream_id, b.column_index))
-    });
 
     let mut series = Vec::new();
     let mut point_count = 0usize;
 
-    for key in &keys {
-        let Some((_, state)) = resolve_column_state(column_states, key) else {
+    for key in pane_columns {
+        let Some((data_key, state)) = resolve_column_state(column_states, key) else {
             continue;
         };
+        if state.raw.is_empty() {
+            continue;
+        }
         let points = match view.decimation_method {
             DecimationMethod::Fpcs => state
                 .fpcs_for_pane(pane_id)
@@ -5283,17 +5493,58 @@ fn emit_live_timeseries_plot(
                 .unwrap_or_else(|| state.point_source_between(window_start, window_end)),
             DecimationMethod::None => state.point_source_between(window_start, window_end),
         };
-        if points.is_empty() {
+
+        // FPCS retains points since window_start regardless of the upper
+        // bound, so verify the column actually overlaps the window before
+        // declaring it visible.
+        let overlaps_window = state
+            .raw
+            .back()
+            .map(|latest| latest.x >= window_start)
+            .unwrap_or(false)
+            && state
+                .raw
+                .front()
+                .map(|earliest| earliest.x <= window_end)
+                .unwrap_or(false);
+
+        if points.is_empty() || !overlaps_window {
+            series.push(BinaryPlotSeries {
+                key: data_key,
+                sample_rate: state.sample_rate,
+                points: PlotPointSource::Slice(&[]),
+                outside_window: true,
+            });
             continue;
         }
 
         point_count += points.len();
         series.push(BinaryPlotSeries {
-            key,
+            key: data_key,
             sample_rate: state.sample_rate,
             points,
+            outside_window: false,
         });
     }
+
+    (view_end, series, point_count)
+}
+
+fn emit_live_timeseries_plot(
+    emitter: &Emitter,
+    pane_id: usize,
+    column_states: &HashMap<ColumnKeyDto, ColumnState>,
+    pane_columns: &[ColumnKeyDto],
+    view: &ViewConfig,
+    shared_view_end: Option<f64>,
+) -> PlotEmitStats {
+    let (view_end, series, point_count) = build_live_timeseries_series(
+        pane_id,
+        column_states,
+        pane_columns,
+        view,
+        shared_view_end,
+    );
 
     if let Err(err) = emitter.emit_plot_frame(pane_id, PlotMode::Timeseries, view_end, &series) {
         emitter.debug(format!("failed to emit binary timeseries plot: {err}"));
@@ -5487,6 +5738,7 @@ fn emit_plot_series_frame(
             key: &item.key,
             sample_rate: item.sample_rate,
             points: PlotPointSource::Slice(&item.points),
+            outside_window: false,
         })
         .collect();
     if let Err(err) = emitter.emit_plot_frame(pane_id, mode, viewport_end, &binary_series) {
@@ -6441,6 +6693,107 @@ mod tests {
     }
 
     #[test]
+    fn flags_series_outside_the_anchored_time_window() {
+        let key_a = ColumnKeyDto {
+            route: "/0".to_string(),
+            stream_id: 1,
+            column_index: 0,
+        };
+        let key_b = ColumnKeyDto {
+            route: "/1".to_string(),
+            stream_id: 1,
+            column_index: 0,
+        };
+
+        // Stream A's clock is near x=1000; stream B's is near x=20: their
+        // time references are not compatible within the 10 s default window.
+        let mut state_a = ColumnState::new("a".to_string(), "V".to_string(), 1.0);
+        let mut state_b = ColumnState::new("b".to_string(), "V".to_string(), 1.0);
+        for i in 0..20 {
+            state_a.push_raw(
+                Point {
+                    x: 1000.0 + i as f64,
+                    y: 1.0,
+                },
+                1e9,
+            );
+            state_b.push_raw(
+                Point {
+                    x: 5.0 + i as f64,
+                    y: 2.0,
+                },
+                1e9,
+            );
+        }
+        let states = HashMap::from([(key_a.clone(), state_a), (key_b.clone(), state_b)]);
+        let view = ViewConfig::default();
+
+        // Anchored to the first pane column (stream A).
+        let pane = vec![key_a.clone(), key_b.clone()];
+        let (view_end, series, _) = build_live_timeseries_series(0, &states, &pane, &view, None);
+        assert_eq!(view_end, Some(1019.0));
+        assert_eq!(series.len(), 2);
+        assert!(!series[0].outside_window);
+        assert!(series[0].points.len() > 0);
+        assert!(series[1].outside_window);
+        assert_eq!(series[1].points.len(), 0);
+
+        // Swapping the pane order anchors to stream B instead.
+        let pane = vec![key_b.clone(), key_a.clone()];
+        let (view_end, series, _) = build_live_timeseries_series(0, &states, &pane, &view, None);
+        assert_eq!(view_end, Some(24.0));
+        assert!(!series[0].outside_window);
+        assert!(series[0].points.len() > 0);
+        assert!(series[1].outside_window);
+        assert_eq!(series[1].points.len(), 0);
+    }
+
+    #[test]
+    fn plots_series_with_compatible_time_references_together() {
+        let key_a = ColumnKeyDto {
+            route: "/0".to_string(),
+            stream_id: 1,
+            column_index: 0,
+        };
+        let key_b = ColumnKeyDto {
+            route: "/1".to_string(),
+            stream_id: 1,
+            column_index: 0,
+        };
+
+        // Clocks differ by a couple of seconds: both fit the 10 s window.
+        let mut state_a = ColumnState::new("a".to_string(), "V".to_string(), 1.0);
+        let mut state_b = ColumnState::new("b".to_string(), "V".to_string(), 1.0);
+        for i in 0..20 {
+            state_a.push_raw(
+                Point {
+                    x: 1000.0 + i as f64,
+                    y: 1.0,
+                },
+                1e9,
+            );
+            state_b.push_raw(
+                Point {
+                    x: 1002.5 + i as f64,
+                    y: 2.0,
+                },
+                1e9,
+            );
+        }
+        let states = HashMap::from([(key_a.clone(), state_a), (key_b.clone(), state_b)]);
+        let view = ViewConfig::default();
+
+        let pane = vec![key_a.clone(), key_b.clone()];
+        let (view_end, series, _) = build_live_timeseries_series(0, &states, &pane, &view, None);
+        assert_eq!(view_end, Some(1019.0));
+        assert_eq!(series.len(), 2);
+        assert!(!series[0].outside_window);
+        assert!(!series[1].outside_window);
+        assert!(series[0].points.len() > 0);
+        assert!(series[1].points.len() > 0);
+    }
+
+    #[test]
     fn decodes_string_rpc_replies() {
         assert_eq!(
             bytes_to_json_value(b"SN123\0\0\0", "string<8>"),
@@ -6847,12 +7200,13 @@ mod tests {
             key: &key,
             sample_rate: 100.0,
             points: source,
+            outside_window: false,
         }];
 
         assert_eq!(source.len(), 2);
         assert_eq!(
             binary_plot_payload_len(&series).unwrap(),
-            20 + 2 + key.route.len() + 1 + 4 + 8 + 4 + 2 * 16
+            20 + 2 + key.route.len() + 1 + 4 + 8 + 1 + 4 + 2 * 16
         );
 
         let mut bytes = Vec::new();

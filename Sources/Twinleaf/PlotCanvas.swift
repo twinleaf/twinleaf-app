@@ -694,10 +694,18 @@ struct PlotCanvas: View {
                         RoundedRectangle(cornerRadius: 2)
                             .fill(colors[index % colors.count])
                             .frame(width: 18, height: 4)
+                            .opacity(item.isOutsideTimeWindow ? 0.35 : 1)
                         Text(item.label)
                             .font(.body)
                             .lineLimit(1)
                             .truncationMode(.middle)
+                            .foregroundStyle(item.isOutsideTimeWindow ? .secondary : .primary)
+                        if item.isOutsideTimeWindow {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.yellow)
+                                .help("This stream's time reference doesn't match the graph's first stream, so it can't be shown on the same time axis.")
+                        }
                         if let hoverValue {
                             Spacer(minLength: 12)
                             Text(hoverValue.yText)

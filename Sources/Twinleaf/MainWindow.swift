@@ -5224,15 +5224,33 @@ private struct DevicePickerURLInlineRow: View {
     let onCancel: () -> Void
 
     @FocusState private var isURLFieldFocused: Bool
+    @State private var isExpanded = false
+    private static let editorLineHeight: CGFloat = 20
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
+            Button {
+                toggleExpanded()
+            } label: {
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 22)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(isExpanded ? "Single device URL" : "Connect several devices at once")
+
             VStack(alignment: .leading, spacing: 4) {
-                TextField("tcp://localhost", text: $draft)
-                    .textFieldStyle(.roundedBorder)
-                    .twinleafDeviceURLTextInput()
-                    .focused($isURLFieldFocused)
-                    .onSubmit(commit)
+                if isExpanded {
+                    multiURLEditor
+                } else {
+                    TextField("tcp://localhost", text: $draft)
+                        .textFieldStyle(.roundedBorder)
+                        .twinleafDeviceURLTextInput()
+                        .focused($isURLFieldFocused)
+                        .onSubmit(commit)
+                }
 
                 if !routes.isEmpty {
                     DeviceRouteList(routes: routes)
@@ -5266,14 +5284,75 @@ private struct DevicePickerURLInlineRow: View {
         .padding(.horizontal, 2)
         .twinleafDevicePickerInlineRowStyle()
         .onAppear {
+            if draftURLs.count > 1 {
+                isExpanded = true
+                draft = draftURLs.joined(separator: "\n")
+            }
             DispatchQueue.main.async {
                 isURLFieldFocused = true
             }
         }
     }
 
+    /// Multi-line editor with a /0, /1, ... gutter: one URL per line, each
+    /// line labeled with the route the sensor will be mounted at.
+    private var multiURLEditor: some View {
+        let lines = draft.components(separatedBy: "\n")
+        var urlIndex = 0
+        let gutter = lines
+            .map { line -> String in
+                guard !line.trimmingCharacters(in: .whitespaces).isEmpty else { return " " }
+                defer { urlIndex += 1 }
+                return "/\(urlIndex)"
+            }
+            .joined(separator: "\n")
+        let lineCount = max(2, min(lines.count + 1, 6))
+
+        return HStack(alignment: .top, spacing: 6) {
+            Text(gutter)
+                .font(.callout.monospaced())
+                .foregroundStyle(.secondary)
+                .lineSpacing(Self.editorLineSpacing)
+                .padding(.top, 8)
+            TextEditor(text: $draft)
+                .font(.callout.monospaced())
+                .lineSpacing(Self.editorLineSpacing)
+                .twinleafDeviceURLTextInput()
+                .focused($isURLFieldFocused)
+                .scrollContentBackground(.hidden)
+                .padding(4)
+                .frame(height: CGFloat(lineCount) * Self.editorLineHeight + 16)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(.background)
+                        .stroke(.separator, lineWidth: 1)
+                )
+        }
+    }
+
+    private static let editorLineSpacing: CGFloat = 2
+
+    private func toggleExpanded() {
+        if isExpanded {
+            // Collapse: back to a single line, URLs space-separated.
+            draft = draftURLs.joined(separator: " ")
+            isExpanded = false
+        } else {
+            // Expand: one URL per line so the gutter shows the /N mounts.
+            let urls = draftURLs
+            draft = urls.isEmpty ? "" : urls.joined(separator: "\n")
+            isExpanded = true
+        }
+    }
+
+    private var draftURLs: [String] {
+        draft.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).map(String.init)
+    }
+
     private var trimmedDraft: String {
-        draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Normalize any space/newline-delimited list to single-space form,
+        // which is the canonical stored representation.
+        draftURLs.joined(separator: " ")
     }
 
     private func commit() {
@@ -5295,9 +5374,23 @@ private struct DevicePickerRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 if device.kind == "remembered" {
                     // Remembered entries are just URLs: show the URL as the
-                    // primary line, with known connected devices below.
-                    Text(device.url)
-                        .font(.callout.monospaced().weight(.semibold))
+                    // primary line, with known connected devices below. A
+                    // multi-sensor entry lists each URL with its /N mount.
+                    let urls = device.url.split(separator: " ").map(String.init)
+                    if urls.count > 1 {
+                        ForEach(Array(urls.enumerated()), id: \.offset) { index, url in
+                            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                Text("/\(index)")
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.secondary)
+                                Text(url)
+                                    .font(.callout.monospaced().weight(.semibold))
+                            }
+                        }
+                    } else {
+                        Text(device.url)
+                            .font(.callout.monospaced().weight(.semibold))
+                    }
                 } else {
                     Text(device.label)
                         .font(.headline)

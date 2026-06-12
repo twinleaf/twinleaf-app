@@ -652,6 +652,10 @@ struct PlotSeries: Codable, Identifiable {
     let units: String
     let sampleRate: Double
     let points: [PlotPoint]
+    /// True when the column has live data but none of it falls inside the
+    /// pane's displayed time window (its time reference is incompatible with
+    /// the pane's anchor stream). Shown with a warning in the legend.
+    var isOutsideTimeWindow = false
 }
 
 enum JSONValue: Codable, Hashable, CustomStringConvertible {
