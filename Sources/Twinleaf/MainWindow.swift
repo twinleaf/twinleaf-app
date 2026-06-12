@@ -384,11 +384,23 @@ struct DocumentWindow: View {
         if reportsWidth {
             sidebar
                 .background(StreamSidebarWidthReporter())
-                .toolbar { UnifySensorsToolbarItem() }
+                .toolbar { UnifySensorsToolbarItem(isAvailable: hasUnifiableSensors) }
         } else {
             sidebar
-                .toolbar { UnifySensorsToolbarItem() }
+                .toolbar { UnifySensorsToolbarItem(isAvailable: hasUnifiableSensors) }
         }
+    }
+
+    /// True when at least two connected sensors share a device type.
+    private var hasUnifiableSensors: Bool {
+        var counts: [String: Int] = [:]
+        for device in bridge.devices where !device.meta.name.isEmpty {
+            counts[device.meta.name, default: 0] += 1
+            if counts[device.meta.name] == 2 {
+                return true
+            }
+        }
+        return false
     }
 
     private var openPlotWindowAction: (([ColumnKey]) -> Void)? {
@@ -1031,25 +1043,28 @@ struct DocumentWindow: View {
             }
 
             if shouldUseSliderOnlyPlotArea {
-                Spacer(minLength: 0)
                 if let captureRPC = activeCaptureRPC {
 #if os(macOS)
                     let popOutCaptureAction: (() -> Void)? = { popOutCapture(captureRPC) }
 #else
                     let popOutCaptureAction: (() -> Void)? = nil
 #endif
+                    // With no graphs visible, the capture plot takes all the
+                    // free vertical space, like a graph would.
                     CaptureResultPane(
                         bridge: bridge,
                         rpcID: captureRPC.id,
                         isAutoEnabled: $captureAutoEnabled,
                         alwaysShowsRail: shouldAlwaysShowPlotControls,
-                        maximumHeight: 360,
+                        maximumHeight: .infinity,
                         onTrigger: triggerCapture,
                         onPopOut: popOutCaptureAction,
                         onClose: closeCaptureView
                     )
-                    .frame(maxWidth: .infinity)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
+                } else {
+                    Spacer(minLength: 0)
                 }
                 if !rpcSliders.isEmpty {
                     if activeCaptureRPC != nil { Divider() }
@@ -1060,55 +1075,69 @@ struct DocumentWindow: View {
                         focusedField: $focusedField
                     )
                 }
-                Spacer(minLength: 0)
+                if activeCaptureRPC == nil {
+                    Spacer(minLength: 0)
+                }
             } else {
-                if !visiblePlotPanes.isEmpty {
-                    stackedPlots
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
+                GeometryReader { plotAreaGeometry in
+                    VStack(spacing: 0) {
+                        if !visiblePlotPanes.isEmpty {
+                            stackedPlots
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
 
-                if let captureRPC = activeCaptureRPC {
+                        if let captureRPC = activeCaptureRPC {
 #if os(macOS)
-                    let popOutCaptureAction: (() -> Void)? = { popOutCapture(captureRPC) }
+                            let popOutCaptureAction: (() -> Void)? = { popOutCapture(captureRPC) }
 #else
-                    let popOutCaptureAction: (() -> Void)? = nil
+                            let popOutCaptureAction: (() -> Void)? = nil
 #endif
-                    if !visiblePlotPanes.isEmpty {
-                        Divider()
-                    }
-                    CaptureResultPane(
-                        bridge: bridge,
-                        rpcID: captureRPC.id,
-                        isAutoEnabled: $captureAutoEnabled,
-                        alwaysShowsRail: shouldAlwaysShowPlotControls,
-                        maximumHeight: 360,
-                        onTrigger: triggerCapture,
-                        onPopOut: popOutCaptureAction,
-                        onClose: closeCaptureView
-                    )
-                    .frame(maxWidth: .infinity)
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-                }
+                            if !visiblePlotPanes.isEmpty {
+                                Divider()
+                            }
+                            // Share the vertical space evenly with the graphs:
+                            // the capture plot takes one graph-sized slot.
+                            CaptureResultPane(
+                                bridge: bridge,
+                                rpcID: captureRPC.id,
+                                isAutoEnabled: $captureAutoEnabled,
+                                alwaysShowsRail: shouldAlwaysShowPlotControls,
+                                maximumHeight: .infinity,
+                                onTrigger: triggerCapture,
+                                onPopOut: popOutCaptureAction,
+                                onClose: closeCaptureView
+                            )
+                            .frame(maxWidth: .infinity)
+                            .frame(height: captureShareHeight(in: plotAreaGeometry))
+                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                        }
 
-                if !rpcSliders.isEmpty {
-                    if !visiblePlotPanes.isEmpty || activeCaptureRPC != nil {
-                        Divider()
+                        if !rpcSliders.isEmpty {
+                            if !visiblePlotPanes.isEmpty || activeCaptureRPC != nil {
+                                Divider()
+                            }
+                            RPCSliderTray(
+                                bridge: bridge,
+                                sliders: $rpcSliders,
+                                onOpenSliderWindow: openSliderConfigurationWindowAction,
+                                focusedField: $focusedField
+                            )
+                        } else if visiblePlotPanes.isEmpty {
+                            Spacer(minLength: 0)
+                        }
                     }
-                    RPCSliderTray(
-                        bridge: bridge,
-                        sliders: $rpcSliders,
-                        onOpenSliderWindow: openSliderConfigurationWindowAction,
-                        focusedField: $focusedField
-                    )
-                } else if activeCaptureRPC == nil,
-                          visiblePlotPanes.isEmpty {
-                    Spacer(minLength: 0)
-                } else if visiblePlotPanes.isEmpty {
-                    Spacer(minLength: 0)
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// One graph-sized slot for the capture plot: the available height divided
+    /// evenly among the visible graphs plus the capture pane.
+    private func captureShareHeight(in geometry: GeometryProxy) -> CGFloat? {
+        let paneCount = visiblePlotPanes.count
+        guard paneCount > 0 else { return nil }
+        return max(180, geometry.size.height / CGFloat(paneCount + 1))
     }
 
     /// True when the user has a slider or capture active but no plot pane is
@@ -3757,19 +3786,23 @@ struct TwinleafInterfaceVisibilityControls: View {
 }
 
 /// Sidebar-toolbar toggle for unify mode. Because it's declared on the
-/// sidebar column's content, it hides whenever the sidebar is hidden.
+/// sidebar column's content, it hides whenever the sidebar is hidden; it also
+/// only appears when at least two same-type sensors are connected.
 private struct UnifySensorsToolbarItem: ToolbarContent {
+    let isAvailable: Bool
     @AppStorage(ViewPreferenceKeys.unifySensors) private var unifySensors = false
 
     var body: some ToolbarContent {
-        ToolbarItem(placement: .automatic) {
-            Toggle(isOn: $unifySensors) {
-                Label("Unify Matching Sensors", systemImage: "arrow.triangle.merge")
+        if isAvailable {
+            ToolbarItem(placement: .automatic) {
+                Toggle(isOn: $unifySensors) {
+                    Label("Unify Matching Sensors", systemImage: "arrow.triangle.merge")
+                }
+                .toggleStyle(.button)
+                .help(unifySensors
+                    ? "Show each sensor separately"
+                    : "Unify matching sensors: group same-type sensors' streams and settings")
             }
-            .toggleStyle(.button)
-            .help(unifySensors
-                ? "Show each sensor separately"
-                : "Unify matching sensors: group same-type sensors' streams and settings")
         }
     }
 }
