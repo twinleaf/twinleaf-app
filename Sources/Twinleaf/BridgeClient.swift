@@ -1738,10 +1738,18 @@ final class BridgeClient: ObservableObject {
         let device = devices[resolved.device]
         let stream = device.streams[resolved.stream]
         let column = stream.columns[resolved.column]
-        return (
-            "\(device.meta.name) \(stream.name).\(column.name)",
-            column.units
-        )
+        var label = "\(device.meta.name) \(stream.name).\(column.name)"
+
+        // With several routes in the session (multiple sensors or a hub),
+        // identical device types produce identical labels; prefix the route
+        // and serial so legend entries stay distinguishable.
+        if Set(devices.map(\.route)).count > 1 {
+            let serial = device.meta.serialNumber
+            let prefix = serial.isEmpty ? device.route : "\(device.route) \(serial)"
+            label = "\(prefix) · \(label)"
+        }
+
+        return (label, column.units)
     }
 
     private func updateColumnDisplayValue(

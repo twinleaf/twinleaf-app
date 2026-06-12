@@ -420,6 +420,7 @@ enum ViewPreferenceKeys {
     static let captureAutoDelaySeconds = "view.captureAutoDelaySeconds"
     static let boardViewLayouts = "view.boardViewLayouts"
     static let showAllSerialPorts = "view.showAllSerialPorts"
+    static let unifySensors = "view.unifySensors"
 }
 
 enum CaptureAutoDelay {

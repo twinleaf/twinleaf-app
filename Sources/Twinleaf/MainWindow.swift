@@ -379,10 +379,15 @@ struct DocumentWindow: View {
                 #endif
             }
         )
+        // Attached to the sidebar content so the item lives in the sidebar's
+        // toolbar section and disappears together with the sidebar.
         if reportsWidth {
-            sidebar.background(StreamSidebarWidthReporter())
+            sidebar
+                .background(StreamSidebarWidthReporter())
+                .toolbar { UnifySensorsToolbarItem() }
         } else {
             sidebar
+                .toolbar { UnifySensorsToolbarItem() }
         }
     }
 
@@ -3751,16 +3756,36 @@ struct TwinleafInterfaceVisibilityControls: View {
     }
 }
 
+/// Sidebar-toolbar toggle for unify mode. Because it's declared on the
+/// sidebar column's content, it hides whenever the sidebar is hidden.
+private struct UnifySensorsToolbarItem: ToolbarContent {
+    @AppStorage(ViewPreferenceKeys.unifySensors) private var unifySensors = false
+
+    var body: some ToolbarContent {
+        ToolbarItem(placement: .automatic) {
+            Toggle(isOn: $unifySensors) {
+                Label("Unify Matching Sensors", systemImage: "arrow.triangle.merge")
+            }
+            .toggleStyle(.button)
+            .help(unifySensors
+                ? "Show each sensor separately"
+                : "Unify matching sensors: group same-type sensors' streams and settings")
+        }
+    }
+}
+
 struct TwinleafInterfaceDetailControls: View {
     @AppStorage(ViewPreferenceKeys.showStreamDetails) private var showStreamDetails = false
     @AppStorage(ViewPreferenceKeys.showRPCDetails) private var showRPCDetails = false
     @AppStorage(ViewPreferenceKeys.showPlotKey) private var showPlotKey = true
+    @AppStorage(ViewPreferenceKeys.unifySensors) private var unifySensors = false
 
     var body: some View {
         Group {
             Toggle("Show Stream Details", isOn: $showStreamDetails)
             Toggle("Show Setting Details", isOn: $showRPCDetails)
             Toggle("Show Plot Key", isOn: $showPlotKey)
+            Toggle("Unify Matching Sensors", isOn: $unifySensors)
         }
     }
 }
@@ -5480,6 +5505,7 @@ private struct StreamSidebar: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     #endif
     @AppStorage(ViewPreferenceKeys.showStreamDetails) private var showStreamDetails = false
+    @AppStorage(ViewPreferenceKeys.unifySensors) private var unifySensors = false
     @State private var sidebarSearchText = ""
     @State private var isSidebarSearchPresented = false
     @State private var expandedStreamIDs: Set<String> = []
@@ -5539,43 +5565,17 @@ private struct StreamSidebar: View {
 
                 if !visibleStreamGroups.isEmpty || sidebarSearchQuery.isEmpty {
                     Section {
-                        ForEach(visibleStreamGroups) { group in
-                            DeviceSectionHeader(device: group.device)
-                                .listRowInsets(denseDeviceHeaderRowInsets)
-                                .listRowSeparator(.hidden)
-                                .listRowBackground(Color.clear)
+                        ForEach(streamDeviceEntries) { entry in
+                            switch entry {
+                            case .single(let device):
+                                singleDeviceStreamRows(device: device)
+                            case .unified(let name, let devices):
+                                UnifiedDeviceSectionHeader(name: name, devices: devices)
+                                    .listRowInsets(denseDeviceHeaderRowInsets)
+                                    .listRowSeparator(.hidden)
+                                    .listRowBackground(Color.clear)
 
-                            ForEach(group.rows) { row in
-                                StreamHeaderRow(
-                                    stream: row.stream,
-                                    showDetails: showStreamDetails,
-                                    isExpanded: expansionBinding(for: row.id),
-                                    bridge: bridge,
-                                    plotState: plotState(for: row.stream.columns.map(\.key)),
-                                    onOpenPlotWindow: onOpenPlotWindow
-                                )
-                                .listRowInsets(denseSidebarRowInsets)
-
-                                if expandedStreamIDs.contains(row.id) {
-                                    if row.stream.columns.isEmpty {
-                                        StreamMetadataUnavailableRow(stream: row.stream)
-                                            .padding(.leading, streamChildRowLeadingPadding)
-                                            .listRowInsets(denseSidebarRowInsets)
-                                    } else {
-                                        ForEach(row.stream.columns) { column in
-                                            StreamColumnRow(
-                                                column: column,
-                                                showDetails: showStreamDetails,
-                                                bridge: bridge,
-                                                plotState: plotState(for: [column.key]),
-                                                onOpenPlotWindow: onOpenPlotWindow
-                                            )
-                                            .equatable()
-                                            .padding(.leading, streamChildRowLeadingPadding)
-                                            .listRowInsets(denseSidebarRowInsets)
-                                        }
-                                    }
-                                }
+                                unifiedStreamRows(groupName: name, devices: devices)
                             }
                         }
                     }
@@ -5617,6 +5617,139 @@ private struct StreamSidebar: View {
             let rows = streamRows(for: device).filter { matchesStream($0.stream, device: device) }
             guard !rows.isEmpty else { return nil }
             return StreamSidebarDeviceGroup(device: device, rows: rows)
+        }
+    }
+
+    private var streamDeviceEntries: [SidebarDeviceEntry] {
+        sidebarDeviceEntries(visibleStreamGroups.map(\.device), unify: unifySensors)
+    }
+
+    @ViewBuilder
+    private func singleDeviceStreamRows(device: DeviceInfo) -> some View {
+        if let group = visibleStreamGroups.first(where: { $0.device.id == device.id }) {
+            DeviceSectionHeader(device: group.device)
+                .listRowInsets(denseDeviceHeaderRowInsets)
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
+
+            ForEach(group.rows) { row in
+                StreamHeaderRow(
+                    stream: row.stream,
+                    showDetails: showStreamDetails,
+                    isExpanded: expansionBinding(for: row.id),
+                    bridge: bridge,
+                    plotState: plotState(for: row.stream.columns.map(\.key)),
+                    onOpenPlotWindow: onOpenPlotWindow
+                )
+                .listRowInsets(denseSidebarRowInsets)
+
+                if expandedStreamIDs.contains(row.id) {
+                    if row.stream.columns.isEmpty {
+                        StreamMetadataUnavailableRow(stream: row.stream)
+                            .padding(.leading, streamChildRowLeadingPadding)
+                            .listRowInsets(denseSidebarRowInsets)
+                    } else {
+                        ForEach(row.stream.columns) { column in
+                            StreamColumnRow(
+                                column: column,
+                                showDetails: showStreamDetails,
+                                bridge: bridge,
+                                plotState: plotState(for: [column.key]),
+                                onOpenPlotWindow: onOpenPlotWindow
+                            )
+                            .equatable()
+                            .padding(.leading, streamChildRowLeadingPadding)
+                            .listRowInsets(denseSidebarRowInsets)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func unifiedStreamRows(groupName: String, devices: [DeviceInfo]) -> some View {
+        let firstRows = visibleStreamGroups.first { $0.device.id == devices.first?.id }?.rows ?? []
+        ForEach(firstRows) { row in
+            let rowID = "unified:\(groupName)#\(row.stream.streamId)"
+            let allKeys = unifiedStreamKeys(streamId: row.stream.streamId, devices: devices)
+
+            StreamHeaderRow(
+                stream: row.stream,
+                showDetails: showStreamDetails,
+                isExpanded: expansionBinding(for: rowID),
+                bridge: bridge,
+                plotState: plotState(for: allKeys),
+                onOpenPlotWindow: onOpenPlotWindow,
+                plotKeysOverride: allKeys
+            )
+            .listRowInsets(denseSidebarRowInsets)
+
+            if expandedStreamIDs.contains(rowID) {
+                if row.stream.columns.isEmpty {
+                    StreamMetadataUnavailableRow(stream: row.stream)
+                        .padding(.leading, streamChildRowLeadingPadding)
+                        .listRowInsets(denseSidebarRowInsets)
+                } else {
+                    ForEach(row.stream.columns) { column in
+                        unifiedColumnCaption(column: column, devices: devices)
+                            .padding(.leading, streamChildRowLeadingPadding)
+                            .listRowInsets(denseSidebarRowInsets)
+
+                        ForEach(devices) { device in
+                            if let deviceColumn = deviceColumn(
+                                device,
+                                streamId: row.stream.streamId,
+                                columnIndex: column.key.columnIndex
+                            ) {
+                                StreamColumnRow(
+                                    column: deviceColumn,
+                                    showDetails: showStreamDetails,
+                                    bridge: bridge,
+                                    plotState: plotState(for: [deviceColumn.key]),
+                                    onOpenPlotWindow: onOpenPlotWindow,
+                                    labelOverride: unifiedDeviceKeyLabel(device)
+                                )
+                                .equatable()
+                                .padding(.leading, streamChildRowLeadingPadding * 2)
+                                .listRowInsets(denseSidebarRowInsets)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func unifiedColumnCaption(column: ColumnInfo, devices: [DeviceInfo]) -> some View {
+        let keys = devices.compactMap { device in
+            deviceColumn(device, streamId: column.key.streamId, columnIndex: column.key.columnIndex)?.key
+        }
+        let state = plotState(for: keys)
+        return Button {
+            bridge.toggleColumnsInLowestPlot(keys)
+        } label: {
+            Text(column.description.isEmpty ? column.name : column.description)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .foregroundStyle(state.isPlottedInAnyPlot ? Color.accentColor : Color.primary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .plotColumnDragSource(keys: keys)
+        .help("Plot \(column.name) from all sensors in the lowest graph")
+    }
+
+    private func deviceColumn(_ device: DeviceInfo, streamId: UInt8, columnIndex: Int) -> ColumnInfo? {
+        device.streams
+            .first { $0.streamId == streamId }?
+            .columns
+            .first { $0.key.columnIndex == columnIndex }
+    }
+
+    private func unifiedStreamKeys(streamId: UInt8, devices: [DeviceInfo]) -> [ColumnKey] {
+        devices.flatMap { device in
+            device.streams.first { $0.streamId == streamId }?.columns.map(\.key) ?? []
         }
     }
 
@@ -5855,6 +5988,9 @@ private struct StreamHeaderRow: View {
     let bridge: BridgeClient
     let plotState: StreamPlotRowState
     let onOpenPlotWindow: (([ColumnKey]) -> Void)?
+    /// Unify mode: plot/drag keys spanning every sensor in the group rather
+    /// than just this stream's own device.
+    var plotKeysOverride: [ColumnKey]? = nil
 
     var body: some View {
         SidebarValueRowLayout() {
@@ -5919,7 +6055,7 @@ private struct StreamHeaderRow: View {
     }
 
     private var plotKeys: [ColumnKey] {
-        stream.columns.map(\.key)
+        plotKeysOverride ?? stream.columns.map(\.key)
     }
 
     @ViewBuilder
@@ -5996,11 +6132,15 @@ private struct StreamColumnRow: View, @MainActor Equatable {
     let bridge: BridgeClient
     let plotState: StreamPlotRowState
     let onOpenPlotWindow: (([ColumnKey]) -> Void)?
+    /// Unify mode: label per-device value rows by sensor route/serial instead
+    /// of repeating the column name.
+    var labelOverride: String? = nil
 
     static func == (lhs: StreamColumnRow, rhs: StreamColumnRow) -> Bool {
         lhs.column == rhs.column
             && lhs.showDetails == rhs.showDetails
             && lhs.plotState == rhs.plotState
+            && lhs.labelOverride == rhs.labelOverride
     }
 
     var body: some View {
@@ -6022,9 +6162,9 @@ private struct StreamColumnRow: View, @MainActor Equatable {
 
     private var labelContent: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(column.description.isEmpty ? column.name : column.description)
+            Text(labelOverride ?? (column.description.isEmpty ? column.name : column.description))
                 .lineLimit(1)
-                .truncationMode(.tail)
+                .truncationMode(labelOverride == nil ? .tail : .middle)
                 .foregroundStyle(plotState.isPlottedInAnyPlot ? Color.accentColor : Color.primary)
 
             if showDetails {
@@ -6190,6 +6330,82 @@ private struct DeviceSectionHeader: View {
                     .font(.caption2)
                     .textCase(nil)
             }
+        }
+    }
+}
+
+// MARK: - Unify mode
+
+/// One entry in the sidebar's device list: either a lone device rendered as
+/// today, or several same-type sensors folded into one unified group.
+private enum SidebarDeviceEntry: Identifiable {
+    case single(DeviceInfo)
+    case unified(name: String, devices: [DeviceInfo])
+
+    var id: String {
+        switch self {
+        case .single(let device):
+            return "single:\(device.id)"
+        case .unified(let name, _):
+            return "unified:\(name)"
+        }
+    }
+}
+
+/// Group same-type sensors (matching `meta.name`) when unify mode is on.
+/// Groups appear at the position of their first member; devices with no name
+/// or no same-type sibling stay as singles.
+private func sidebarDeviceEntries(_ devices: [DeviceInfo], unify: Bool) -> [SidebarDeviceEntry] {
+    guard unify else { return devices.map { .single($0) } }
+
+    var counts: [String: Int] = [:]
+    for device in devices where !device.meta.name.isEmpty {
+        counts[device.meta.name, default: 0] += 1
+    }
+
+    var emitted: Set<String> = []
+    var entries: [SidebarDeviceEntry] = []
+    for device in devices {
+        let name = device.meta.name
+        if name.isEmpty || counts[name, default: 0] < 2 {
+            entries.append(.single(device))
+        } else if emitted.insert(name).inserted {
+            entries.append(.unified(
+                name: name,
+                devices: devices.filter { $0.meta.name == name }
+            ))
+        }
+    }
+    return entries
+}
+
+/// Short identifier for one sensor inside a unified group: route plus serial.
+private func unifiedDeviceKeyLabel(_ device: DeviceInfo) -> String {
+    let route = device.route.isEmpty ? "/" : device.route
+    if device.meta.serialNumber.isEmpty {
+        return route
+    }
+    return "\(route) · \(device.meta.serialNumber)"
+}
+
+private struct UnifiedDeviceSectionHeader: View {
+    let name: String
+    let devices: [DeviceInfo]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.triangle.merge")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(name)
+                    .font(.subheadline.weight(.semibold))
+            }
+            Text(devices.map(unifiedDeviceKeyLabel).joined(separator: "   "))
+                .font(.caption2)
+                .textCase(nil)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
     }
 }
@@ -7324,6 +7540,7 @@ private struct SettingsSidebarSections: View {
     let focusedField: FocusState<RpcFocusField?>.Binding
     @AppStorage(ViewPreferenceKeys.showRPCDetails) private var showRPCDetails = false
     @AppStorage(ViewPreferenceKeys.favoriteRPCs) private var favoriteRPCsRaw = ""
+    @AppStorage(ViewPreferenceKeys.unifySensors) private var unifySensors = false
 
     @ViewBuilder
     var body: some View {
@@ -7381,30 +7598,24 @@ private struct SettingsSidebarSections: View {
                 .listRowSeparator(.hidden)
                 .listRowBackground(Color.clear)
             } else {
-                ForEach(visibleDevices) { device in
-                    DeviceSectionHeader(device: device)
-                        .listRowInsets(denseDeviceHeaderRowInsets)
-                        .listRowSeparator(.hidden)
-                        .listRowBackground(Color.clear)
+                ForEach(deviceEntries) { entry in
+                    switch entry {
+                    case .single(let device):
+                        DeviceSectionHeader(device: device)
+                            .listRowInsets(denseDeviceHeaderRowInsets)
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
 
-                    ForEach(device.rpcs) { rpc in
-                        RpcRow(
-                            bridge: bridge,
-                            rpc: rpc,
-                            showDetails: showRPCDetails,
-                            isSliderActive: activeSliderIDs.contains(rpc.id),
-                            isFavorite: RPCFavorites.contains(rpc, in: favoriteRPCIDs),
-                            onToggleSlider: onToggleSlider,
-                            onCaptureRPC: onCaptureRPC,
-                            onOpenSliderWindow: onOpenSliderWindow,
-                            onOpenCaptureWindow: onOpenCaptureWindow,
-                            onToggleFavorite: toggleFavorite,
-                            focusedField: focusedField
-                        )
-                        .equatable()
-                        .listRowInsets(denseRPCRowInsets)
-                        .listRowSeparator(.hidden)
-                        .listRowBackground(Color.clear)
+                        ForEach(device.rpcs) { rpc in
+                            standardRow(for: rpc)
+                        }
+                    case .unified(let name, let devices):
+                        UnifiedDeviceSectionHeader(name: name, devices: devices)
+                            .listRowInsets(denseDeviceHeaderRowInsets)
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
+
+                        unifiedRows(groupName: name, devices: devices)
                     }
                 }
             }
@@ -7412,6 +7623,100 @@ private struct SettingsSidebarSections: View {
             rpcHeader
         }
         .listSectionSeparator(.hidden)
+    }
+
+    @ViewBuilder
+    private func standardRow(for rpc: RpcInfo, labelOverride: String? = nil, indented: Bool = false) -> some View {
+        RpcRow(
+            bridge: bridge,
+            rpc: rpc,
+            showDetails: showRPCDetails,
+            isSliderActive: activeSliderIDs.contains(rpc.id),
+            isFavorite: RPCFavorites.contains(rpc, in: favoriteRPCIDs),
+            onToggleSlider: onToggleSlider,
+            onCaptureRPC: onCaptureRPC,
+            onOpenSliderWindow: onOpenSliderWindow,
+            onOpenCaptureWindow: onOpenCaptureWindow,
+            onToggleFavorite: toggleFavorite,
+            focusedField: focusedField,
+            labelOverride: labelOverride
+        )
+        .equatable()
+        .padding(.leading, indented ? streamChildRowLeadingPadding : 0)
+        .listRowInsets(denseRPCRowInsets)
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
+    }
+
+    @ViewBuilder
+    private func unifiedRows(groupName: String, devices: [DeviceInfo]) -> some View {
+        ForEach(unifiedRPCGroups(devices: devices), id: \.id) { group in
+            if group.rpcs.count < 2 || group.rpcs[0].isCaptureRPC {
+                // Not unifiable (only one device has it, or capture rows act
+                // per device): render plain rows labeled by sensor.
+                ForEach(group.rpcs) { rpc in
+                    standardRow(
+                        for: rpc,
+                        labelOverride: group.rpcs.count < 2
+                            ? rpc.name
+                            : "\(rpc.name) — \(deviceKeyLabel(for: rpc, devices: devices))"
+                    )
+                }
+            } else {
+                UnifiedRpcRow(
+                    bridge: bridge,
+                    groupName: groupName,
+                    rpcs: group.rpcs,
+                    showDetails: showRPCDetails,
+                    focusedField: focusedField
+                )
+                .listRowInsets(denseRPCRowInsets)
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
+
+                if unifiedRPCValuesDiffer(group.rpcs) {
+                    ForEach(group.rpcs) { rpc in
+                        standardRow(
+                            for: rpc,
+                            labelOverride: deviceKeyLabel(for: rpc, devices: devices),
+                            indented: true
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private struct UnifiedRPCGroup: Identifiable {
+        let id: String
+        let rpcs: [RpcInfo]
+    }
+
+    /// Same-named RPCs across the group's devices, ordered by the first
+    /// device's RPC list, with any names unique to later devices appended.
+    private func unifiedRPCGroups(devices: [DeviceInfo]) -> [UnifiedRPCGroup] {
+        var seen: Set<String> = []
+        var groups: [UnifiedRPCGroup] = []
+        for device in devices {
+            for rpc in device.rpcs where seen.insert(rpc.name).inserted {
+                let matching = devices.compactMap { candidate in
+                    candidate.rpcs.first { $0.name == rpc.name }
+                }
+                groups.append(UnifiedRPCGroup(id: rpc.name, rpcs: matching))
+            }
+        }
+        return groups
+    }
+
+    private func deviceKeyLabel(for rpc: RpcInfo, devices: [DeviceInfo]) -> String {
+        guard let device = devices.first(where: { $0.route == rpc.route }) else {
+            return rpc.route
+        }
+        return unifiedDeviceKeyLabel(device)
+    }
+
+    private var deviceEntries: [SidebarDeviceEntry] {
+        sidebarDeviceEntries(visibleDevices, unify: unifySensors)
     }
 
     private var visibleDevices: [DeviceInfo] {
@@ -7451,10 +7756,27 @@ private struct SettingsSidebarSections: View {
         }
     }
 
+    private func isEditableSetting(_ rpc: RpcInfo) -> Bool {
+        rpc.writable && rpc.hasMetadata && !rpc.isActionRPC && !rpc.isCaptureRPC && !rpc.isEnableSwitchRPC
+    }
+
     private var editableRPCIDs: [String] {
-        visibleDevices.flatMap { device in
-            device.rpcs.compactMap { rpc in
-                rpc.writable && rpc.hasMetadata && !rpc.isActionRPC && !rpc.isCaptureRPC && !rpc.isEnableSwitchRPC ? rpc.id : nil
+        deviceEntries.flatMap { entry -> [String] in
+            switch entry {
+            case .single(let device):
+                return device.rpcs.filter(isEditableSetting).map(\.id)
+            case .unified(let name, let devices):
+                return unifiedRPCGroups(devices: devices).flatMap { group -> [String] in
+                    if group.rpcs.count < 2 || group.rpcs[0].isCaptureRPC {
+                        return group.rpcs.filter(isEditableSetting).map(\.id)
+                    }
+                    guard isEditableSetting(group.rpcs[0]) else { return [] }
+                    var ids = [unifiedRPCFieldID(groupName: name, rpcName: group.rpcs[0].name)]
+                    if unifiedRPCValuesDiffer(group.rpcs) {
+                        ids += group.rpcs.map(\.id)
+                    }
+                    return ids
+                }
             }
         }
     }
@@ -7506,6 +7828,9 @@ private struct RpcRow: View, @MainActor Equatable {
     let onOpenCaptureWindow: ((RpcInfo) -> Void)?
     let onToggleFavorite: (RpcInfo) -> Void
     let focusedField: FocusState<RpcFocusField?>.Binding
+    /// Replaces the RPC name in the row label; used by unify mode's
+    /// per-device sub-rows to label rows by route/serial instead.
+    var labelOverride: String? = nil
 
     @AppStorage(ViewPreferenceKeys.rpcFloatPrecisionPPM) private var rpcFloatPrecisionPPM = NumericDisplayPolicy.defaultRPCFloatPrecisionPPM
     @State private var argument = ""
@@ -7516,6 +7841,7 @@ private struct RpcRow: View, @MainActor Equatable {
             && lhs.showDetails == rhs.showDetails
             && lhs.isSliderActive == rhs.isSliderActive
             && lhs.isFavorite == rhs.isFavorite
+            && lhs.labelOverride == rhs.labelOverride
     }
 
     var body: some View {
@@ -7584,7 +7910,7 @@ private struct RpcRow: View, @MainActor Equatable {
     }
 
     private var settingNameText: some View {
-        Text(rpc.name)
+        Text(labelOverride ?? rpc.name)
             .font(.body)
             .lineLimit(1)
             .truncationMode(.middle)
@@ -7783,16 +8109,7 @@ private struct RpcRow: View, @MainActor Equatable {
     }
 
     private func argumentText(for value: JSONValue) -> String {
-        if case .number(let number) = value,
-           rpc.isNumericRPC,
-           !rpc.isIntegerRPC {
-            return fixedRPCFloatText(number)
-        }
-
-        return value.rpcDisplayText(
-            argType: rpc.argType,
-            floatPrecisionPPM: rpcFloatPrecisionPPM
-        )
+        rpcArgumentDisplayText(value, rpc: rpc, floatPrecisionPPM: rpcFloatPrecisionPPM)
     }
 
     private func syncArgument(with value: JSONValue) {
@@ -7823,6 +8140,246 @@ private struct RpcRow: View, @MainActor Equatable {
         bridge.callRpc(rpc, argumentText: newText)
     }
 
+}
+
+/// Whether the same-named RPCs across a unified sensor group currently report
+/// different values (a nil among known values counts as differing).
+private func unifiedRPCValuesDiffer(_ rpcs: [RpcInfo]) -> Bool {
+    guard rpcs.count > 1 else { return false }
+    if rpcs.allSatisfy({ $0.value == nil }) { return false }
+    guard let first = rpcs.first?.value else { return true }
+    return !rpcs.dropFirst().allSatisfy { $0.value == first }
+}
+
+/// Focus/tab identifier for a unified settings field.
+private func unifiedRPCFieldID(groupName: String, rpcName: String) -> String {
+    "unified:\(groupName)#\(rpcName)"
+}
+
+/// One settings row representing the same RPC across several same-type
+/// sensors. When every sensor reports the same value, the row shows that
+/// value once, marked with a merge icon; edits are written to all sensors.
+/// When values differ, the field is empty (placeholder "mixed") and the
+/// caller renders one editable sub-row per sensor below.
+private struct UnifiedRpcRow: View {
+    let bridge: BridgeClient
+    let groupName: String
+    let rpcs: [RpcInfo]
+    let showDetails: Bool
+    let focusedField: FocusState<RpcFocusField?>.Binding
+
+    @AppStorage(ViewPreferenceKeys.rpcFloatPrecisionPPM) private var rpcFloatPrecisionPPM = NumericDisplayPolicy.defaultRPCFloatPrecisionPPM
+    @State private var argument = ""
+    @State private var committedArgument = ""
+
+    private var primary: RpcInfo { rpcs[0] }
+
+    private var fieldID: String {
+        unifiedRPCFieldID(groupName: groupName, rpcName: primary.name)
+    }
+
+    /// The common value across all sensors, or nil when they differ or none
+    /// is known yet.
+    private var unifiedValue: JSONValue? {
+        guard let first = primary.value,
+              rpcs.dropFirst().allSatisfy({ $0.value == first }) else {
+            return nil
+        }
+        return first
+    }
+
+    private var valuesDiffer: Bool {
+        unifiedRPCValuesDiffer(rpcs)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            SidebarValueRowLayout() {
+                labelContent
+                    .layoutPriority(1)
+                trailingControls
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 1)
+        .onAppear {
+            syncArgument()
+        }
+        .onChange(of: unifiedValue) { _, _ in
+            syncArgument()
+        }
+        .onChange(of: focusedField.wrappedValue) { oldValue, newValue in
+            guard oldValue == .rpc(fieldID), newValue != .rpc(fieldID) else { return }
+            commitIfChanged()
+        }
+    }
+
+    private var labelContent: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(primary.name)
+                .font(.body)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .contextMenu {
+                    Button {
+                        reloadAll()
+                    } label: {
+                        Label("Reload All", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(!primary.readable)
+                }
+            if showDetails {
+                Text("\(primary.permissions) \(primary.argType) ×\(rpcs.count)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var trailingControls: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "arrow.triangle.merge")
+                .font(.caption)
+                .foregroundStyle(valuesDiffer ? AnyShapeStyle(.tertiary) : AnyShapeStyle(Color.accentColor))
+                .help(valuesDiffer
+                    ? "Sensors report different values; edit below or type here to set all"
+                    : "All sensors share this value; edits apply to every sensor")
+
+            unifiedControl
+        }
+    }
+
+    @ViewBuilder
+    private var unifiedControl: some View {
+        if primary.isActionRPC {
+            Button {
+                for rpc in rpcs where rpc.writable {
+                    bridge.callRpc(rpc)
+                }
+            } label: {
+                Text(actionButtonTitle)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 108)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(!primary.writable)
+            .frame(width: 128, alignment: .trailing)
+            .help("Run \(primary.name) on all sensors")
+        } else if primary.isEnableSwitchRPC {
+            Toggle(isOn: unifiedEnableBinding) {
+                EmptyView()
+            }
+            .toggleStyle(.switch)
+            .labelsHidden()
+            .controlSize(.small)
+            .disabled(!primary.writable)
+            .frame(width: 128, alignment: .trailing)
+            .help(valuesDiffer
+                ? "Sensors differ; toggling sets all sensors"
+                : "Set \(primary.name) on all sensors")
+        } else {
+            #if os(macOS)
+            SteppableRPCField(
+                text: $argument,
+                focus: focusedField,
+                focusTag: .rpc(fieldID),
+                placeholder: valuesDiffer ? "mixed" : rpcDisplayType,
+                isEnabled: primary.writable && primary.hasMetadata,
+                fixedFractionDigits: primary.isIntegerRPC ? nil : 3,
+                onStep: { writeAll($0) },
+                onCommit: commit
+            )
+            .frame(width: 128)
+            .focused(focusedField, equals: .rpc(fieldID))
+            #else
+            TextField(valuesDiffer ? "mixed" : rpcDisplayType, text: $argument)
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .disabled(!primary.writable || !primary.hasMetadata)
+                .frame(width: 128)
+                .focused(focusedField, equals: .rpc(fieldID))
+                .onSubmit(commit)
+            #endif
+        }
+    }
+
+    private var unifiedEnableBinding: Binding<Bool> {
+        Binding(
+            get: {
+                guard case .bool(let value)? = unifiedValue else {
+                    if case .number(let value)? = unifiedValue { return value != 0 }
+                    return false
+                }
+                return value
+            },
+            set: { isEnabled in
+                let text: String
+                switch primary.baseArgType {
+                case "bool", "string":
+                    text = isEnabled ? "true" : "false"
+                default:
+                    text = isEnabled ? "1" : "0"
+                }
+                writeAll(text)
+            }
+        )
+    }
+
+    private var rpcDisplayType: String {
+        let type = primary.argType.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !primary.hasMetadata || type.isEmpty {
+            return "missing"
+        }
+        return type == "unit" ? "string" : type
+    }
+
+    private var actionButtonTitle: String {
+        primary.name
+            .split(separator: ".")
+            .last
+            .map(String.init)
+            ?? primary.name
+    }
+
+    private func syncArgument() {
+        let newText = unifiedValue.map {
+            rpcArgumentDisplayText($0, rpc: primary, floatPrecisionPPM: rpcFloatPrecisionPPM)
+        } ?? ""
+        committedArgument = newText
+        guard focusedField.wrappedValue != .rpc(fieldID) else { return }
+        if newText != argument {
+            argument = newText
+        }
+    }
+
+    private func commit() {
+        let trimmed = argument.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        writeAll(argument)
+    }
+
+    private func commitIfChanged() {
+        guard argument != committedArgument else { return }
+        commit()
+    }
+
+    private func writeAll(_ text: String) {
+        committedArgument = text
+        if argument != text {
+            argument = text
+        }
+        for rpc in rpcs where rpc.writable && rpc.hasMetadata {
+            bridge.callRpc(rpc, argumentText: text)
+        }
+    }
+
+    private func reloadAll() {
+        for rpc in rpcs where rpc.readable {
+            bridge.callRpc(rpc)
+        }
+    }
 }
 
 #if os(macOS)
@@ -8444,6 +9001,24 @@ private func fixedRPCFloatText(_ value: Double) -> String {
     guard value.isFinite else { return String(format: "%.3f", value) }
     let normalized = abs(value) < 0.0005 ? 0 : value
     return String(format: "%.3f", normalized)
+}
+
+/// Canonical display text for an RPC value in an editable settings field.
+private func rpcArgumentDisplayText(
+    _ value: JSONValue,
+    rpc: RpcInfo,
+    floatPrecisionPPM: Double
+) -> String {
+    if case .number(let number) = value,
+       rpc.isNumericRPC,
+       !rpc.isIntegerRPC {
+        return fixedRPCFloatText(number)
+    }
+
+    return value.rpcDisplayText(
+        argType: rpc.argType,
+        floatPrecisionPPM: floatPrecisionPPM
+    )
 }
 
 private func sidebarHeader(_ title: String, systemImage: String) -> some View {
