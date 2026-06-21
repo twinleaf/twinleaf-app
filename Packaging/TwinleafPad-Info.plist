@@ -47,6 +47,11 @@
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Twinleaf connects to nearby Twinleaf devices and local TIO proxies on your network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_twinleaf._tcp</string>
+		<string>_twinleaf._udp</string>
+	</array>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UIApplicationSceneManifest</key>

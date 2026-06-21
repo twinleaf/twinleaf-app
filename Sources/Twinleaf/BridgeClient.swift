@@ -156,6 +156,9 @@ final class BridgeClient: ObservableObject {
     @Published private(set) var availableUpgrades: [FirmwareUpgrade] = []
     /// Live progress of an in-flight firmware flash, or nil when none is running.
     @Published private(set) var upgradeProgress: FirmwareUpgradeProgress?
+    /// Per-stream timing/rate diagnostics (mirrors `tio health`), refreshed
+    /// continuously while connected.
+    @Published private(set) var streamHealth: [StreamHealthInfo] = []
     @Published private(set) var logMessages: [LogMessage] = []
     @Published private(set) var logRevision: UInt64 = 0
     @Published private(set) var isInspectionMode = false
@@ -179,6 +182,18 @@ final class BridgeClient: ObservableObject {
 
     private var runtime: (any BridgeRuntime)?
     private var discoveredDevices: [AvailableDevice] = []
+    #if os(iOS)
+    private var mdnsDevices: [AvailableDevice] = []
+    private lazy var bonjourBrowser: BonjourDeviceBrowser = {
+        let browser = BonjourDeviceBrowser()
+        browser.onChange = { [weak self] devices in
+            guard let self else { return }
+            self.mdnsDevices = devices
+            self.refreshAvailableDevices()
+        }
+        return browser
+    }()
+    #endif
     private var pendingPlotSnapshots: [Int: PlotSnapshot] = [:]
     private var lastLogRevisionMark = Date.distantPast
     private var nextPlotPaneID = 1
@@ -255,6 +270,12 @@ final class BridgeClient: ObservableObject {
 
     func listDevices(includeAllSerial: Bool? = nil) {
         startIfNeeded()
+        #if os(iOS)
+        // Browse the local network natively on iOS (the Rust core's raw-socket
+        // mDNS is macOS-only). Idempotent; keeps running and republishes as
+        // devices appear or vanish.
+        bonjourBrowser.start()
+        #endif
         refreshAvailableDevices()
         let includeAll = includeAllSerial ?? Self.loadShowAllSerialPorts()
         shouldRetryAllSerialAfterStrictDiscovery = !includeAll
@@ -279,6 +300,7 @@ final class BridgeClient: ObservableObject {
         connectionProgress = .started(attemptID: attemptID, device: device)
         availableUpgrades = []
         upgradeProgress = nil
+        streamHealth = []
         isInspectionMode = false
         rpcCacheNeedsReload = false
         clearLogMessages()
@@ -306,6 +328,7 @@ final class BridgeClient: ObservableObject {
         isInspectionMode = true
         isPlotPaused = true
         rpcCacheNeedsReload = false
+        streamHealth = []
         clearLogMessages()
         clearRPCReadbackState()
         clearStreamDisplayValues()
@@ -343,6 +366,7 @@ final class BridgeClient: ObservableObject {
         isPlotPaused = false
         availableUpgrades = []
         upgradeProgress = nil
+        streamHealth = []
     }
 
     /// Re-run the lazy firmware-availability check for the active session.
@@ -1317,6 +1341,8 @@ final class BridgeClient: ObservableObject {
                 availableUpgrades = event.available
             case "upgradeProgress":
                 handleUpgradeProgressEvent(try decoder.decode(FirmwareUpgradeProgress.self, from: data))
+            case "health":
+                streamHealth = try decoder.decode(StreamHealthEvent.self, from: data).streams
             default:
                 break
             }
@@ -1634,6 +1660,12 @@ final class BridgeClient: ObservableObject {
             devices.append(device)
         }
 
+        #if os(iOS)
+        for device in mdnsDevices where seenURLs.insert(device.url).inserted {
+            devices.append(device)
+        }
+        #endif
+
         availableDevices = devices
         let rendered = devices.map { "\($0.kind)|\($0.url)" }.joined(separator: " ; ")
         logDeviceDiscovery("availableDevices refreshed count=\(devices.count) rendered=[\(rendered)]")
@@ -1874,10 +1906,15 @@ final class BridgeClient: ObservableObject {
             .lazy
             .compactMap { device -> [ColumnKey]? in
                 guard !self.shouldSuppressDefaultStreamSelection(for: device) else { return nil }
-                return device.streams
-                    .first { $0.streamId == 1 }?
+                // The first stream that actually carries data columns, in
+                // stream-id order. (Previously hardcoded to stream id 1, which
+                // skipped devices whose data stream is id 0, e.g. `vector`.)
+                let columns = device.streams
+                    .filter { !$0.columns.isEmpty }
+                    .min { $0.streamId < $1.streamId }?
                     .columns
                     .map(\.key)
+                return (columns?.isEmpty == false) ? columns : nil
             }
             .first ?? []
 
@@ -2314,6 +2351,29 @@ private struct StatusEvent: Decodable {
 
 private struct ErrorEvent: Decodable {
     let message: String
+}
+
+// MARK: - Health diagnostics models (module-internal: used by the UI layer)
+
+/// Per-stream timing/rate diagnostics from the bridge's health monitor.
+struct StreamHealthInfo: Decodable, Hashable, Identifiable {
+    let route: String
+    let streamId: Int
+    let name: String
+    let rateHz: Double?
+    let ppm: Double?
+    let driftSeconds: Double?
+    let jitterMs: Double?
+    let received: UInt64
+    let dropped: UInt64
+    let sessionId: UInt32?
+    let stale: Bool
+
+    var id: String { "\(route)#\(streamId)" }
+}
+
+private struct StreamHealthEvent: Decodable {
+    let streams: [StreamHealthInfo]
 }
 
 // MARK: - Firmware upgrade models (module-internal: used by the UI layer)
@@ -2882,3 +2942,135 @@ private enum BridgeEventProfiler {
         cadenceByName[name] = Cadence(windowStart: now)
     }
 }
+
+#if os(iOS)
+/// iOS-native mDNS/Bonjour discovery of Twinleaf network devices.
+///
+/// macOS gets network discovery from the Rust core (raw multicast under the
+/// sandbox). iOS forbids raw multicast without the approval-gated multicast
+/// entitlement, so on iOS we browse with `NetServiceBrowser` instead, which
+/// needs only the Local Network permission plus the `NSBonjourServices`
+/// Info.plist keys. Resolving each service yields its advertised `.local`
+/// hostname and port, so connect URLs read `tcp://twinleaf-00076.local:7855`
+/// (no raw IP / interface scope). TCP is preferred when a device advertises
+/// both transports.
+///
+/// Not `@MainActor`: `NetService`/`NetServiceBrowser` deliver delegate
+/// callbacks on the run loop they are scheduled on. Everything here is driven
+/// on the main run loop, and `onChange` is hopped onto the main actor when
+/// fired.
+final class BonjourDeviceBrowser: NSObject {
+    /// Called on the main actor whenever the discovered set changes.
+    var onChange: (@MainActor ([AvailableDevice]) -> Void)?
+
+    private static let serviceTypes = ["_twinleaf._tcp.", "_twinleaf._udp."]
+
+    private var browsers: [NetServiceBrowser] = []
+    /// Services currently being resolved or already resolved, retained so they
+    /// are not deallocated mid-resolution. Keyed by "scheme|instanceName".
+    private var services: [String: NetService] = [:]
+    private var devicesByKey: [String: AvailableDevice] = [:]
+
+    func start() {
+        guard browsers.isEmpty else { return }
+        for type in Self.serviceTypes {
+            let browser = NetServiceBrowser()
+            browser.delegate = self
+            browser.schedule(in: .main, forMode: .common)
+            browser.searchForServices(ofType: type, inDomain: "local.")
+            browsers.append(browser)
+        }
+    }
+
+    func stop() {
+        for browser in browsers {
+            browser.stop()
+        }
+        browsers.removeAll()
+        for service in services.values {
+            service.stop()
+        }
+        services.removeAll()
+        devicesByKey.removeAll()
+    }
+
+    private static func scheme(for type: String) -> String {
+        type.contains("_udp") ? "udp" : "tcp"
+    }
+
+    private func key(scheme: String, name: String) -> String {
+        "\(scheme)|\(name)"
+    }
+
+    /// Merge per-scheme entries into one device per instance name, preferring
+    /// the TCP advertisement when a device offers both, then notify.
+    private func publish() {
+        var byName: [String: AvailableDevice] = [:]
+        for (entryKey, device) in devicesByKey {
+            let name = entryKey.split(separator: "|", maxSplits: 1).last.map(String.init) ?? entryKey
+            if let existing = byName[name], existing.url.hasPrefix("tcp") {
+                continue
+            }
+            byName[name] = device
+        }
+        let merged = byName.values.sorted { $0.url < $1.url }
+        // Capture only Sendable locals (not self) so the main-actor hop is
+        // data-race-free under Swift 6. Delegate callbacks already run on the
+        // main run loop, so this asserts isolation rather than dispatching.
+        let callback = onChange
+        MainActor.assumeIsolated {
+            callback?(merged)
+        }
+    }
+}
+
+extension BonjourDeviceBrowser: NetServiceBrowserDelegate {
+    func netServiceBrowser(
+        _ browser: NetServiceBrowser,
+        didFind service: NetService,
+        moreComing: Bool
+    ) {
+        let scheme = Self.scheme(for: service.type)
+        let entryKey = key(scheme: scheme, name: service.name)
+        services[entryKey] = service
+        service.delegate = self
+        service.schedule(in: .main, forMode: .common)
+        service.resolve(withTimeout: 5)
+    }
+
+    func netServiceBrowser(
+        _ browser: NetServiceBrowser,
+        didRemove service: NetService,
+        moreComing: Bool
+    ) {
+        let scheme = Self.scheme(for: service.type)
+        let entryKey = key(scheme: scheme, name: service.name)
+        services[entryKey]?.stop()
+        services.removeValue(forKey: entryKey)
+        if devicesByKey.removeValue(forKey: entryKey) != nil {
+            publish()
+        }
+    }
+}
+
+extension BonjourDeviceBrowser: NetServiceDelegate {
+    func netServiceDidResolveAddress(_ sender: NetService) {
+        guard let host = sender.hostName, sender.port > 0 else { return }
+        let hostText = host.hasSuffix(".") ? String(host.dropLast()) : host
+        let scheme = Self.scheme(for: sender.type)
+        let entryKey = key(scheme: scheme, name: sender.name)
+        devicesByKey[entryKey] = AvailableDevice(
+            url: "\(scheme)://\(hostText):\(sender.port)",
+            label: sender.name,
+            kind: "network",
+            detail: "\(scheme.uppercased()) \u{00B7} \(hostText):\(sender.port)"
+        )
+        publish()
+    }
+
+    func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
+        let scheme = Self.scheme(for: sender.type)
+        services.removeValue(forKey: key(scheme: scheme, name: sender.name))
+    }
+}
+#endif

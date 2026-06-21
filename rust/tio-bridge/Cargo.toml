@@ -10,12 +10,16 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 path = "src/lib.rs"
 
 [features]
-default = ["serial", "firmware"]
+default = ["serial", "firmware", "mdns"]
 serial = ["twinleaf/serial"]
 hdf5 = ["twinleaf/hdf5"]
 # Firmware update support: lazy availability check + flashing, backed by the
 # GitHub firmware catalog (pulls in an HTTP client + TLS via twinleaf).
 firmware = ["twinleaf/firmware-update"]
+# Network device discovery over mDNS/DNS-SD. Uses raw multicast sockets, which
+# require the multicast networking entitlement on macOS/iOS. Enabled on macOS;
+# omitted from the iOS build (that entitlement is approval-gated).
+mdns = ["twinleaf/mdns"]
 
 # Full debug info in release builds, packed into .dSYM bundles next to the
 # artifacts. App Store Connect requires matching dSYMs for every binary in an

@@ -11,13 +11,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use twinleaf::data::{DeviceDataParser, DeviceFullMetadata, Sample};
+use twinleaf::data::{BoundaryReason, DeviceDataParser, DeviceFullMetadata, Sample};
 use twinleaf::device::capture::{read_capture, CaptureReadout, CaptureRpc};
 use twinleaf::device::{
     DeviceEvent, DeviceTree, RpcDescriptor, RpcMetaFlags, RpcValueType, TreeEvent,
 };
+#[cfg(any(feature = "serial", feature = "mdns"))]
+use twinleaf::device::discovery::{self};
 #[cfg(feature = "serial")]
-use twinleaf::device::discovery::{self, PortInterface};
+use twinleaf::device::discovery::PortInterface;
 #[cfg(feature = "firmware")]
 use twinleaf::firmware::{self, FirmwareCatalog, FlashEvent, StopOutcome, UpdateStatus};
 use twinleaf::tio::proto::meta::MetadataEpoch;
@@ -33,6 +35,11 @@ const DEVICE_LIST_DISCOVERY_WINDOW: Duration = Duration::from_millis(300);
 const DEVICE_LIST_NAME_RPC_TIMEOUT: Duration = Duration::from_millis(200);
 #[cfg(feature = "serial")]
 const DEVICE_LIST_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+/// Upper bound on each mDNS browse. `enumerate_mdns` exits early once results
+/// go quiet, so a warm cache resolves well under this; the cap only applies on
+/// a cold first browse. Kept short so periodic refreshes stay snappy.
+#[cfg(feature = "mdns")]
+const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(1500);
 
 const EVENT_JSON: u32 = 0;
 const EVENT_PLOT: u32 = 1;
@@ -63,6 +70,14 @@ const RPC_METADATA_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 /// Minimum spacing between metadata/RPC refreshes triggered by a device reset,
 /// so a device that reboots repeatedly can't keep the session busy refetching.
 const DEVICE_RESET_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Health diagnostics (mirrors `tio health`): jitter window length, the sample
+/// count before drift/PPM is trusted, the stale-stream floor, and the emit
+/// cadence to the UI.
+const HEALTH_JITTER_WINDOW_SECONDS: u64 = 10;
+const HEALTH_MIN_DRIFT_SAMPLES: u64 = 50;
+const HEALTH_STALE_FLOOR: Duration = Duration::from_millis(2000);
+const HEALTH_EMIT_INTERVAL: Duration = Duration::from_millis(500);
 
 type EventCallback = extern "C" fn(kind: u32, data: *const u8, len: usize, context: usize);
 
@@ -2489,9 +2504,36 @@ fn list_available_devices(include_all: bool) -> Vec<AvailableDevice> {
         routes: Vec::new(),
     }];
 
+    append_mdns_devices(&mut devices);
     append_serial_devices(&mut devices, include_all);
 
     devices
+}
+
+/// Browse the local network for Twinleaf devices advertised over mDNS and add
+/// any that aren't already in the list. No-op when the `mdns` feature is off.
+fn append_mdns_devices(devices: &mut Vec<AvailableDevice>) {
+    #[cfg(feature = "mdns")]
+    {
+        let existing: HashSet<String> = devices.iter().map(|d| d.url.clone()).collect();
+        for found in discovery::enumerate_mdns(MDNS_DISCOVERY_TIMEOUT) {
+            if existing.contains(&found.url) {
+                continue;
+            }
+            let scheme = found.url.split("://").next().unwrap_or("network");
+            devices.push(AvailableDevice {
+                label: found.name.clone().unwrap_or_else(|| found.url.clone()),
+                kind: "network".to_string(),
+                detail: format!("{} · {found_url}", scheme.to_uppercase(), found_url = found.url),
+                url: found.url,
+                routes: Vec::new(),
+            });
+        }
+    }
+    #[cfg(not(feature = "mdns"))]
+    {
+        let _ = devices;
+    }
 }
 
 #[cfg(feature = "serial")]
@@ -2512,6 +2554,8 @@ fn append_serial_devices(devices: &mut Vec<AvailableDevice>, include_all: bool) 
         match &device.interface {
             PortInterface::Unknown(_, _) => unknown_devices.push(device),
             PortInterface::FTDI | PortInterface::STM32 => probe_candidates.push(device),
+            // Network devices come from mDNS, not serial enumeration.
+            PortInterface::Network => {}
         }
     }
 
@@ -2680,6 +2724,7 @@ fn serial_device_kind(interface: &PortInterface) -> &'static str {
         PortInterface::FTDI => "Twinleaf FTDI",
         PortInterface::STM32 => "Twinleaf STM32",
         PortInterface::Unknown(_, _) => "USB serial",
+        PortInterface::Network => "Network",
     }
 }
 
@@ -2710,6 +2755,7 @@ fn interface_detail(interface: &PortInterface) -> String {
         PortInterface::FTDI => "VID 0403, PID 6015".to_string(),
         PortInterface::STM32 => "VID 0483, PID 5740".to_string(),
         PortInterface::Unknown(vid, pid) => format!("VID {vid:04x}, PID {pid:04x}"),
+        PortInterface::Network => "Network".to_string(),
     }
 }
 
@@ -2892,6 +2938,248 @@ fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, em
     }
 }
 
+// MARK: - Health diagnostics
+//
+// Per-stream timing/rate diagnostics equivalent to `tio health`. The math
+// (incremental OLS for drift and rate, a ring-buffer jitter window) is ported
+// from twinleaf-tools, which is a binary crate the bridge can't depend on.
+
+/// Incremental ordinary-least-squares slope, anchored at the first point to
+/// keep the sums small.
+#[derive(Default)]
+struct OnlineSlope {
+    n: u64,
+    sum_x: f64,
+    sum_y: f64,
+    sum_xx: f64,
+    sum_xy: f64,
+    x0: f64,
+    y0: f64,
+}
+
+impl OnlineSlope {
+    fn push(&mut self, x: f64, y: f64) {
+        if self.n == 0 {
+            self.x0 = x;
+            self.y0 = y;
+        }
+        let dx = x - self.x0;
+        let dy = y - self.y0;
+        self.n += 1;
+        self.sum_x += dx;
+        self.sum_y += dy;
+        self.sum_xx += dx * dx;
+        self.sum_xy += dx * dy;
+    }
+
+    fn slope(&self) -> Option<f64> {
+        if self.n < 2 {
+            return None;
+        }
+        let denom = self.n as f64 * self.sum_xx - self.sum_x * self.sum_x;
+        if denom.abs() < f64::EPSILON {
+            return None;
+        }
+        Some((self.n as f64 * self.sum_xy - self.sum_x * self.sum_y) / denom)
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Fixed-capacity ring of inter-sample timing deltas (ms); reports their stddev.
+struct JitterWindow {
+    buf: Vec<f64>,
+    idx: usize,
+    filled: bool,
+}
+
+impl JitterWindow {
+    fn new(seconds: u64, hz_guess: f64) -> Self {
+        let cap = ((seconds as f64 * hz_guess).round() as usize).max(16);
+        Self {
+            buf: vec![0.0; cap],
+            idx: 0,
+            filled: false,
+        }
+    }
+
+    fn push(&mut self, value: f64) {
+        self.buf[self.idx] = value;
+        self.idx = (self.idx + 1) % self.buf.len();
+        if self.idx == 0 {
+            self.filled = true;
+        }
+    }
+
+    fn std_ms(&self) -> f64 {
+        let n = if self.filled { self.buf.len() } else { self.idx };
+        if n == 0 {
+            return 0.0;
+        }
+        let mean = self.buf[..n].iter().sum::<f64>() / n as f64;
+        let var = self.buf[..n].iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+        var.sqrt()
+    }
+}
+
+#[derive(Default)]
+struct StreamHealth {
+    name: String,
+    host_epoch: Option<Instant>,
+    drift_slope: OnlineSlope,
+    drift_s: f64,
+    ppm: f64,
+    last_host: Option<Instant>,
+    last_data: Option<f64>,
+    jitter_ms: f64,
+    jitter_window: Option<JitterWindow>,
+    last_n: Option<u32>,
+    samples_dropped: u64,
+    session_id: Option<u32>,
+    rate_slope: OnlineSlope,
+    received_count: u64,
+    rate_smps: f64,
+    last_seen: Option<Instant>,
+}
+
+impl StreamHealth {
+    fn on_sample(&mut self, sample_n: u32, t_data: f64, now: Instant) {
+        let epoch = *self.host_epoch.get_or_insert(now);
+        let host_time = now.duration_since(epoch).as_secs_f64();
+
+        let window = self
+            .jitter_window
+            .get_or_insert_with(|| JitterWindow::new(HEALTH_JITTER_WINDOW_SECONDS, 100.0));
+        if let (Some(last_host), Some(last_data)) = (self.last_host, self.last_data) {
+            let dh = now.duration_since(last_host).as_secs_f64();
+            let dd = t_data - last_data;
+            window.push((dd - dh) * 1000.0);
+            self.jitter_ms = window.std_ms();
+        }
+        self.last_host = Some(now);
+        self.last_data = Some(t_data);
+
+        self.drift_slope.push(host_time, t_data);
+        if self.drift_slope.n >= HEALTH_MIN_DRIFT_SAMPLES {
+            if let Some(beta) = self.drift_slope.slope() {
+                let host_elapsed = host_time - self.drift_slope.x0;
+                self.drift_s = (beta - 1.0) * host_elapsed;
+                self.ppm = (beta - 1.0) * 1e6;
+            }
+        }
+
+        self.received_count += 1;
+        self.rate_slope.push(host_time, self.received_count as f64);
+        if let Some(slope) = self.rate_slope.slope() {
+            self.rate_smps = slope;
+        }
+
+        self.last_n = Some(sample_n);
+    }
+
+    fn reset_timing(&mut self) {
+        self.drift_slope.reset();
+        self.drift_s = 0.0;
+        self.ppm = 0.0;
+        self.last_host = None;
+        self.last_data = None;
+        self.jitter_ms = 0.0;
+        self.jitter_window = None;
+        self.last_n = None;
+    }
+
+    fn reset_for_new_session(&mut self, session_id: u32) {
+        self.reset_timing();
+        self.samples_dropped = 0;
+        self.session_id = Some(session_id);
+    }
+
+    fn stale_threshold(&self) -> Duration {
+        if self.rate_slope.n >= 2 && self.rate_smps > 0.0 {
+            Duration::from_secs_f64(2.0 / self.rate_smps).max(HEALTH_STALE_FLOOR)
+        } else {
+            HEALTH_STALE_FLOOR
+        }
+    }
+
+    fn is_stale(&self, now: Instant) -> bool {
+        self.last_seen
+            .map(|seen| now.duration_since(seen) > self.stale_threshold())
+            .unwrap_or(true)
+    }
+}
+
+#[derive(Default)]
+struct HealthMonitor {
+    streams: HashMap<(DeviceRoute, u8), StreamHealth>,
+}
+
+impl HealthMonitor {
+    fn observe(&mut self, sample: &Sample, route: &DeviceRoute, now: Instant) {
+        let key = (route.clone(), sample.stream.stream_id);
+        let stats = self.streams.entry(key).or_insert_with(|| StreamHealth {
+            name: sample.stream.name.clone(),
+            session_id: Some(sample.device.session_id),
+            ..Default::default()
+        });
+        stats.name = sample.stream.name.clone();
+
+        if let Some(boundary) = &sample.boundary {
+            match &boundary.reason {
+                BoundaryReason::SessionChanged { new, .. } => stats.reset_for_new_session(*new),
+                BoundaryReason::SamplesLost { expected, received } => {
+                    stats.samples_dropped += u64::from(received.wrapping_sub(*expected));
+                }
+                _ => {}
+            }
+        }
+
+        if stats.last_n.map(|n| sample.n != n).unwrap_or(true) {
+            stats.last_seen = Some(now);
+        }
+        stats.on_sample(sample.n, sample.timestamp_end(), now);
+    }
+
+    /// Drop all streams for a route (device reset / disconnect).
+    fn reset_route(&mut self, route: &DeviceRoute) {
+        self.streams.retain(|(r, _), _| r != route);
+    }
+
+    fn snapshot(&self, now: Instant) -> Value {
+        let mut entries: Vec<(&(DeviceRoute, u8), &StreamHealth)> = self.streams.iter().collect();
+        entries.sort_by(|a, b| (a.0 .0.to_string(), a.0 .1).cmp(&(b.0 .0.to_string(), b.0 .1)));
+        let streams: Vec<Value> = entries
+            .into_iter()
+            .map(|((route, stream_id), stats)| {
+                json!({
+                    "route": route.to_string(),
+                    "streamId": stream_id,
+                    "name": stats.name,
+                    "rateHz": finite_or_null(stats.rate_smps),
+                    "ppm": finite_or_null(stats.ppm),
+                    "driftSeconds": finite_or_null(stats.drift_s),
+                    "jitterMs": finite_or_null(stats.jitter_ms),
+                    "received": stats.received_count,
+                    "dropped": stats.samples_dropped,
+                    "sessionId": stats.session_id,
+                    "stale": stats.is_stale(now),
+                })
+            })
+            .collect();
+        json!({ "type": "health", "streams": streams })
+    }
+}
+
+fn finite_or_null(value: f64) -> Value {
+    if value.is_finite() {
+        json!(value)
+    } else {
+        Value::Null
+    }
+}
+
 fn run_session(
     url: String,
     route: Option<String>,
@@ -3007,6 +3295,8 @@ fn run_session(
     spawn_upgrade_check(Arc::clone(&proxy), discovery.devices.clone(), emitter.clone());
     let mut last_plot_emit = Instant::now();
     let mut last_stream_value_emit = Instant::now();
+    let mut health = HealthMonitor::default();
+    let mut last_health_emit = Instant::now();
     let mut last_log_flush = Instant::now();
     let mut last_log_progress_packets = 0;
     let mut log_data_start: Option<f64> = None;
@@ -3123,8 +3413,10 @@ fn run_session(
             Ok(Ok(samples)) => {
                 loop_profile.samples = samples.len();
                 let process_start = Instant::now();
+                let sample_now = Instant::now();
                 let mut reset_routes: HashSet<DeviceRoute> = HashSet::new();
                 for (sample, sample_route) in samples {
+                    health.observe(&sample, &sample_route, sample_now);
                     // A sample counter that goes backward means the device
                     // rebooted (its counter restarted). Note the route so the
                     // stale history gets flushed after this batch.
@@ -3175,6 +3467,7 @@ fn run_session(
                     ));
                     flush_route_history(&route.to_string(), &mut column_states);
                     fft_workers.clear();
+                    health.reset_route(&route);
                     // Drop baselines for the route's other streams so their
                     // first post-reset sample doesn't re-trigger.
                     last_sample_number_by_stream.retain(|(r, _), _| r != &route);
@@ -3294,6 +3587,11 @@ fn run_session(
             loop_profile.stream_value_elapsed = emit_start.elapsed();
             stream_value_profiler.record(emit_start.elapsed(), value_count, column_states.len());
             last_stream_value_emit = Instant::now();
+        }
+
+        if last_health_emit.elapsed() >= HEALTH_EMIT_INTERVAL {
+            emitter.emit(&health.snapshot(Instant::now()));
+            last_health_emit = Instant::now();
         }
 
         if last_log_flush.elapsed() >= Duration::from_secs(1) {
@@ -5018,6 +5316,8 @@ fn process_sample(
             active_hits += 1;
         }
 
+        let effective_rate =
+            sample.segment.sampling_rate as f64 / sample.segment.decimation.max(1) as f64;
         let state = column_states.entry(key.clone()).or_insert_with(|| {
             ColumnState::new(
                 format!(
@@ -5025,9 +5325,20 @@ fn process_sample(
                     route, sample.stream.stream_id, column.desc.index
                 ),
                 column.desc.units.clone(),
-                sample.segment.sampling_rate as f64 / sample.segment.decimation.max(1) as f64,
+                effective_rate,
             )
         });
+        // Keep the per-column rate in sync with the live segment. A device-side
+        // decimation change alters the effective sample rate without new
+        // metadata; if the stale rate persists, the FPCS decimation ratio is
+        // wrong and the displayed window collapses. `ensure_fpcs_configured`
+        // rebuilds the decimator when the resulting ratio changes.
+        if effective_rate.is_finite()
+            && effective_rate > 0.0
+            && (state.sample_rate - effective_rate).abs() > effective_rate * 0.001
+        {
+            state.sample_rate = effective_rate;
+        }
         display_elapsed += state.push_raw_profiled(point, max_window_seconds, profile_enabled);
         processed_columns += 1;
         for (pane_id, view) in active_fpcs_panes {

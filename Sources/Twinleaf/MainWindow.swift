@@ -70,6 +70,7 @@ struct DocumentWindow: View {
     @State private var showingPlotSettings = false
     @State private var showingExportPanel = false
     @State private var showingUpgradePopover = false
+    @State private var showingHealthPopover = false
     @State private var didStartDocument = false
     @State private var lastExportFormat: ExportFormat = .csv
     @State private var streamSplitVisibility: NavigationSplitViewVisibility = .all
@@ -78,6 +79,7 @@ struct DocumentWindow: View {
     /// On iPhone (compact), `NavigationSplitView` shows one column at a time.
     /// The sidebar's "View Graph" row flips this to `.detail` to surface the plot.
     @State private var preferredCompactColumn: NavigationSplitViewColumn = .sidebar
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     #endif
     @State private var rpcSearchFocusRequest = 0
     @State private var verticalAxisModes: [Int: VerticalAxisMode] = [:]
@@ -361,6 +363,20 @@ struct DocumentWindow: View {
         #endif
     }
 
+    /// The "View Graph" shortcut row is only useful when the plot isn't already
+    /// on screen — i.e., a compact single-column layout currently showing the
+    /// sidebar. In a regular two-column layout (iPad, wide windows) the graph is
+    /// always visible, so the row is hidden. Computed at the scene root, where
+    /// the size class is authoritative (reading it inside the split view's
+    /// sidebar column can report the wrong value).
+    private var showsGraphShortcut: Bool {
+        #if os(iOS)
+        horizontalSizeClass == .compact && preferredCompactColumn == .sidebar
+        #else
+        false
+        #endif
+    }
+
     @ViewBuilder
     private func streamSidebarContent(reportsWidth: Bool = true) -> some View {
         let sidebar = StreamSidebar(
@@ -373,6 +389,7 @@ struct DocumentWindow: View {
             onOpenSliderWindow: openSliderWindowAction,
             onOpenCaptureWindow: openCaptureWindowAction,
             focusedField: $focusedField,
+            showsGraphShortcut: showsGraphShortcut,
             onShowGraph: {
                 #if os(iOS)
                 preferredCompactColumn = .detail
@@ -530,6 +547,7 @@ struct DocumentWindow: View {
                         .glassEffect(.regular, in: panelShape)
                 }
                 .shadow(color: .black.opacity(effectiveWindowColorScheme == .dark ? 0.45 : 0.18), radius: 22, x: 0, y: 12)
+                .padding(.vertical, 40)
         }
     }
 
@@ -1661,6 +1679,10 @@ struct DocumentWindow: View {
         }
     }
 
+    private var showHealthToolbarButton: Bool {
+        !bridge.streamHealth.isEmpty
+    }
+
     private var showUpgradeToolbarButton: Bool {
         !bridge.isInspectionMode
             && (!bridge.availableUpgrades.isEmpty || bridge.upgradeProgress != nil)
@@ -1681,6 +1703,19 @@ struct DocumentWindow: View {
                 .help("Firmware update available")
                 .popover(isPresented: $showingUpgradePopover, arrowEdge: .bottom) {
                     FirmwareUpgradePopover(bridge: bridge)
+                }
+            }
+
+            if showHealthToolbarButton {
+                Button {
+                    showingHealthPopover = true
+                } label: {
+                    Label("Device Health", systemImage: "info.circle")
+                }
+                .labelStyle(.iconOnly)
+                .help("Device timing and rate diagnostics")
+                .popover(isPresented: $showingHealthPopover, arrowEdge: .bottom) {
+                    DeviceHealthPopover(bridge: bridge)
                 }
             }
 
@@ -2391,7 +2426,11 @@ private extension View {
 #if os(iOS)
         frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 #else
-        frame(width: 520, height: isConnectionProgressVisible ? 565 : 420)
+        // Fixed width, but grow vertically with the window. The overlay adds a
+        // margin so the panel stops short of the window edges; the device list
+        // inside absorbs the extra height.
+        frame(width: 520)
+            .frame(minHeight: isConnectionProgressVisible ? 460 : 360, maxHeight: .infinity)
 #endif
     }
 
@@ -4675,6 +4714,11 @@ private struct DevicePicker: View {
     @State private var urlDraft = ""
     @AppStorage(ViewPreferenceKeys.showAllSerialPorts) private var showAllSerialPorts = true
 
+    /// Re-scan for devices (serial probes + mDNS network discovery) on a slow
+    /// cadence so freshly-powered or newly-advertised sensors appear without a
+    /// manual refresh.
+    private let autoRefreshTicker = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
@@ -4775,7 +4819,7 @@ private struct DevicePicker: View {
                         }
                     }
                 }
-                .frame(minHeight: 260)
+                .frame(minHeight: 200, maxHeight: .infinity)
             }
 
             Divider()
@@ -4834,6 +4878,17 @@ private struct DevicePicker: View {
                 "available=\(bridge.availableDevices.count) summary=\(bridge.deviceDiscoverySummary)"
             )
             selection = bridge.availableDevices.first?.id
+            refreshDevices()
+        }
+        .onReceive(autoRefreshTicker) { _ in
+            // Skip while a connection attempt is underway (the list is hidden
+            // and a rescan would churn the bridge mid-connect) or while the
+            // user is typing a URL.
+            guard !bridge.connectionProgress.isVisible,
+                  !isAddingURL,
+                  editingRememberedURL == nil else {
+                return
+            }
             refreshDevices()
         }
         .onChange(of: bridge.connectionProgress.isReadyToDismiss) { _, isReady in
@@ -5018,6 +5073,112 @@ private enum ConnectionProgressRowState {
         case .failed:
             .red
         }
+    }
+}
+
+/// Live timing & rate diagnostics (the `tio health` data) grouped by device
+/// route, shown from the toolbar info button.
+private struct DeviceHealthPopover: View {
+    @ObservedObject var bridge: BridgeClient
+
+    /// All streams sorted by route then stream id (route appears per row, so no
+    /// grouping headers are needed — keeps it compact for iPhone).
+    private var streams: [StreamHealthInfo] {
+        bridge.streamHealth.sorted {
+            ($0.route, $0.streamId) < ($1.route, $1.streamId)
+        }
+    }
+
+    // Fixed widths for the second-line data columns so they align across rows.
+    private static let rateWidth: CGFloat = 78
+    private static let driftWidth: CGFloat = 86
+    private static let droppedWidth: CGFloat = 64
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Connection Health")
+                .font(.headline)
+
+            if bridge.streamHealth.isEmpty {
+                Text("No live streams.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(streams) { stream in
+                            healthRow(stream)
+                        }
+                    }
+                }
+                .frame(maxHeight: 420)
+            }
+        }
+        .padding(16)
+        .frame(width: 300)
+        .presentationCompactAdaptation(.popover)
+    }
+
+    @ViewBuilder
+    private func healthRow(_ stream: StreamHealthInfo) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            // Line 1: status dot + route and stream name.
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(stream.stale ? Color.secondary : Color.green)
+                    .frame(width: 7, height: 7)
+                Text("\(stream.route)  \(stream.name.isEmpty ? "stream \(stream.streamId)" : stream.name)")
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            // Line 2: data columns, indented under the name.
+            HStack(spacing: 0) {
+                metric("Rate", rateText(stream.rateHz), unit: "Hz",
+                       width: Self.rateWidth,
+                       color: stream.stale ? .secondary : .primary)
+                metric("Drift", ppmText(stream.ppm), unit: "ppm",
+                       width: Self.driftWidth,
+                       color: ppmColor(stream.ppm))
+                metric("Drop", "\(stream.dropped)", unit: nil,
+                       width: Self.droppedWidth,
+                       color: stream.dropped > 0 ? .orange : .primary)
+            }
+            .padding(.leading, 13)
+        }
+    }
+
+    private func metric(_ label: String, _ value: String, unit: String?, width: CGFloat, color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(unit.map { "\(label) (\($0))" } ?? label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(color)
+        }
+        .frame(width: width, alignment: .leading)
+    }
+
+    private func rateText(_ hz: Double?) -> String {
+        guard let hz, hz.isFinite else { return "—" }
+        if hz >= 100 { return String(format: "%.0f", hz) }
+        if hz >= 1 { return String(format: "%.1f", hz) }
+        return String(format: "%.3f", hz)
+    }
+
+    private func ppmText(_ ppm: Double?) -> String {
+        guard let ppm, ppm.isFinite else { return "—" }
+        return String(format: "%+.0f", ppm)
+    }
+
+    private func ppmColor(_ ppm: Double?) -> Color {
+        guard let ppm, ppm.isFinite else { return .primary }
+        let magnitude = abs(ppm)
+        if magnitude >= 200 { return .red }
+        if magnitude >= 100 { return .orange }
+        return .primary
     }
 }
 
@@ -5530,13 +5691,13 @@ private struct StreamSidebar: View {
     let onOpenSliderWindow: ((RpcInfo) -> Void)?
     let onOpenCaptureWindow: ((RpcInfo) -> Void)?
     let focusedField: FocusState<RpcFocusField?>.Binding
-    /// Invoked when the user taps the iOS-compact "View Graph" row. The
-    /// container flips `preferredCompactColumn` to `.detail` so the plot pane
-    /// takes over the screen.
+    /// Whether to show the "View Graph" shortcut row — true only when the plot
+    /// isn't already visible (compact layout showing the sidebar). Decided by
+    /// the container at the scene root.
+    let showsGraphShortcut: Bool
+    /// Invoked when the user taps the "View Graph" row. The container flips
+    /// `preferredCompactColumn` to `.detail` so the plot pane takes over.
     let onShowGraph: () -> Void
-    #if os(iOS)
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    #endif
     @AppStorage(ViewPreferenceKeys.showStreamDetails) private var showStreamDetails = false
     @AppStorage(ViewPreferenceKeys.unifySensors) private var unifySensors = false
     @State private var sidebarSearchText = ""
@@ -5576,8 +5737,7 @@ private struct StreamSidebar: View {
                 .padding()
         } else {
             List {
-                #if os(iOS)
-                if horizontalSizeClass == .compact {
+                if showsGraphShortcut {
                     Button(action: onShowGraph) {
                         HStack(spacing: 10) {
                             Image(systemName: "chart.xyaxis.line")
@@ -5594,7 +5754,6 @@ private struct StreamSidebar: View {
                     .buttonStyle(.plain)
                     .listRowSeparator(.hidden)
                 }
-                #endif
 
                 if !visibleStreamGroups.isEmpty || sidebarSearchQuery.isEmpty {
                     Section {
