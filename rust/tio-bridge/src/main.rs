@@ -1722,7 +1722,18 @@ impl ColumnState {
         {
             return;
         }
+        self.rebuild_fpcs(pane_id, view);
+    }
 
+    /// Rebuild the pane's FPCS decimator from the retained raw buffer,
+    /// discarding any existing ring. The raw buffer is filled for every column
+    /// regardless of selection, so rebuilding here keeps the decimated trace
+    /// continuous when a column re-enters a pane. Without it, the ring frozen
+    /// while the column was unselected would be stitched onto fresh points,
+    /// leaving a gap across the unselected interval.
+    fn rebuild_fpcs(&mut self, pane_id: usize, view: &ViewConfig) {
+        let ratio = fpcs_ratio(self.sample_rate, view);
+        let capacity = target_plot_points(view).max(2);
         let mut fpcs = StreamingFpcs::new(ratio, capacity);
         for point in self.recent_points(view.window_seconds) {
             fpcs.process_point(point);
@@ -5407,7 +5418,10 @@ fn hydrate_fpcs(
                 continue;
             };
             if let Some(state) = column_states.get_mut(&data_key) {
-                state.ensure_fpcs_configured(pane.id, view);
+                // Rebuild (not just ensure) so a column re-entering a pane gets
+                // a fresh ring from the continuous raw buffer — no gap across
+                // the interval it was unselected.
+                state.rebuild_fpcs(pane.id, view);
             }
         }
     }
@@ -7263,6 +7277,45 @@ mod tests {
 
         view.window_seconds = 120.0;
         assert_eq!(live_retention_seconds(&view), 180.0);
+    }
+
+    #[test]
+    fn rebuild_fpcs_discards_stale_ring_after_reselect() {
+        let mut view = ViewConfig::default();
+        view.window_seconds = 10.0;
+        view.plot_width_pixels = 200;
+        view.resolution_multiplier = 100;
+        view.decimation_method = DecimationMethod::Fpcs;
+        let retention = live_retention_seconds(&view);
+
+        // Column selected: raw and FPCS ring fill together for x = 0..5.
+        let mut state = ColumnState::new("signal".to_string(), "V".to_string(), 1.0);
+        for index in 0..5 {
+            let point = Point { x: index as f64, y: index as f64 };
+            state.push_raw(point, retention);
+            state.process_fpcs_point(0, &view, point);
+        }
+
+        // Unselected: the raw buffer keeps filling (process_sample pushes every
+        // column), trimming the original x = 0..5 out of retention while the
+        // ring stays frozen.
+        for index in 5..60 {
+            state.push_raw(Point { x: index as f64, y: index as f64 }, retention);
+        }
+
+        // Reselect rebuilds the ring from the continuous raw buffer.
+        state.rebuild_fpcs(0, &view);
+
+        let oldest_raw = state.raw.front().unwrap().x;
+        let ring = state.fpcs_for_pane(0).unwrap().points_since(-1.0);
+        assert!(!ring.is_empty());
+        // No stale points from before the column was unselected — the ring is
+        // continuous with the raw buffer, so the trace has no gap.
+        assert!(
+            ring.iter().all(|point| point.x >= oldest_raw),
+            "rebuild kept stale pre-unselect points: oldest_raw={oldest_raw}, ring={:?}",
+            ring.iter().map(|point| point.x).collect::<Vec<_>>()
+        );
     }
 
     #[test]
