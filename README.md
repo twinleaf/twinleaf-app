@@ -28,48 +28,62 @@ This keeps the app native while keeping the hardware boundary in Rust, without a
 
 ## Build
 
-Build the Rust core first:
+The `Twinleaf.xcodeproj` project is the single source of truth for the build.
+Building from the command line goes through the same `xcodebuild` invocation as
+Xcode's Build & Run — there is no separate SwiftPM build to drift out of sync.
+The Rust core is compiled by the project's own "Build Rust core" run-script
+phase as part of the app build, so you never build it by hand.
+
+The `make` targets are a thin wrapper around that project:
 
 ```sh
-cargo build --manifest-path rust/tio-bridge/Cargo.toml --features hdf5
+make          # build the macOS app (== Xcode Build & Run) -> build/Twinleaf.app
+make run      # build and launch the macOS app
+make release  # build a Release macOS bundle
+make ios      # build for the iPad Simulator
+make test     # run the Rust core unit tests
+make clean    # remove build artifacts
 ```
 
-If you omit `--features hdf5`, the app can still stream, log, inspect, and export CSV, but HDF5 export will report that Rust was built without HDF5 support.
+`make` checks out the vendored `twinleaf-rust` submodule and verifies a Rust
+toolchain (`cargo`) is on the PATH, then runs `scripts/build-app.sh`, which
+drives `xcodebuild` and copies the finished bundle to `build/Twinleaf.app`.
 
-Building with `--features hdf5` compiles HDF5 from source through the statically linked `hdf5-metno` crate, which requires `cmake` on the PATH (`brew install cmake`). No system HDF5 installation is needed.
+Prerequisites:
 
-Then run the macOS app:
+- A Rust toolchain (`cargo`) — install from <https://rustup.rs>.
+- `cmake` on the PATH for the statically linked HDF5 build (`brew install
+  cmake`). The macOS bundle builds Rust with `--features hdf5`, which compiles
+  HDF5 from source through the `hdf5-metno` crate; no system HDF5 install is
+  needed. Without HDF5 the app still streams, logs, inspects, and exports CSV,
+  but HDF5 export reports that Rust was built without HDF5 support.
 
-```sh
-swift run --build-path build/swiftpm Twinleaf
-```
-
-During development, the Swift app loads `rust/tio-bridge/target/debug/libtwinleaf_core.dylib` directly. You can override the library path with `TWINLEAF_CORE_PATH`.
-
-For Xcode development, open the project and choose the `Twinleaf` scheme:
+For interactive development, open the project and choose the `Twinleaf` scheme:
 
 ```sh
 open Twinleaf.xcodeproj
 ```
 
-The `Twinleaf` Xcode scheme builds the native `Twinleaf.app` bundle for the selected destination. For macOS, it runs `scripts/xcode-build-rust.sh` to package `libtwinleaf_core.dylib` into `Contents/Frameworks` and the `tio-bridge` tool into `Contents/MacOS`. If `cargo` is installed, the script rebuilds the Rust bridge for the active Xcode configuration in an isolated Cargo target directory under `build/xcode-rust`; otherwise it uses existing artifacts from that target directory or the legacy `rust/tio-bridge/target` location.
+The `Twinleaf` scheme builds the native `Twinleaf.app` bundle for the selected
+destination. For macOS it runs `scripts/xcode-build-rust.sh`, which rebuilds the
+Rust bridge for the active configuration in an isolated Cargo target directory
+under `build/xcode-rust`, packages `libtwinleaf_core.dylib` into
+`Contents/Frameworks`, and copies the `tio-bridge` CLI harness into
+`Contents/MacOS` for debugging. The dylib path can be overridden at runtime with
+`TWINLEAF_CORE_PATH`.
 
-For iPadOS, the same target runs `scripts/build-ios-rust.sh` in static-library mode. That script builds `rust/tio-bridge` with serial support disabled and firmware update support enabled, links the resulting `libtwinleaf_core.a` into the app, and supports both iPad devices and iPad simulators. Install the Rust standard libraries once before building for iPad:
+For iPadOS, the same target runs `scripts/build-ios-rust.sh` in static-library
+mode: it builds `rust/tio-bridge` with serial support disabled and firmware
+update support enabled, and links the resulting `libtwinleaf_core.a` into the
+app for both iPad devices and simulators. Install the Rust standard libraries
+for iPad once (or run `make ios-deps`):
 
 ```sh
 rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 ```
 
-The iPad app declares local-network usage because live connections use nearby Twinleaf devices or local TIO proxies.
-
-For normal macOS app behavior, build and launch the `.app` bundle:
-
-```sh
-scripts/build-app.sh
-open build/Twinleaf.app
-```
-
-The bundle includes `libtwinleaf_core.dylib` in `Contents/Frameworks`, also includes the `tio-bridge` CLI harness in `Contents/MacOS` for debugging, declares the `.tio` document type, builds Rust with HDF5 export support, and is the preferred way to test menu bar, focus, keyboard shortcuts, and document lifecycle behavior. Running with `swift run --build-path build/swiftpm Twinleaf` remains useful for quick iteration, but it is a command-line launch rather than a full Launch Services app launch.
+The iPad app declares local-network usage because live connections use nearby
+Twinleaf devices or local TIO proxies.
 
 For a simulator smoke test of the Xcode iPad bundle, boot an iPad simulator and run:
 

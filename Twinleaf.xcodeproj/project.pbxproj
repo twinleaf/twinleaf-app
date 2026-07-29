@@ -52,7 +52,6 @@
 /* Begin PBXFileReference section */
 		A00000000000000000000201 /* Twinleaf.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Twinleaf.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A00000000000000000000203 /* TwinleafQuickLook.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = TwinleafQuickLook.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		A00000000000000000000401 /* Package.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Package.swift; sourceTree = "<group>"; };
 		A00000000000000000000402 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		A00000000000000000000411 /* Sources/Twinleaf/TwinleafApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/TwinleafApp.swift; sourceTree = "<group>"; };
 		A00000000000000000000412 /* Sources/Twinleaf/MainWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/MainWindow.swift; sourceTree = "<group>"; };
@@ -104,7 +103,6 @@
 		A00000000000000000000002 = {
 			isa = PBXGroup;
 			children = (
-				A00000000000000000000401 /* Package.swift */,
 				A00000000000000000000402 /* README.md */,
 				A00000000000000000000004 /* Sources */,
 				A00000000000000000000007 /* Packaging */,

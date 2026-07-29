@@ -4,7 +4,7 @@ fn main() {
     // A sandboxed executable must carry a bundle identifier so libsecinit can
     // create its sandbox container; without one, the process is killed during
     // dyld startup. Embed an Info.plist into the tio-bridge binary (macOS
-    // builds only) the same way the SwiftPM app target does.
+    // builds only), the same way the app bundle embeds its own Info.plist.
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "macos" {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();

@@ -1,6 +1,4 @@
 .DS_Store
 build/
-.swiftpm/
 rust/tio-bridge/target/
 xcuserdata
-.build

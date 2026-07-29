@@ -4,9 +4,13 @@
 #   - rust:      the tio-bridge core with the same features the shipping
 #                macOS app uses (hdf5 included; cmake is preinstalled on
 #                GitHub macOS runners for the static HDF5 build)
-#   - macos-app: the SwiftPM compile of the Swift app target
+#   - macos-app: the full Xcode build of the macOS app, which also
+#                compiles the Rust core via scripts/xcode-build-rust.sh
 #   - ios-app:   the full Xcode build for iPad Simulator, which also
 #                cross-compiles the Rust core via scripts/build-ios-rust.sh
+#
+# Both app jobs go through xcodebuild — the same path as Xcode's Build & Run
+# and `make` — so there is no separate (SwiftPM) build to drift out of sync.
 #
 # macos-26 runners provide Xcode 26 / Swift 6.2, matching the project's
 # macOS 26 / iOS 26 deployment targets.
@@ -40,14 +44,25 @@ jobs:
         run: cargo test --manifest-path rust/tio-bridge/Cargo.toml --features hdf5
 
   macos-app:
-    name: macOS app (swift build)
+    name: macOS app (xcodebuild)
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Build Swift app target
-        run: swift build --build-path build/swiftpm --target Twinleaf
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/tio-bridge
+      - name: Build macOS app
+        run: |
+          xcodebuild \
+            -project Twinleaf.xcodeproj \
+            -scheme Twinleaf \
+            -destination 'generic/platform=macOS' \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            build
 
   ios-app:
     name: iPadOS app (xcodebuild)
