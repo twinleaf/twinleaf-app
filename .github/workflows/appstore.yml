@@ -1,10 +1,12 @@
 name: App Store
 
-# Archives the iOS app and uploads it to App Store Connect (TestFlight / review). Run it
-# manually from the Actions tab, or push a version tag like v1.2.
+# Archives and uploads both apps (iOS and macOS) to App Store Connect
+# (TestFlight / review). Run it manually from the Actions tab, or push a version
+# tag like v1.2.
 #
-# iOS only by design: macOS ships as a notarized Developer ID DMG through
-# scripts/release-app.sh, matching the app's existing distribution channels.
+# macOS is also distributed directly as a notarized Developer ID DMG via
+# scripts/release-app.sh; that is a separate channel and unaffected by this
+# workflow.
 #
 # Required repository secrets (Settings → Secrets and variables → Actions), for the
 # TWINLEAF developer account (team 6MFC6VKTVX — not the Twarge key):
@@ -44,17 +46,35 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   upload:
-    name: Upload (iOS)
+    name: Upload (${{ matrix.name }})
     needs: build
     runs-on: macos-26
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # One platform at a time: parallel legs share the ASC key and race
+      # Apple's provisioning and upload services, which intermittently fails
+      # the slower leg with misleading errors ("Cloud signing permission
+      # error", "Account credentials have expired").
+      max-parallel: 1
+      matrix:
+        include:
+          - name: iOS
+            destination: generic/platform=iOS
+            archive: build/Twinleaf-iOS.xcarchive
+            asc_platform: IOS
+          - name: macOS
+            destination: generic/platform=macOS
+            archive: build/Twinleaf-macOS.xcarchive
+            asc_platform: MAC_OS
     steps:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
 
-      # The Xcode build compiles the Rust core (scripts/build-ios-rust.sh) during the
-      # archive, so the toolchain and iOS targets must be present.
+      # The Xcode archive compiles the Rust core during the build
+      # (scripts/build-ios-rust.sh for iOS, scripts/xcode-build-rust.sh for
+      # macOS), so the toolchain and iOS targets must be present on both legs.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
@@ -131,7 +151,7 @@ jobs:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_BUNDLE_ID: com.twinleaf.Twinleaf
-          ASC_PLATFORM: IOS
+          ASC_PLATFORM: ${{ matrix.asc_platform }}
           TARGET_VERSION: ${{ steps.version.outputs.version }}
         run: |
           ASC_KEY_PATH=~/private_keys/AuthKey_"$ASC_KEY_ID".p8 \
@@ -167,8 +187,8 @@ jobs:
             -project Twinleaf.xcodeproj \
             -scheme Twinleaf \
             -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -archivePath build/Twinleaf-iOS.xcarchive \
+            -destination '${{ matrix.destination }}' \
+            -archivePath '${{ matrix.archive }}' \
             MARKETING_VERSION='${{ steps.version.outputs.version }}' \
             CURRENT_PROJECT_VERSION='${{ github.run_number }}.${{ github.run_attempt }}' \
             -allowProvisioningUpdates \
@@ -182,7 +202,7 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
           xcodebuild -exportArchive \
-            -archivePath build/Twinleaf-iOS.xcarchive \
+            -archivePath '${{ matrix.archive }}' \
             -exportOptionsPlist build-exportOptions.plist \
             -allowProvisioningUpdates \
             -authenticationKeyPath ~/private_keys/AuthKey_"$ASC_KEY_ID".p8 \
