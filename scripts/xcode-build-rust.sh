@@ -4,8 +4,16 @@ set -euo pipefail
 
 ROOT_DIR="${SRCROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CONFIGURATION="${CONFIGURATION:-Debug}"
-TWINLEAF_BUILD_DIR="${TWINLEAF_BUILD_DIR:-$ROOT_DIR/build}"
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$TWINLEAF_BUILD_DIR/xcode-rust/tio-bridge}"
+# Build the Rust core under Xcode's per-build intermediates (DerivedData) when
+# invoked from Xcode, mirroring build-ios-rust.sh, so nothing lands in the repo
+# working tree. Fall back to $ROOT_DIR/build only for standalone runs outside
+# Xcode (where DERIVED_FILE_DIR is unset).
+if [[ -n "${DERIVED_FILE_DIR:-}" ]]; then
+	DEFAULT_CARGO_TARGET_DIR="$DERIVED_FILE_DIR/rust-macos/tio-bridge"
+else
+	DEFAULT_CARGO_TARGET_DIR="$ROOT_DIR/build/xcode-rust/tio-bridge"
+fi
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$DEFAULT_CARGO_TARGET_DIR}"
 
 # Xcode runs build-phase scripts with a sanitized PATH that drops the
 # typical rustup / Homebrew locations. Surface them here so `cargo` is
