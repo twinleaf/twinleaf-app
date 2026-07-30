@@ -140,19 +140,6 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Building marketing version $VERSION"
 
-      # Fails fast with a readable message when App Store Connect would reject the upload
-      # because this version's train is already approved and closed.
-      - name: Check the version train is open
-        env:
-          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
-          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
-          ASC_BUNDLE_ID: com.twinleaf.Twinleaf
-          ASC_PLATFORM: ${{ matrix.asc_platform }}
-          TARGET_VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          ASC_KEY_PATH=~/private_keys/AuthKey_"$ASC_KEY_ID".p8 \
-            swift scripts/check-appstore-version.swift
-
       - name: Write export options
         run: |
           cat > build-exportOptions.plist <<'PLIST'
