@@ -4,10 +4,6 @@ name: App Store
 # (TestFlight / review). Run it manually from the Actions tab, or push a version
 # tag like v1.2.
 #
-# macOS is also distributed directly as a notarized Developer ID DMG via
-# scripts/release-app.sh; that is a separate channel and unaffected by this
-# workflow.
-#
 # Required repository secrets (Settings → Secrets and variables → Actions), for the
 # TWINLEAF developer account (team 6MFC6VKTVX — not the Twarge key):
 #   ASC_KEY_ID     App Store Connect API key ID

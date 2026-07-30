@@ -28,101 +28,51 @@ This keeps the app native while keeping the hardware boundary in Rust, without a
 
 ## Build
 
-The `Twinleaf.xcodeproj` project is the single source of truth for the build.
-Building from the command line goes through the same `xcodebuild` invocation as
-Xcode's Build & Run — there is no separate SwiftPM build to drift out of sync.
-The Rust core is compiled by the project's own "Build Rust core" run-script
-phase as part of the app build, so you never build it by hand.
+The `Twinleaf.xcodeproj` project is the single source of truth. Open it in
+Xcode 26 or later and run the `Twinleaf` scheme (⌘R); the app targets macOS 26
+and iOS 26. The scheme's run-script phase compiles the vendored Rust core and
+embeds it in the bundle, so there is nothing to build by hand.
 
-The `make` targets are a thin wrapper around that project:
+The `Makefile` is just that same build from the command line — plain
+`xcodebuild` against the shared scheme, no overrides, identical to Xcode's
+Build:
 
 ```sh
-make          # build the macOS app (== Xcode Build & Run) -> build/Twinleaf.app
-make run      # build and launch the macOS app
-make release  # build a Release macOS bundle
-make ios      # build for the iPad Simulator
-make test     # run the Rust core unit tests
-make clean    # remove build artifacts
+make        # build the macOS app
+make ios    # build for the iPad Simulator
+make clean  # clean both destinations
 ```
 
-`make` checks out the vendored `twinleaf-rust` submodule and verifies a Rust
-toolchain (`cargo`) is on the PATH, then runs `scripts/build-app.sh`, which
-drives `xcodebuild` and copies the finished bundle to `build/Twinleaf.app`.
+Prerequisites (the same ones Xcode needs):
 
-Prerequisites:
-
-- A Rust toolchain (`cargo`) — install from <https://rustup.rs>.
+- The vendored Rust core submodule: `git submodule update --init --recursive`.
+- A Rust toolchain (`cargo`) — install from <https://rustup.rs>. For iPad builds
+  also add the device/simulator targets once:
+  `rustup target add aarch64-apple-ios aarch64-apple-ios-sim`.
 - `cmake` on the PATH for the statically linked HDF5 build (`brew install
-  cmake`). The macOS bundle builds Rust with `--features hdf5`, which compiles
-  HDF5 from source through the `hdf5-metno` crate; no system HDF5 install is
-  needed. Without HDF5 the app still streams, logs, inspects, and exports CSV,
-  but HDF5 export reports that Rust was built without HDF5 support.
+  cmake`). The macOS build compiles HDF5 from source through the `hdf5-metno`
+  crate; no system HDF5 install is needed. Without HDF5 the app still streams,
+  logs, inspects, and exports CSV, but HDF5 export reports that Rust was built
+  without HDF5 support.
 
-For interactive development, open the project and choose the `Twinleaf` scheme:
+The macOS build runs `scripts/xcode-build-rust.sh` (packages
+`libtwinleaf_core.dylib` into `Contents/Frameworks` and the `tio-bridge` CLI
+into `Contents/MacOS`); iPadOS runs `scripts/build-ios-rust.sh` in
+static-library mode and links `libtwinleaf_core.a`. Both are invoked by the
+Xcode run-script phase — you do not run them directly. During development the
+dylib path can be overridden with `TWINLEAF_CORE_PATH`. The iPad app declares
+local-network usage because live connections use nearby Twinleaf devices or
+local TIO proxies.
 
-```sh
-open Twinleaf.xcodeproj
-```
+## Distribution
 
-The `Twinleaf` scheme builds the native `Twinleaf.app` bundle for the selected
-destination. For macOS it runs `scripts/xcode-build-rust.sh`, which rebuilds the
-Rust bridge for the active configuration in an isolated Cargo target directory
-under `build/xcode-rust`, packages `libtwinleaf_core.dylib` into
-`Contents/Frameworks`, and copies the `tio-bridge` CLI harness into
-`Contents/MacOS` for debugging. The dylib path can be overridden at runtime with
-`TWINLEAF_CORE_PATH`.
-
-For iPadOS, the same target runs `scripts/build-ios-rust.sh` in static-library
-mode: it builds `rust/tio-bridge` with serial support disabled and firmware
-update support enabled, and links the resulting `libtwinleaf_core.a` into the
-app for both iPad devices and simulators. Install the Rust standard libraries
-for iPad once (or run `make ios-deps`):
-
-```sh
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-```
-
-The iPad app declares local-network usage because live connections use nearby
-Twinleaf devices or local TIO proxies.
-
-For a simulator smoke test of the Xcode iPad bundle, boot an iPad simulator and run:
-
-```sh
-scripts/smoke-ipad-simulator.sh
-```
-
-The script builds `Twinleaf.app`, installs it into the booted simulator, launches it, saves a screenshot under `build/ipad-simulator-smoke/`, and prints recent app log output.
-
-For a release-style bundle:
-
-```sh
-scripts/build-app.sh release
-open build/Twinleaf.app
-```
-
-## Distribution Signing and Notarization
-
-For direct macOS distribution outside the App Store, install both `Developer ID Application` and `Developer ID Installer` certificates in Keychain, then store notarization credentials once with Apple's `notarytool`:
-
-```sh
-xcrun notarytool store-credentials "twinleaf-notary" --apple-id "you@example.com" --team-id TEAMID --password "app-specific-password"
-```
-
-Build, sign, notarize, staple, and package release artifacts with:
-
-```sh
-TWINLEAF_NOTARY_PROFILE=twinleaf-notary APPLE_TEAM_ID=TEAMID scripts/release-app.sh
-```
-
-The script signs the app with hardened runtime, signs the embedded Quick Look extension, Rust dylib, and `tio-bridge` tool, notarizes and staples by default, creates a distributable app ZIP at `build/distribution/Twinleaf-macOS.zip`, builds a signed `/Applications` installer package at `build/distribution/Twinleaf-macOS.pkg`, builds a signed drag-install disk image at `build/distribution/Twinleaf-macOS.dmg`, and exports the iPadOS IPA at `build/distribution/Twinleaf-iPadOS.ipa`. iPadOS export lets Xcode create or update signing assets by default; pass `--no-ios-provisioning-updates` for fully manual signing. If you only want to validate signing locally, use `scripts/release-app.sh --skip-notarization --skip-ios`; use `--skip-pkg`, `--skip-dmg`, or `--skip-ios` to omit those artifacts.
-
-For company iPads, distribute Twinleaf as an Apple Business Manager custom app. Build an App Store Connect export with:
-
-```sh
-APPLE_TEAM_ID=TEAMID scripts/release-app.sh --only-ios
-```
-
-That archives the `Twinleaf` Xcode scheme for an iPadOS destination and exports `build/distribution/Twinleaf-iPadOS.ipa`, suitable for uploading to App Store Connect. From App Store Connect, make the app available as a custom app for the company's Apple Business Manager organization; Apple Business Manager then handles app licenses for MDM assignment. For manual iPadOS signing, pass `--ios-signing-style manual --ios-team-id TEAMID --ios-provisioning-profile "TwinleafPad App Store"`.
+Release goes through App Store Connect. Either archive and upload from Xcode's
+Organizer (Product → Archive → Distribute App → App Store Connect), or run the
+**App Store** GitHub Actions workflow (`.github/workflows/appstore.yml`), which
+archives and uploads both the iOS and macOS apps for TestFlight / review. Run it
+from the Actions tab, or push a version tag like `v1.2`. CI supplies a unique,
+monotonically increasing `CFBundleVersion` for every upload; see the workflow
+header for the required App Store Connect secrets.
 
 ## Notes
 

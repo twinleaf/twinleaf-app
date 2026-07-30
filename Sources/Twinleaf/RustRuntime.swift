@@ -633,7 +633,7 @@ private enum RuntimeError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .libraryNotFound(let name):
-            "Could not find \(name). Run scripts/build-app.sh or set TWINLEAF_CORE_PATH."
+            "Could not find \(name). Build the app with Xcode or `make`, or set TWINLEAF_CORE_PATH."
         case .loadFailed(let message):
             "Could not load Twinleaf Rust core: \(message)"
         case .symbolNotFound(let symbol):
