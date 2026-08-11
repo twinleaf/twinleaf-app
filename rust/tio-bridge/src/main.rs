@@ -4983,7 +4983,14 @@ fn export_log_file(
                 .unwrap_or(0);
             Ok(summary)
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            // Writing in place means a failure can leave a partial file (for
+            // CSV, the header alone). Truncate it so a failed export never
+            // looks like a successful one; the save panel had already emptied
+            // this file before we were called, so nothing is lost.
+            let _ = File::create(output_path);
+            Err(err)
+        }
     }
 }
 
