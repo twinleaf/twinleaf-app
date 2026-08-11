@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufWriter, Write};
 use std::panic::{self, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -4962,25 +4962,28 @@ fn export_log_file(
     emitter: &Emitter,
 ) -> Result<ExportSummary, String> {
     let output_path = Path::new(output_path);
-    let temp_path = temporary_export_path(output_path);
 
+    // Write straight to the destination the user picked in the save panel.
+    //
+    // Staging through a sibling temp file and renaming it into place does not
+    // work under the App Sandbox: the user-selected read/write grant covers the
+    // chosen file itself, not arbitrary neighbouring paths in that directory,
+    // so creating ".<name>.<pid>.tmp" (or renaming it over the destination) is
+    // denied. The export then failed while the empty placeholder the save panel
+    // had already created stayed behind — a completely blank CSV.
     let result = match format {
-        ExportFormat::Csv => export_log_csv(source_path, &temp_path, emitter),
-        ExportFormat::Hdf5 => export_log_hdf5(source_path, &temp_path, emitter),
+        ExportFormat::Csv => export_log_csv(source_path, output_path, emitter),
+        ExportFormat::Hdf5 => export_log_hdf5(source_path, output_path, emitter),
     };
 
     match result {
         Ok(mut summary) => {
-            replace_export_file(&temp_path, output_path)?;
             summary.bytes = std::fs::metadata(output_path)
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
             Ok(summary)
         }
-        Err(err) => {
-            let _ = std::fs::remove_file(&temp_path);
-            Err(err)
-        }
+        Err(err) => Err(err),
     }
 }
 
@@ -5211,24 +5214,6 @@ fn export_log_hdf5(
     _emitter: &Emitter,
 ) -> Result<ExportSummary, String> {
     Err("HDF5 export is not enabled in this build of tio-bridge".to_string())
-}
-
-fn temporary_export_path(output_path: &Path) -> PathBuf {
-    let file_name = output_path
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_else(|| "Twinleaf Export".into());
-    output_path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
-}
-
-fn replace_export_file(temp_path: &Path, output_path: &Path) -> Result<(), String> {
-    std::fs::rename(temp_path, output_path).map_err(|err| {
-        format!(
-            "Failed to move export into place from {} to {}: {err}",
-            temp_path.display(),
-            output_path.display()
-        )
-    })
 }
 
 fn write_csv_record<W, S>(writer: &mut W, fields: &[S]) -> io::Result<()>
