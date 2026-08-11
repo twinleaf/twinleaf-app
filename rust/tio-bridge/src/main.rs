@@ -1790,22 +1790,33 @@ fn update_smoothed_display_value(
     display_value_x: &mut Option<f64>,
     point: Point,
 ) {
+    // Never let a non-finite sample into the smoothing state: a single NaN would
+    // poison every subsequent value, because `NaN + alpha * (y - NaN)` stays NaN
+    // forever. Non-finite samples are simply skipped.
     if !point.y.is_finite() {
         return;
     }
 
-    let alpha = if let (Some(previous_x), Some(_)) = (*display_value_x, *display_value) {
-        let dt = (point.x - previous_x).max(0.0);
-        (1.0 - (-dt / 0.25).exp()).clamp(0.02, 1.0)
-    } else {
-        1.0
+    // Treat a missing — or, defensively, a non-finite — prior state as "no
+    // state", so the first good value after a NaN run passes straight through
+    // and the average resumes from there instead of staying poisoned. Guarding
+    // the prior timestamp too keeps a bad `dt` from producing a NaN `alpha`.
+    let previous = display_value.filter(|value| value.is_finite());
+    let previous_x = display_value_x.filter(|x| x.is_finite());
+
+    let alpha = match (previous, previous_x) {
+        (Some(_), Some(previous_x)) => {
+            let dt = (point.x - previous_x).max(0.0);
+            (1.0 - (-dt / 0.25).exp()).clamp(0.02, 1.0)
+        }
+        _ => 1.0,
     };
 
-    *display_value = Some(match *display_value {
+    *display_value = Some(match previous {
         Some(previous) => previous + alpha * (point.y - previous),
         None => point.y,
     });
-    *display_value_x = Some(point.x);
+    *display_value_x = point.x.is_finite().then_some(point.x);
 }
 
 fn lower_bound_point_deque(points: &VecDeque<Point>, target: f64) -> usize {
@@ -7456,6 +7467,35 @@ mod tests {
 
         let later_view_value = state.display_value_between(4.0, 4.0).unwrap();
         assert_eq!(later_view_value, 400.0);
+    }
+
+    #[test]
+    fn smoothed_display_value_skips_non_finite_samples() {
+        // A NaN sample must not enter the state; the last good value stays.
+        let mut value = Some(10.0);
+        let mut value_x = Some(0.0);
+        update_smoothed_display_value(&mut value, &mut value_x, Point { x: 1.0, y: f64::NAN });
+        assert_eq!(value, Some(10.0));
+        assert_eq!(value_x, Some(0.0));
+    }
+
+    #[test]
+    fn smoothed_display_value_recovers_from_poisoned_state() {
+        // If the state is somehow left non-finite, the first finite sample
+        // passes straight through instead of staying poisoned...
+        let mut value = Some(f64::NAN);
+        let mut value_x = Some(f64::NAN);
+        update_smoothed_display_value(&mut value, &mut value_x, Point { x: 1.0, y: 42.0 });
+        assert_eq!(value, Some(42.0));
+        assert_eq!(value_x, Some(1.0));
+
+        // ...and averaging resumes from that value on the next sample.
+        update_smoothed_display_value(&mut value, &mut value_x, Point { x: 1.01, y: 142.0 });
+        let averaged = value.unwrap();
+        assert!(
+            averaged > 42.0 && averaged < 142.0,
+            "expected an average between the two samples, got {averaged}"
+        );
     }
 
     #[test]
