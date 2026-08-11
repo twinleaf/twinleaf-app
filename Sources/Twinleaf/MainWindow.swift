@@ -1674,8 +1674,15 @@ struct DocumentWindow: View {
             bridge.reloadAllRPCs()
         } else {
             bridge.setLogging(enabled: false, logURL: nil)
-            document.removeTemporaryLogFile()
-            clearDocumentEditedRequest &+= 1
+            // Stopping a recording must not throw the recording away: the log
+            // *is* the document's data, so "record, stop, save" has to keep it.
+            // Only discard the log when nothing was captured, which is what
+            // this cleanup was for — it keeps an untouched document from going
+            // dirty and leaving a 0-byte .tio behind.
+            if document.temporaryLogIsEmpty {
+                document.removeTemporaryLogFile()
+                clearDocumentEditedRequest &+= 1
+            }
         }
     }
 
@@ -1757,7 +1764,7 @@ struct DocumentWindow: View {
             .toggleStyle(.button)
             .labelStyle(.iconOnly)
             .disabled(!canControlDataLogging)
-            .help(isDataLoggingEnabled ? "Stop data logging and remove the .tio log" : "Start data logging")
+            .help(isDataLoggingEnabled ? "Stop data logging" : "Start data logging")
 
             Button {
                 activateConnectionButton()

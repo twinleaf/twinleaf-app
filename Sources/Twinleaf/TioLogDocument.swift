@@ -29,6 +29,14 @@ private final class TioLogBacking: @unchecked Sendable {
         _ = FileManager.default.createFile(atPath: temporaryURL.path, contents: Data())
     }
 
+    /// Size of the log on disk, or 0 when it does not exist. Reads the file
+    /// attributes rather than the contents so this stays cheap for long
+    /// recordings.
+    var logByteCount: Int {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: temporaryURL.path)
+        return (attributes?[.size] as? NSNumber)?.intValue ?? 0
+    }
+
     func removeLogFile() {
         guard FileManager.default.fileExists(atPath: temporaryURL.path) else { return }
         try? FileManager.default.removeItem(at: temporaryURL)
@@ -66,6 +74,12 @@ struct TioLogDocument: FileDocument {
 
     func removeTemporaryLogFile() {
         backing.removeLogFile()
+    }
+
+    /// Whether nothing has been recorded yet, so the log can be discarded
+    /// without losing data.
+    var temporaryLogIsEmpty: Bool {
+        backing.logByteCount == 0
     }
 
     init(data: Data = Data()) {
