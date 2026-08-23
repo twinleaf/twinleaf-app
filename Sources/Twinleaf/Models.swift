@@ -223,15 +223,122 @@ struct ColumnInfo: Codable, Hashable, Identifiable {
     var displayValue: Double?
 }
 
+/// A channel computed from another column rather than received from a device.
+///
+/// The tag rides on `ColumnKey` so a derived channel is addressable exactly
+/// like a raw column — panes, legends, drags and exports need no special case
+/// — while clearing the tag recovers the source key. Parameters deliberately
+/// live in `DerivedChannelSpec` instead of here, so retuning a channel
+/// re-derives it in place rather than invalidating every pane selection and
+/// saved layout that referenced it.
+enum Derivation: String, Codable, Hashable, Sendable, CaseIterable {
+    /// Robust white-noise ASD of the source column's spectrum, sampled over
+    /// time. One point per cadence interval, in `source units/√Hz`.
+    case noiseFloor
+
+    var sortOrder: Int {
+        switch self {
+        case .noiseFloor: 0
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .noiseFloor: "Noise Floor"
+        }
+    }
+
+    /// Units for a channel derived from a source measured in `units`.
+    func units(fromSource units: String) -> String {
+        switch self {
+        case .noiseFloor: units.isEmpty ? "1/√Hz" : "\(units)/√Hz"
+        }
+    }
+
+    func label(fromSource label: String) -> String {
+        switch self {
+        case .noiseFloor: "\(label) noise floor"
+        }
+    }
+}
+
 struct ColumnKey: Codable, Hashable, Comparable, Sendable {
     let route: String
     let streamId: UInt8
     let columnIndex: Int
+    /// `nil` for a column received from a device.
+    var derivation: Derivation? = nil
+
+    var isDerived: Bool { derivation != nil }
+
+    /// The raw column this key was derived from. Identity for a raw key.
+    var source: ColumnKey {
+        ColumnKey(route: route, streamId: streamId, columnIndex: columnIndex)
+    }
+
+    func derived(_ derivation: Derivation) -> ColumnKey {
+        ColumnKey(
+            route: route,
+            streamId: streamId,
+            columnIndex: columnIndex,
+            derivation: derivation
+        )
+    }
 
     static func < (lhs: ColumnKey, rhs: ColumnKey) -> Bool {
         if lhs.route != rhs.route { return lhs.route < rhs.route }
         if lhs.streamId != rhs.streamId { return lhs.streamId < rhs.streamId }
-        return lhs.columnIndex < rhs.columnIndex
+        if lhs.columnIndex != rhs.columnIndex { return lhs.columnIndex < rhs.columnIndex }
+        // Raw column first, then its derived channels in a stable order.
+        return (lhs.derivation?.sortOrder ?? -1) < (rhs.derivation?.sortOrder ?? -1)
+    }
+}
+
+/// How a derived channel is produced.
+///
+/// Window and cadence are independent knobs and both matter: the window sets
+/// the frequency resolution and the statistical scatter of each estimate,
+/// while the cadence only sets how often one is taken. With the defaults —
+/// a 10 s window every 1 s — successive points share 90% of their input, so
+/// the trace is smooth but adjacent points are correlated, not independent
+/// measurements.
+struct DerivedChannelSpec: Codable, Hashable, Identifiable, Sendable {
+    /// Source key with `derivation` applied.
+    var key: ColumnKey
+    /// Seconds of source data behind each estimate.
+    var windowSeconds: Double = DerivedChannelDefaults.windowSeconds
+    /// Seconds between emitted points.
+    var cadenceSeconds: Double = DerivedChannelDefaults.cadenceSeconds
+    /// Mirrors the global FFT detrend; derived channels do not carry a second
+    /// copy of that setting.
+    var detrend: DetrendMethod = .quadratic
+
+    var id: ColumnKey { key }
+    var source: ColumnKey { key.source }
+    var derivation: Derivation? { key.derivation }
+
+    private enum CodingKeys: String, CodingKey {
+        case key
+        case windowSeconds
+        case cadenceSeconds
+        case detrend
+    }
+}
+
+enum DerivedChannelDefaults {
+    static let windowSeconds = 10.0
+    static let cadenceSeconds = 1.0
+    static let windowRange: ClosedRange<Double> = 1...1000
+    static let cadenceRange: ClosedRange<Double> = 0.1...60
+
+    static func clampedWindow(_ value: Double) -> Double {
+        guard value.isFinite else { return windowSeconds }
+        return min(max(value, windowRange.lowerBound), windowRange.upperBound)
+    }
+
+    static func clampedCadence(_ value: Double) -> Double {
+        guard value.isFinite else { return cadenceSeconds }
+        return min(max(value, cadenceRange.lowerBound), cadenceRange.upperBound)
     }
 }
 
@@ -390,6 +497,9 @@ struct ViewConfig: Codable, Hashable {
     var detrend: DetrendMethod = .quadratic
     var fftLogX: Bool = true
     var fftLogY: Bool = true
+    /// Log vertical axis in timeseries mode. Separate from `fftLogY` so a pane
+    /// toggling between modes keeps each axis choice.
+    var logY: Bool = false
 }
 
 enum ViewPreferenceKeys {
@@ -417,6 +527,8 @@ enum ViewPreferenceKeys {
     static let suppressCommHubDefaultPlot = "view.suppressCommHubDefaultPlot"
     static let yAxisHysteresis = "view.yAxisHysteresis"
     static let fftAxisHysteresis = "view.fftAxisHysteresis"
+    static let noiseFloorWindowSeconds = "view.noiseFloorWindowSeconds"
+    static let noiseFloorCadenceSeconds = "view.noiseFloorCadenceSeconds"
     static let captureAutoDelaySeconds = "view.captureAutoDelaySeconds"
     static let boardViewLayouts = "view.boardViewLayouts"
     static let showAllSerialPorts = "view.showAllSerialPorts"
@@ -653,10 +765,21 @@ struct PlotSeries: Codable, Identifiable {
     let units: String
     let sampleRate: Double
     let points: [PlotPoint]
+    /// Robust white-noise ASD estimate for FFT data, in `units/sqrt(Hz)`.
+    var noiseFloor: Double? = nil
     /// True when the column has live data but none of it falls inside the
     /// pane's displayed time window (its time reference is incompatible with
     /// the pane's anchor stream). Shown with a warning in the legend.
     var isOutsideTimeWindow = false
+    /// True for a derived channel that has not yet accumulated a full source
+    /// window. Nothing is wrong — there is simply no estimate yet — so the
+    /// legend says so rather than showing the time-reference warning or
+    /// dropping the trace entirely.
+    var isWarmingUp = false
+
+    /// Both states mean "no trace to draw right now", so the legend entry is
+    /// shown subdued either way; only the trailing annotation differs.
+    var isDimmedInLegend: Bool { isOutsideTimeWindow || isWarmingUp }
 }
 
 enum JSONValue: Codable, Hashable, CustomStringConvertible {

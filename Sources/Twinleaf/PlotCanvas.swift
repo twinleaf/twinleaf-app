@@ -240,6 +240,9 @@ struct PlotCanvas: View {
     let recordingStartSeconds: Double?
     let fftLogX: Bool
     let fftLogY: Bool
+    /// Log vertical axis in timeseries mode. Kept apart from `fftLogY` so a
+    /// pane toggling between modes remembers each axis choice.
+    var logY: Bool = false
     let showKey: Bool
     var showsXAxisLabels = true
     var topPlotInset: CGFloat = 0
@@ -251,6 +254,9 @@ struct PlotCanvas: View {
     var onTimeseriesPan: (Double) -> Void = { _ in }
     var onTimeseriesZoom: (Double, Double) -> Void = { _, _ in }
     var onPlotColumnsDropped: (PlotColumnDragPayload) -> Void = { _ in }
+    /// Context-menu content for one legend entry. Supplied by the host so the
+    /// canvas stays free of bridge and menu-building concerns.
+    var legendMenu: (PlotSeries) -> AnyView = { _ in AnyView(EmptyView()) }
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(ViewPreferenceKeys.traceColorPaletteLight) private var traceColorPaletteLightRaw = PlotTracePalette.defaultLightRawValue
     @AppStorage(ViewPreferenceKeys.traceColorPaletteDark) private var traceColorPaletteDarkRaw = PlotTracePalette.defaultDarkRawValue
@@ -258,7 +264,7 @@ struct PlotCanvas: View {
     @AppStorage(ViewPreferenceKeys.fftAxisHysteresis) private var fftAxisHysteresis = PlotAxisHysteresis.defaultFraction
     @State private var cursorLocation: CGPoint?
     @State private var isPlotDropTargeted = false
-    @State private var fftAxisRangeMemory = FftAxisRangeMemory()
+    @State private var snappedAxisRangeMemory = SnappedAxisRangeMemory()
     @State private var timeseriesAxisRangeMemory = LinearAxisRangeMemory()
     @State private var axisRangeScanCache = PlotAxisRangeScanCache()
     // Class-backed cache held in @State so cursor-driven body re-evals don't
@@ -312,16 +318,22 @@ struct PlotCanvas: View {
                             .allowsHitTesting(false)
                     }
                 }
+                .contentShape(Rectangle())
+                // The plot's own drag has to be attached below the legend: an
+                // .onDrag layered over the legend swallows every drag that
+                // starts inside it, including the legend's per-series drags.
+                .onDrag {
+                    plotPDFItemProvider(size: geometry.size, plan: plan, rect: rect)
+                }
                 .overlay(alignment: .topLeading) {
                     if (showKey || activeCursorSelection != nil) && (!series.isEmpty || isPlotDropTargeted) {
                         legend(selection: activeCursorSelection)
                             .padding(.leading, legendSafeAreaInsets.leading + Self.legendSafeAreaMargin)
                             .padding(.top, legendSafeAreaInsets.top + Self.legendTopSafeAreaMargin)
+                            // The legend sizes to its contents; this only bounds
+                            // how far right it may grow before labels truncate.
+                            .frame(maxWidth: legendMaxWidth(rect: rect), alignment: .topLeading)
                     }
-                }
-                .contentShape(Rectangle())
-                .onDrag {
-                    plotPDFItemProvider(size: geometry.size, plan: plan, rect: rect)
                 }
                 .contextMenu {
                     Button {
@@ -642,9 +654,15 @@ struct PlotCanvas: View {
 
     private func legend(selection: CursorSelection?) -> some View {
         let valuesByID = Dictionary(uniqueKeysWithValues: selection?.values.map { ($0.id, $0) } ?? [])
+        let showsNoiseFloors = selection == nil && mode == .fft
+        let showsValues = selection != nil || (showsNoiseFloors && series.contains { $0.noiseFloor != nil })
 
         return VStack(alignment: .leading, spacing: 6) {
-            legendRows(valuesByID: valuesByID, showsValues: selection != nil)
+            legendRows(
+                valuesByID: valuesByID,
+                showsNoiseFloors: showsNoiseFloors,
+                showsValues: showsValues
+            )
 
             if let selection {
                 HStack(spacing: 6) {
@@ -677,51 +695,108 @@ struct PlotCanvas: View {
     private static let legendSafeAreaMargin: CGFloat = 8
     private static let legendTopSafeAreaMargin: CGFloat = 3
     private static let legendCornerRadius: CGFloat = 6
+    private static let legendMinimumContentWidth: CGFloat = 120
+
+    private func noiseFloorText(_ value: Double, units: String) -> String {
+        let formatted = String(format: "%.3g", value)
+        guard !units.isEmpty else { return "Floor \(formatted) ASD" }
+        return "Floor \(formatted) \(units)/√Hz"
+    }
 
     @ViewBuilder
-    private func legendRows(valuesByID: [ColumnKey: CursorValue], showsValues: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if series.isEmpty {
-                Image(systemName: "plus")
-                    .font(.body)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 18, height: 18)
-            } else {
+    private func legendRows(
+        valuesByID: [ColumnKey: CursorValue],
+        showsNoiseFloors: Bool,
+        showsValues: Bool
+    ) -> some View {
+        if series.isEmpty {
+            Image(systemName: "plus")
+                .font(.body)
+                .foregroundStyle(.secondary)
+                .frame(width: 18, height: 18)
+        } else {
+            // A Grid keeps the value column aligned across rows while every
+            // row stays only as wide as its own contents need. The gap between
+            // the two columns is padding inside the value cell rather than grid
+            // spacing, so the cell's drag hit area reaches the label beside it.
+            Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 6) {
                 ForEach(Array(series.enumerated()), id: \.element.id) { index, item in
-                    let hoverValue = valuesByID[item.id]
-
-                    HStack(spacing: 6) {
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(colors[index % colors.count])
-                            .frame(width: 18, height: 4)
-                            .opacity(item.isOutsideTimeWindow ? 0.35 : 1)
-                        Text(item.label)
-                            .font(.body)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .foregroundStyle(item.isOutsideTimeWindow ? .secondary : .primary)
-                        if item.isOutsideTimeWindow {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.yellow)
-                                .help("This stream's time reference doesn't match the graph's first stream, so it can't be shown on the same time axis.")
-                        }
-                        if let hoverValue {
-                            Spacer(minLength: 12)
-                            Text(hoverValue.yText)
-                                .font(.body.monospacedDigit())
-                                .foregroundStyle(.primary)
+                    GridRow {
+                        HStack(spacing: 6) {
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(colors[index % colors.count])
+                                .frame(width: 18, height: 4)
+                                .opacity(item.isDimmedInLegend ? 0.35 : 1)
+                            Text(item.label)
+                                .font(.body)
                                 .lineLimit(1)
+                                .truncationMode(.middle)
+                                .foregroundStyle(item.isDimmedInLegend ? .secondary : .primary)
+                            if item.isOutsideTimeWindow {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.yellow)
+                                    .help("This stream's time reference doesn't match the graph's first stream, so it can't be shown on the same time axis.")
+                            } else if item.isWarmingUp {
+                                // Nothing is wrong: a derived channel needs a
+                                // full source window before its first estimate.
+                                Text("warming up")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .help("Collecting enough data for the first estimate.")
+                            }
                         }
-                    }
-                    .frame(width: showsValues ? 260 : nil, alignment: .leading)
-                    .contentShape(Rectangle())
-                    .onDrag {
-                        PlotColumnDragPayload(keys: [item.key], sourcePaneID: paneID).itemProvider
+                        .contentShape(Rectangle())
+                        .onDrag {
+                            PlotColumnDragPayload(keys: [item.key], sourcePaneID: paneID).itemProvider
+                        }
+                        .contextMenu { legendMenu(item) }
+
+                        if showsValues {
+                            legendValue(
+                                for: item,
+                                hoverValue: valuesByID[item.id],
+                                showsNoiseFloors: showsNoiseFloors
+                            )
+                            .padding(.leading, 12)
+                            .gridColumnAlignment(.trailing)
+                            .contentShape(Rectangle())
+                            .onDrag {
+                                PlotColumnDragPayload(keys: [item.key], sourcePaneID: paneID).itemProvider
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func legendValue(
+        for item: PlotSeries,
+        hoverValue: CursorValue?,
+        showsNoiseFloors: Bool
+    ) -> some View {
+        if let hoverValue {
+            Text(hoverValue.yText)
+                .font(.body.monospacedDigit())
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+        } else if showsNoiseFloors, let floor = item.noiseFloor {
+            Text(noiseFloorText(floor, units: item.units))
+                .font(.body.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        } else {
+            Color.clear.frame(width: 0, height: 0)
+        }
+    }
+
+    // The legend hangs off the plot frame's leading edge, so it may run right
+    // up to the frame's trailing edge before its labels have to truncate.
+    private func legendMaxWidth(rect: CGRect) -> CGFloat {
+        let leading = legendSafeAreaInsets.leading + Self.legendSafeAreaMargin
+        return max(leading + Self.legendMinimumContentWidth, rect.maxX)
     }
 
     private var totalPointCount: Int {
@@ -897,7 +972,7 @@ struct PlotCanvas: View {
 
     private func computePlan() -> PlotDataPlan? {
         let useLogX = mode == .fft && fftLogX
-        let useLogY = mode == .fft && fftLogY
+        let useLogY = mode == .fft ? fftLogY : logY
         let key = PlotPlanKey(
             plotRevision: plotRevision,
             mode: mode,
@@ -952,7 +1027,7 @@ struct PlotCanvas: View {
             }
             xRange = (end - window)...end
         case .fft:
-            xRange = snappedFftAxisRange(axis: .x, rawLower: xMin, rawUpper: xMax, useLog: useLogX)
+            xRange = snappedAxisRange(axis: .x, rawLower: xMin, rawUpper: xMax, useLog: useLogX)
         }
 
         let ySnapshot = yAxisRangeSnapshot(
@@ -1026,7 +1101,7 @@ struct PlotCanvas: View {
             if yMin < sharedYMin { sharedYMin = yMin }
             if yMax > sharedYMax { sharedYMax = yMax }
             if needsIndependent {
-                perSeries[item.id] = fftAwareYRange(
+                perSeries[item.id] = resolvedYRange(
                     minY: yMin,
                     maxY: yMax,
                     useLogY: useLogY,
@@ -1043,7 +1118,7 @@ struct PlotCanvas: View {
             )
         }
 
-        let sharedYRange = fftAwareYRange(minY: sharedYMin, maxY: sharedYMax, useLogY: useLogY)
+        let sharedYRange = resolvedYRange(minY: sharedYMin, maxY: sharedYMax, useLogY: useLogY)
         return PlotAxisRangeSnapshot(
             sharedYRange: sharedYRange,
             seriesYRanges: perSeries,
@@ -1074,13 +1149,17 @@ struct PlotCanvas: View {
         return max(points.startIndex, low - radius)..<min(points.endIndex, low + radius + 1)
     }
 
-    private func fftAwareYRange(
+    private func resolvedYRange(
         minY: Double,
         maxY: Double,
         useLogY: Bool,
         seriesID: ColumnKey? = nil
     ) -> ClosedRange<Double> {
-        guard mode == .fft else {
+        // A linear axis keeps its linear-span hysteresis; a log axis — in
+        // either mode — snaps to decades and measures hysteresis in orders of
+        // magnitude, because a linear margin over a range spanning decades is
+        // set entirely by the topmost one.
+        guard mode == .fft || useLogY else {
             let ideal = plotPaddedYRange(minY: minY, maxY: maxY, useLogY: useLogY)
             return timeseriesAxisRangeMemory.hystereticRange(
                 mode: mode,
@@ -1092,7 +1171,7 @@ struct PlotCanvas: View {
                 hysteresisFraction: PlotAxisHysteresis.clamped(yAxisHysteresis)
             )
         }
-        return snappedFftAxisRange(
+        return snappedAxisRange(
             axis: .y,
             seriesID: seriesID,
             rawLower: minY,
@@ -1101,14 +1180,15 @@ struct PlotCanvas: View {
         )
     }
 
-    private func snappedFftAxisRange(
-        axis: FftAxis,
+    private func snappedAxisRange(
+        axis: PlotAxisKind,
         seriesID: ColumnKey? = nil,
         rawLower: Double,
         rawUpper: Double,
         useLog: Bool
     ) -> ClosedRange<Double> {
-        fftAxisRangeMemory.snappedRange(
+        snappedAxisRangeMemory.snappedRange(
+            mode: mode,
             axis: axis,
             seriesID: seriesID,
             scale: useLog ? .log : .linear,
@@ -1675,34 +1755,39 @@ private struct AxisMapping {
     }
 }
 
-private enum FftAxis: Hashable {
+private enum PlotAxisKind: Hashable {
     case x
     case y
 }
 
-private enum FftAxisScale: Hashable {
+private enum PlotAxisScale: Hashable {
     case linear
     case log
 }
 
-private struct FftAxisRangeKey: Hashable {
-    let axis: FftAxis
+private struct SnappedAxisRangeKey: Hashable {
+    /// Included so a pane switching between modes does not inherit the other
+    /// mode's remembered range — a frequency axis and a time axis share
+    /// nothing but their orientation.
+    let mode: PlotMode
+    let axis: PlotAxisKind
     let seriesID: ColumnKey?
-    let scale: FftAxisScale
+    let scale: PlotAxisScale
 }
 
-private final class FftAxisRangeMemory {
-    private var ranges: [FftAxisRangeKey: ClosedRange<Double>] = [:]
+private final class SnappedAxisRangeMemory {
+    private var ranges: [SnappedAxisRangeKey: ClosedRange<Double>] = [:]
 
     func snappedRange(
-        axis: FftAxis,
+        mode: PlotMode,
+        axis: PlotAxisKind,
         seriesID: ColumnKey? = nil,
-        scale: FftAxisScale,
+        scale: PlotAxisScale,
         rawLower: Double,
         rawUpper: Double,
         hysteresisFraction: Double
     ) -> ClosedRange<Double> {
-        let key = FftAxisRangeKey(axis: axis, seriesID: seriesID, scale: scale)
+        let key = SnappedAxisRangeKey(mode: mode, axis: axis, seriesID: seriesID, scale: scale)
         let ideal = idealRange(scale: scale, rawLower: rawLower, rawUpper: rawUpper)
         let hysteresis = PlotAxisHysteresis.clamped(hysteresisFraction)
 
@@ -1752,7 +1837,7 @@ private final class FftAxisRangeMemory {
     }
 
     private func idealRange(
-        scale: FftAxisScale,
+        scale: PlotAxisScale,
         rawLower: Double,
         rawUpper: Double
     ) -> ClosedRange<Double> {
@@ -1791,7 +1876,7 @@ private final class FftAxisRangeMemory {
     }
 
     private func shouldContractUpper(
-        scale: FftAxisScale,
+        scale: PlotAxisScale,
         rawUpper: Double,
         idealUpper: Double,
         hysteresisFraction: Double
@@ -1812,7 +1897,7 @@ private final class FftAxisRangeMemory {
     }
 
     private func shouldContractLower(
-        scale: FftAxisScale,
+        scale: PlotAxisScale,
         rawLower: Double,
         idealLower: Double,
         hysteresisFraction: Double
@@ -1851,7 +1936,7 @@ private final class FftAxisRangeMemory {
 
 private struct LinearAxisRangeKey: Hashable {
     let mode: PlotMode
-    let axis: FftAxis
+    let axis: PlotAxisKind
     let seriesID: ColumnKey?
 }
 
@@ -1860,7 +1945,7 @@ private final class LinearAxisRangeMemory {
 
     func hystereticRange(
         mode: PlotMode,
-        axis: FftAxis,
+        axis: PlotAxisKind,
         seriesID: ColumnKey? = nil,
         ideal: ClosedRange<Double>,
         rawLower: Double,

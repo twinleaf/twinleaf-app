@@ -50,35 +50,10 @@ private typealias RuntimeCopyViewDataFn = @convention(c) (
     UInt8,
     Double
 ) -> Void
-private typealias RuntimeSetPlotPanesFn = @convention(c) (
+private typealias RuntimeSendCommandJsonFn = @convention(c) (
     OpaquePointer?,
-    UnsafePointer<UInt>?,
-    UnsafePointer<UInt8>?,
-    UnsafePointer<Double>?,
-    UnsafePointer<UInt>?,
-    UnsafePointer<UInt>?,
-    UnsafePointer<UInt8>?,
-    UnsafePointer<UInt8>?,
-    UnsafePointer<UInt8>?,
-    UnsafePointer<UInt8>?,
-    Int,
-    UnsafePointer<UInt>?,
-    UnsafePointer<UnsafePointer<CChar>?>?,
-    UnsafePointer<UInt8>?,
-    UnsafePointer<UInt>?,
-    Int
-) -> Void
-private typealias RuntimeSetViewFn = @convention(c) (
-    OpaquePointer?,
-    UInt8,
-    Double,
-    UInt,
-    UInt,
-    UInt8,
-    UInt8,
-    UInt8,
-    UInt8
-) -> Void
+    UnsafePointer<CChar>?
+) -> Bool
 private typealias RuntimeCallRpcFn = @convention(c) (
     OpaquePointer?,
     UnsafePointer<CChar>?,
@@ -155,38 +130,11 @@ private func twinleaf_runtime_copy_view_data(
     _ viewportEnd: Double
 )
 
-@_silgen_name("twinleaf_runtime_set_plot_panes")
-private func twinleaf_runtime_set_plot_panes(
+@_silgen_name("twinleaf_runtime_send_command_json")
+private func twinleaf_runtime_send_command_json(
     _ runtime: OpaquePointer?,
-    _ paneIDs: UnsafePointer<UInt>?,
-    _ modes: UnsafePointer<UInt8>?,
-    _ windowSeconds: UnsafePointer<Double>?,
-    _ resolutionMultipliers: UnsafePointer<UInt>?,
-    _ plotWidthPixels: UnsafePointer<UInt>?,
-    _ decimationMethods: UnsafePointer<UInt8>?,
-    _ detrends: UnsafePointer<UInt8>?,
-    _ fftLogXs: UnsafePointer<UInt8>?,
-    _ fftLogYs: UnsafePointer<UInt8>?,
-    _ paneCount: Int,
-    _ columnPaneIDs: UnsafePointer<UInt>?,
-    _ routes: UnsafePointer<UnsafePointer<CChar>?>?,
-    _ streamIDs: UnsafePointer<UInt8>?,
-    _ columnIndices: UnsafePointer<UInt>?,
-    _ columnCount: Int
-)
-
-@_silgen_name("twinleaf_runtime_set_view")
-private func twinleaf_runtime_set_view(
-    _ runtime: OpaquePointer?,
-    _ mode: UInt8,
-    _ windowSeconds: Double,
-    _ resolutionMultiplier: UInt,
-    _ plotWidthPixels: UInt,
-    _ decimationMethod: UInt8,
-    _ detrend: UInt8,
-    _ fftLogX: UInt8,
-    _ fftLogY: UInt8
-)
+    _ json: UnsafePointer<CChar>?
+) -> Bool
 
 @_silgen_name("twinleaf_runtime_call_rpc")
 private func twinleaf_runtime_call_rpc(
@@ -262,8 +210,7 @@ final class RustRuntime {
     private let performUpgradeFn: RuntimePerformUpgradeFn
     private let setPlaybackFn: RuntimeSetPlaybackFn
     private let copyViewDataFn: RuntimeCopyViewDataFn
-    private let setPlotPanesFn: RuntimeSetPlotPanesFn
-    private let setViewFn: RuntimeSetViewFn
+    private let sendCommandJsonFn: RuntimeSendCommandJsonFn
     private let callRpcValueFn: RuntimeCallRpcValueFn
 
     init(owner: BridgeClient) throws {
@@ -285,8 +232,7 @@ final class RustRuntime {
         performUpgradeFn = twinleaf_runtime_perform_upgrade
         setPlaybackFn = twinleaf_runtime_set_playback
         copyViewDataFn = twinleaf_runtime_copy_view_data
-        setPlotPanesFn = twinleaf_runtime_set_plot_panes
-        setViewFn = twinleaf_runtime_set_view
+        sendCommandJsonFn = twinleaf_runtime_send_command_json
         callRpcValueFn = twinleaf_runtime_call_rpc_value
 #else
         let libraryURL = try Self.findLibraryURL()
@@ -310,8 +256,7 @@ final class RustRuntime {
         performUpgradeFn = try Self.load(library, "twinleaf_runtime_perform_upgrade")
         setPlaybackFn = try Self.load(library, "twinleaf_runtime_set_playback")
         copyViewDataFn = try Self.load(library, "twinleaf_runtime_copy_view_data")
-        setPlotPanesFn = try Self.load(library, "twinleaf_runtime_set_plot_panes")
-        setViewFn = try Self.load(library, "twinleaf_runtime_set_view")
+        sendCommandJsonFn = try Self.load(library, "twinleaf_runtime_send_command_json")
         callRpcValueFn = try Self.load(library, "twinleaf_runtime_call_rpc_value")
 #endif
 
@@ -403,89 +348,35 @@ final class RustRuntime {
     }
 
     func setPlotPanes(_ panes: [PlotPaneSelection]) {
-        let paneIDs = panes.map { UInt($0.id) }
-        let modes = panes.map { $0.viewConfig.mode.runtimeCode }
-        let windowSeconds = panes.map { $0.viewConfig.windowSeconds }
-        let resolutionMultipliers = panes.map { UInt($0.viewConfig.resolutionMultiplier) }
-        let plotWidths = panes.map { UInt($0.viewConfig.plotWidthPixels) }
-        let decimationMethods = panes.map { $0.viewConfig.decimationMethod.runtimeCode }
-        let detrends = panes.map { $0.viewConfig.detrend.runtimeCode }
-        let fftLogXs = panes.map { $0.viewConfig.fftLogX ? UInt8(1) : UInt8(0) }
-        let fftLogYs = panes.map { $0.viewConfig.fftLogY ? UInt8(1) : UInt8(0) }
-        let columns = panes.flatMap { pane in
-            pane.columns.sorted().map { column in
-                (paneID: UInt(pane.id), column: column)
-            }
-        }
-        let columnPaneIDs = columns.map { $0.paneID }
-        let routeStrings = columns.map { strdup($0.column.route)! }
-        defer {
-            for pointer in routeStrings {
-                free(pointer)
-            }
-        }
-        let routePointers: [UnsafePointer<CChar>?] = routeStrings.map { UnsafePointer($0) }
-        let streamIDs = columns.map { $0.column.streamId }
-        let columnIndices = columns.map { UInt($0.column.columnIndex) }
+        send(SetPlotPanesCommand(panes: panes.map(PlotPaneConfigPayload.init)))
+    }
 
-        paneIDs.withUnsafeBufferPointer { paneIDBuffer in
-            modes.withUnsafeBufferPointer { modeBuffer in
-                windowSeconds.withUnsafeBufferPointer { windowBuffer in
-                    resolutionMultipliers.withUnsafeBufferPointer { resolutionBuffer in
-                        plotWidths.withUnsafeBufferPointer { widthBuffer in
-                            decimationMethods.withUnsafeBufferPointer { decimationBuffer in
-                                detrends.withUnsafeBufferPointer { detrendBuffer in
-                                    fftLogXs.withUnsafeBufferPointer { fftLogXBuffer in
-                                        fftLogYs.withUnsafeBufferPointer { fftLogYBuffer in
-                                            columnPaneIDs.withUnsafeBufferPointer { columnPaneBuffer in
-                                                routePointers.withUnsafeBufferPointer { routesBuffer in
-                                                    streamIDs.withUnsafeBufferPointer { streamIDsBuffer in
-                                                        columnIndices.withUnsafeBufferPointer { columnIndicesBuffer in
-                                                            setPlotPanesFn(
-                                                                runtime,
-                                                                paneIDBuffer.baseAddress,
-                                                                modeBuffer.baseAddress,
-                                                                windowBuffer.baseAddress,
-                                                                resolutionBuffer.baseAddress,
-                                                                widthBuffer.baseAddress,
-                                                                decimationBuffer.baseAddress,
-                                                                detrendBuffer.baseAddress,
-                                                                fftLogXBuffer.baseAddress,
-                                                                fftLogYBuffer.baseAddress,
-                                                                panes.count,
-                                                                columnPaneBuffer.baseAddress,
-                                                                routesBuffer.baseAddress,
-                                                                streamIDsBuffer.baseAddress,
-                                                                columnIndicesBuffer.baseAddress,
-                                                                columns.count
-                                                            )
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    func setDerivedChannels(_ channels: [DerivedChannelSpec]) {
+        send(SetDerivedChannelsCommand(
+            channels: channels.sorted { $0.key < $1.key }.map(DerivedChannelPayload.init)
+        ))
     }
 
     func setView(_ view: ViewConfig) {
-        setViewFn(
-            runtime,
-            view.mode.runtimeCode,
-            view.windowSeconds,
-            UInt(view.resolutionMultiplier),
-            UInt(view.plotWidthPixels),
-            view.decimationMethod.runtimeCode,
-            view.detrend.runtimeCode,
-            view.fftLogX ? 1 : 0,
-            view.fftLogY ? 1 : 0
-        )
+        send(SetViewCommand(view: view))
+    }
+
+    /// Structured commands cross the FFI boundary as JSON.
+    ///
+    /// The alternative — a dozen parallel C arrays per command, as plot panes
+    /// used to be passed — cost an array on both sides for every new field and
+    /// silently misbehaved if the two sides fell out of step. These commands
+    /// fire on user actions, not per frame, so encoding is not on any hot path.
+    private func send<Command: Encodable>(_ command: Command) {
+        guard let data = try? JSONEncoder().encode(command),
+              let json = String(data: data, encoding: .utf8) else {
+            logRustRuntime("failed to encode runtime command")
+            return
+        }
+        let accepted = json.withCString { sendCommandJsonFn(runtime, $0) }
+        if !accepted {
+            logRustRuntime("runtime rejected command: \(json.prefix(200))")
+        }
     }
 
     func callRpc(requestId: String, route: String, name: String, argument: Any?) {
@@ -679,5 +570,56 @@ private extension ExportFormat {
         case .csv: 0
         case .hdf5: 1
         }
+    }
+}
+
+// MARK: - Runtime command payloads
+//
+// These mirror the Rust `ClientCommand` variants exactly: the tag field is
+// `type`, and every key is camelCase. They exist as separate types rather than
+// encoding the UI models directly because the UI models carry things the
+// runtime has no use for (pane titles, selection sets) and name things
+// differently (`viewConfig` vs the runtime's `view`).
+
+private struct SetPlotPanesCommand: Encodable {
+    let type = "setPlotPanes"
+    let panes: [PlotPaneConfigPayload]
+}
+
+private struct SetDerivedChannelsCommand: Encodable {
+    let type = "setDerivedChannels"
+    let channels: [DerivedChannelPayload]
+}
+
+private struct SetViewCommand: Encodable {
+    let type = "setView"
+    let view: ViewConfig
+}
+
+private struct PlotPaneConfigPayload: Encodable {
+    let id: Int
+    let view: ViewConfig
+    let columns: [ColumnKey]
+
+    init(_ pane: PlotPaneSelection) {
+        id = pane.id
+        view = pane.viewConfig
+        // Sorted so an unchanged selection encodes identically every time;
+        // `columns` is a Set on the UI side and would otherwise reorder.
+        columns = pane.columns.sorted()
+    }
+}
+
+private struct DerivedChannelPayload: Encodable {
+    let key: ColumnKey
+    let windowSeconds: Double
+    let cadenceSeconds: Double
+    let detrend: DetrendMethod
+
+    init(_ spec: DerivedChannelSpec) {
+        key = spec.key
+        windowSeconds = DerivedChannelDefaults.clampedWindow(spec.windowSeconds)
+        cadenceSeconds = DerivedChannelDefaults.clampedCadence(spec.cadenceSeconds)
+        detrend = spec.detrend
     }
 }

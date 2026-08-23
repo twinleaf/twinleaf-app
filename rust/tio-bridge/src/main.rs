@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufWriter, Write};
+use std::ops::RangeInclusive;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -620,6 +621,21 @@ fn optional_f64(value: Option<&Value>) -> Option<f64> {
         .filter(|value| value.is_finite())
 }
 
+/// Bumped whenever the per-series layout changes. 5 added the derivation tag
+/// after the column index, and the warming-up bit to the flags byte.
+const PLOT_FRAME_VERSION: usize = 5;
+
+fn derivation_code(derivation: Option<Derivation>) -> u8 {
+    match derivation {
+        None => 0,
+        Some(Derivation::NoiseFloor) => 1,
+    }
+}
+
+fn series_flags(item: &BinaryPlotSeries<'_>) -> u8 {
+    u8::from(item.outside_window) | (u8::from(item.warming_up) << 1)
+}
+
 fn write_plot_payload<W: Write>(
     writer: &mut W,
     pane_id: usize,
@@ -629,7 +645,7 @@ fn write_plot_payload<W: Write>(
 ) -> io::Result<()> {
     write_u8(writer, plot_mode_code(mode))?;
     write_u8(writer, u8::from(viewport_end.is_some()))?;
-    write_u16(writer, 3)?;
+    write_u16(writer, PLOT_FRAME_VERSION)?;
     write_u32(writer, pane_id)?;
     write_u32(writer, series.len())?;
     write_f64(writer, viewport_end.unwrap_or(0.0))?;
@@ -646,8 +662,10 @@ fn write_plot_payload<W: Write>(
         writer.write_all(route)?;
         write_u8(writer, item.key.stream_id)?;
         write_u32(writer, item.key.column_index)?;
+        write_u8(writer, derivation_code(item.key.derivation))?;
         write_f64(writer, item.sample_rate)?;
-        write_u8(writer, u8::from(item.outside_window))?;
+        write_u8(writer, series_flags(item))?;
+        write_f64(writer, item.noise_floor.unwrap_or(f64::NAN))?;
         write_u32(writer, item.points.len())?;
         item.points.write_to(writer)?;
     }
@@ -698,6 +716,9 @@ enum ClientCommand {
     SetPlotPanes {
         panes: Vec<PlotPaneConfig>,
     },
+    SetDerivedChannels {
+        channels: Vec<DerivedChannelDto>,
+    },
     SetView {
         view: ViewConfig,
     },
@@ -724,6 +745,7 @@ enum SessionCommand {
     },
     SetView(ViewConfig),
     SetPlotPanes(Vec<PlotPaneConfig>),
+    SetDerivedChannels(Vec<DerivedChannelDto>),
     CallRpc {
         request_id: String,
         route: String,
@@ -741,12 +763,52 @@ enum SessionCommand {
     },
 }
 
+/// A channel computed from another column rather than received from a device.
+///
+/// The tag rides on `ColumnKeyDto` so a derived channel is addressable exactly
+/// like a raw column — panes, legends, exports and FPCS all keep working
+/// unchanged — while clearing the tag recovers the source key. Namespacing by
+/// stream id instead would collide with real `u8` ids and lose that link.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+enum Derivation {
+    /// Robust white-noise ASD of the source column's spectrum, sampled over
+    /// time. One point per cadence interval, in `source units/sqrt(Hz)`.
+    NoiseFloor,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase")]
 struct ColumnKeyDto {
     route: String,
     stream_id: u8,
     column_index: usize,
+    /// `None` for a column received from a device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    derivation: Option<Derivation>,
+}
+
+impl ColumnKeyDto {
+    fn raw(route: impl Into<String>, stream_id: u8, column_index: usize) -> Self {
+        Self {
+            route: route.into(),
+            stream_id,
+            column_index,
+            derivation: None,
+        }
+    }
+
+    fn is_derived(&self) -> bool {
+        self.derivation.is_some()
+    }
+
+    /// The raw column this key was derived from. Identity for a raw key.
+    fn source(&self) -> Self {
+        Self {
+            derivation: None,
+            ..self.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -760,6 +822,9 @@ struct ViewConfig {
     detrend: DetrendMethod,
     fft_log_x: bool,
     fft_log_y: bool,
+    /// Log vertical axis in timeseries mode. Separate from `fft_log_y` so a
+    /// pane toggling between modes keeps each axis choice.
+    log_y: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -781,6 +846,7 @@ impl Default for ViewConfig {
             detrend: DetrendMethod::Quadratic,
             fft_log_x: true,
             fft_log_y: true,
+            log_y: false,
         }
     }
 }
@@ -884,6 +950,13 @@ struct BinaryPlotSeries<'a> {
     /// pane's anchor stream). The series is sent with no points so the legend
     /// can flag it.
     outside_window: bool,
+    /// True for a derived column that exists but has not yet accumulated a
+    /// full source window. Distinct from `outside_window`: nothing is wrong,
+    /// there is simply no estimate yet, and the legend says so rather than
+    /// showing a time-reference warning or silently omitting the trace.
+    warming_up: bool,
+    /// White-noise ASD estimate for FFT series. Encoded as NaN when absent.
+    noise_floor: Option<f64>,
 }
 
 fn binary_plot_payload_len(series: &[BinaryPlotSeries<'_>]) -> io::Result<usize> {
@@ -896,8 +969,10 @@ fn binary_plot_payload_len(series: &[BinaryPlotSeries<'_>]) -> io::Result<usize>
                 "route is too long for binary plot frame",
             ));
         }
+        // route len + route + stream id + column index + derivation +
+        // sample rate + flags + noise floor + point count
         length = length
-            .checked_add(2 + route_len + 1 + 4 + 8 + 1 + 4)
+            .checked_add(2 + route_len + 1 + 4 + 1 + 8 + 1 + 8 + 4)
             .and_then(|value| value.checked_add(item.points.len().checked_mul(16)?))
             .ok_or_else(|| {
                 io::Error::new(
@@ -1395,6 +1470,7 @@ struct PlotSeries {
     units: String,
     sample_rate: f64,
     points: Vec<Point>,
+    noise_floor: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1570,6 +1646,136 @@ impl FftWorker {
 fn same_fft_window_seconds(lhs: f64, rhs: f64) -> bool {
     let scale = lhs.abs().max(rhs.abs()).max(1.0);
     (lhs - rhs).abs() <= scale * 1e-9
+}
+
+/// How a derived channel is produced. Parameters live here rather than in the
+/// key so that retuning a channel re-derives it in place instead of
+/// invalidating every pane selection and saved layout that referenced it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct DerivedChannelDto {
+    /// Source column key with `derivation` applied.
+    key: ColumnKeyDto,
+    /// Seconds of source data behind each estimate.
+    window_seconds: f64,
+    /// Seconds between emitted points.
+    cadence_seconds: f64,
+    detrend: DetrendMethod,
+}
+
+impl DerivedChannelDto {
+    fn source(&self) -> ColumnKeyDto {
+        self.key.source()
+    }
+
+    fn kind(&self) -> Option<Derivation> {
+        self.key.derivation
+    }
+
+    /// Derived units for a source measured in `units`.
+    fn units(&self, units: &str) -> String {
+        match self.kind() {
+            Some(Derivation::NoiseFloor) if units.is_empty() => "1/sqrt(Hz)".to_string(),
+            Some(Derivation::NoiseFloor) => format!("{units}/sqrt(Hz)"),
+            None => units.to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DerivedJob {
+    key: ColumnKeyDto,
+    /// Timestamp to stamp the result with: the end of the window the estimate
+    /// was taken over, matching what an FFT pane's legend reads at that
+    /// instant.
+    x: f64,
+    sample_rate: f64,
+    detrend: DetrendMethod,
+    points: Vec<Point>,
+}
+
+#[derive(Debug)]
+struct DerivedOutcome {
+    key: ColumnKeyDto,
+    x: f64,
+    /// `None` when the window was too short or too contaminated to yield an
+    /// estimate; the tick is skipped rather than plotted as a gap value.
+    y: Option<f64>,
+}
+
+/// Computes derived-channel points off the ingest thread.
+///
+/// Deliberately separate from `FftWorker`: that one is bound to per-pane
+/// display generations and viewport semantics, and folding derivation into it
+/// would couple a background summary to what happens to be on screen.
+struct DerivedWorker {
+    request_tx: Sender<Vec<DerivedJob>>,
+    result_rx: Receiver<Vec<DerivedOutcome>>,
+    in_flight: bool,
+}
+
+impl DerivedWorker {
+    fn new() -> Self {
+        let (request_tx, request_rx) = channel::bounded::<Vec<DerivedJob>>(1);
+        let (result_tx, result_rx) = channel::unbounded::<Vec<DerivedOutcome>>();
+
+        thread::Builder::new()
+            .name("derived-worker".into())
+            .spawn(move || {
+                while let Ok(jobs) = request_rx.recv() {
+                    let outcomes: Vec<DerivedOutcome> =
+                        jobs.into_iter().map(run_derived_job).collect();
+                    if result_tx.send(outcomes).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("failed to spawn derived channel worker");
+
+        Self {
+            request_tx,
+            result_rx,
+            in_flight: false,
+        }
+    }
+
+    fn take_results(&mut self) -> Vec<DerivedOutcome> {
+        let mut outcomes = Vec::new();
+        while let Ok(batch) = self.result_rx.try_recv() {
+            self.in_flight = false;
+            outcomes.extend(batch);
+        }
+        outcomes
+    }
+
+    /// Drops the batch when one is already running. A derived channel is a
+    /// coarse summary, so a skipped tick costs nothing — and the points carry
+    /// their own timestamps, so the trace stays truthful either way.
+    fn submit(&mut self, jobs: Vec<DerivedJob>) {
+        if self.in_flight || jobs.is_empty() {
+            return;
+        }
+        match self.request_tx.try_send(jobs) {
+            Ok(()) => self.in_flight = true,
+            Err(channel::TrySendError::Full(_)) => self.in_flight = true,
+            Err(channel::TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+fn run_derived_job(job: DerivedJob) -> DerivedOutcome {
+    let y = match job.key.derivation {
+        Some(Derivation::NoiseFloor) => {
+            let spectrum = fft_points(&job.points, job.sample_rate, job.detrend);
+            estimate_white_noise_floor(&spectrum)
+        }
+        None => None,
+    };
+    DerivedOutcome {
+        key: job.key,
+        x: job.x,
+        y,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2179,6 +2385,7 @@ struct PlaybackSession {
     active_columns: HashSet<ColumnKeyDto>,
     view: ViewConfig,
     plot_panes: Vec<PlotPaneConfig>,
+    derived_channels: Vec<DerivedChannelDto>,
     range: Option<(f64, f64)>,
     recording_start: Option<f64>,
     time_reference_start: Option<f64>,
@@ -2200,6 +2407,7 @@ impl PlaybackSession {
             column_states,
             active_columns: HashSet::new(),
             plot_panes: default_plot_panes(&view),
+            derived_channels: Vec::new(),
             view,
             range,
             recording_start,
@@ -2228,6 +2436,17 @@ impl PlaybackSession {
         self.plot_panes = panes;
         self.active_columns = active_columns_for_panes(&self.plot_panes);
         self.position = self.clamp_position(self.position);
+    }
+
+    /// A log holds raw samples only, so derived channels are recomputed from
+    /// it. Deriving the whole range up front means every later operation —
+    /// scrubbing, export, plotting — sees a derived column that behaves
+    /// exactly like a recorded one.
+    fn set_derived_channels(&mut self, channels: Vec<DerivedChannelDto>) {
+        self.column_states.retain(|key, _| !key.is_derived());
+        rebuild_derived_columns_for_range(&channels, &mut self.column_states, self.range);
+        self.derived_channels = channels;
+        self.active_columns = active_columns_for_panes(&self.plot_panes);
     }
 
     fn clamp_position(&self, position: f64) -> f64 {
@@ -2440,6 +2659,15 @@ fn main() {
                     playback.set_plot_panes(panes);
                     emit_active_columns(&emitter, &playback.active_columns);
                     playback.emit_state(&emitter);
+                    playback.emit_plot(&emitter);
+                    playback.emit_stream_values(&emitter);
+                }
+            }
+            ClientCommand::SetDerivedChannels { channels } => {
+                if let Some(tx) = &session_tx {
+                    let _ = tx.send(SessionCommand::SetDerivedChannels(channels));
+                } else if let Some(playback) = playback.as_mut() {
+                    playback.set_derived_channels(channels);
                     playback.emit_plot(&emitter);
                     playback.emit_stream_values(&emitter);
                 }
@@ -3289,6 +3517,8 @@ fn run_session(
     let mut view = ViewConfig::default();
     let mut plot_panes = default_plot_panes(&view);
     let mut fft_workers: HashMap<usize, FftWorker> = HashMap::new();
+    let mut derived_channels: Vec<DerivedChannelDto> = Vec::new();
+    let mut derived_worker = DerivedWorker::new();
     let mut logger = PacketLogger::new(log_path, &emitter);
     logger.write_startup_metadata(&discovery.devices, &emitter);
     let mut plot_profiler = PlotCadenceProfiler::new();
@@ -3387,6 +3617,30 @@ fn run_session(
                     hydrate_fpcs(&mut column_states, &plot_panes, &emitter);
                     emit_active_columns(&emitter, &active_columns);
                 }
+                SessionCommand::SetDerivedChannels(channels) => {
+                    // Retuning a channel invalidates the history accumulated
+                    // under the old parameters: points from a 10 s window and
+                    // a 60 s window are not the same measurement and must not
+                    // share a trace.
+                    for channel in &channels {
+                        let changed = derived_channels
+                            .iter()
+                            .find(|existing| existing.key == channel.key)
+                            .is_none_or(|existing| existing != channel);
+                        if changed {
+                            column_states.remove(&channel.key);
+                        }
+                    }
+                    let retained: HashSet<_> =
+                        channels.iter().map(|channel| channel.key.clone()).collect();
+                    column_states
+                        .retain(|key, _| !key.is_derived() || retained.contains(key));
+                    derived_channels = channels;
+                    emitter.debug(format!(
+                        "derived channels updated: {} active",
+                        derived_channels.len()
+                    ));
+                }
                 SessionCommand::CallRpc {
                     request_id,
                     route,
@@ -3477,7 +3731,7 @@ fn run_session(
                         &mut column_states,
                         &active_columns,
                         &plot_panes,
-                        live_retention_seconds_for_panes(&plot_panes, &view),
+                        live_retention_seconds_for_panes(&plot_panes, &view, &derived_channels),
                         Some(&mut ingest_profiler),
                     );
                 }
@@ -3584,6 +3838,15 @@ fn run_session(
             emit_metadata_devices(&emitter, &discovery.devices);
         }
         loop_profile.event_elapsed = event_start.elapsed();
+
+        if !derived_channels.is_empty() {
+            update_derived_channels(
+                &derived_channels,
+                &mut column_states,
+                &mut derived_worker,
+                live_retention_seconds_for_panes(&plot_panes, &view, &derived_channels),
+            );
+        }
 
         if last_plot_emit.elapsed() >= Duration::from_millis(33) {
             let emit_start = Instant::now();
@@ -4615,11 +4878,7 @@ fn metadata_to_stream_dtos(
             .columns
             .iter()
             .map(|column| ColumnDto {
-                key: ColumnKeyDto {
-                    route: route.to_string(),
-                    stream_id: stream.stream.stream_id,
-                    column_index: column.index,
-                },
+                key: ColumnKeyDto::raw(route.to_string(), stream.stream.stream_id, column.index),
                 name: column.name.clone(),
                 units: column.units.clone(),
                 data_type: format!("{:?}", column.data_type),
@@ -5301,11 +5560,11 @@ fn process_sample(
         let Some(value) = column.value.try_as_f64() else {
             continue;
         };
-        let key = ColumnKeyDto {
-            route: route_string.clone(),
-            stream_id: sample.stream.stream_id,
-            column_index: column.desc.index,
-        };
+        let key = ColumnKeyDto::raw(
+            route_string.clone(),
+            sample.stream.stream_id,
+            column.desc.index,
+        );
 
         let point = Point {
             x: sample.timestamp_end(),
@@ -5368,6 +5627,209 @@ fn process_sample(
             column_states.len(),
             active_columns.len(),
         );
+    }
+}
+
+/// Seconds of source data behind each derived estimate.
+const DERIVED_WINDOW_RANGE: RangeInclusive<f64> = 1.0..=1000.0;
+/// Seconds between emitted derived points.
+const DERIVED_CADENCE_RANGE: RangeInclusive<f64> = 0.1..=60.0;
+
+fn derived_window_seconds(channel: &DerivedChannelDto) -> f64 {
+    if channel.window_seconds.is_finite() {
+        channel
+            .window_seconds
+            .clamp(*DERIVED_WINDOW_RANGE.start(), *DERIVED_WINDOW_RANGE.end())
+    } else {
+        *DERIVED_WINDOW_RANGE.start()
+    }
+}
+
+fn derived_cadence_seconds(channel: &DerivedChannelDto) -> f64 {
+    if channel.cadence_seconds.is_finite() {
+        channel
+            .cadence_seconds
+            .clamp(*DERIVED_CADENCE_RANGE.start(), *DERIVED_CADENCE_RANGE.end())
+    } else {
+        *DERIVED_CADENCE_RANGE.start()
+    }
+}
+
+fn derived_label(source_label: &str, channel: &DerivedChannelDto) -> String {
+    match channel.kind() {
+        Some(Derivation::NoiseFloor) => format!("{source_label} noise floor"),
+        None => source_label.to_string(),
+    }
+}
+
+/// Advance every derived channel by at most one point per call.
+///
+/// Points are stamped with the *end* of the window they summarise, on the
+/// source's own timestamps — never wall clock. That keeps a derived trace on
+/// the same time axis as its source, so it lines up in a shared pane and
+/// replays from a log exactly as it ran live.
+fn update_derived_channels(
+    channels: &[DerivedChannelDto],
+    column_states: &mut HashMap<ColumnKeyDto, ColumnState>,
+    worker: &mut DerivedWorker,
+    max_window_seconds: f64,
+) {
+    // Land finished work first so the cadence test below sees current
+    // timestamps and does not re-request a point already in flight.
+    for outcome in worker.take_results() {
+        let Some(y) = outcome.y else {
+            continue;
+        };
+        if let Some(state) = column_states.get_mut(&outcome.key) {
+            state.push_raw_profiled(Point { x: outcome.x, y }, max_window_seconds, false);
+        }
+    }
+
+    // Read every source before touching the map: the borrow checker aside,
+    // gathering first keeps a channel from observing a state another channel
+    // in the same pass just created.
+    struct PendingDerivation {
+        key: ColumnKeyDto,
+        label: String,
+        units: String,
+        cadence: f64,
+        detrend: DetrendMethod,
+        sample_rate: f64,
+        latest_x: f64,
+        points: Vec<Point>,
+        has_full_window: bool,
+    }
+
+    let mut pending = Vec::new();
+    for channel in channels {
+        if channel.kind().is_none() {
+            continue;
+        }
+        let source_key = channel.source();
+        let Some((_, source)) = resolve_column_state(column_states, &source_key) else {
+            continue;
+        };
+        let Some(latest) = source.raw.back().copied() else {
+            continue;
+        };
+        if !latest.x.is_finite() || source.sample_rate <= 0.0 {
+            continue;
+        }
+
+        let window = derived_window_seconds(channel);
+        let points = source.fft_window_points(window, None);
+
+        // Hold the first point until a full window is available, otherwise
+        // the opening estimates carry a different frequency resolution than
+        // everything after them. At the raw-buffer cap a full window is
+        // unreachable, so the cap itself becomes the bar.
+        let wanted = source
+            .fft_window_sample_count(window)
+            .min(MAX_RAW_POINTS_PER_STREAM);
+        let has_full_window = points.len() >= wanted;
+
+        pending.push(PendingDerivation {
+            key: channel.key.clone(),
+            label: derived_label(&source.label, channel),
+            units: channel.units(&source.units),
+            cadence: derived_cadence_seconds(channel),
+            detrend: channel.detrend,
+            sample_rate: source.sample_rate,
+            latest_x: latest.x,
+            points,
+            has_full_window,
+        });
+    }
+
+    let mut jobs = Vec::new();
+    for item in pending {
+        let rate = 1.0 / item.cadence;
+        let state = column_states
+            .entry(item.key.clone())
+            .or_insert_with(|| ColumnState::new(item.label.clone(), item.units.clone(), rate));
+        // The spec can be retuned while the channel is live; keep the
+        // presentation fields in step with it.
+        state.label = item.label;
+        state.units = item.units;
+        state.sample_rate = rate;
+
+        let due = state
+            .raw
+            .back()
+            .map(|point| item.latest_x - point.x >= item.cadence)
+            .unwrap_or(true);
+        if !due || !item.has_full_window {
+            continue;
+        }
+
+        jobs.push(DerivedJob {
+            key: item.key,
+            x: item.latest_x,
+            sample_rate: item.sample_rate,
+            detrend: item.detrend,
+            points: item.points,
+        });
+    }
+
+    worker.submit(jobs);
+}
+
+/// Derive every channel across an already-loaded time range in one pass.
+///
+/// Used for log playback, where there is no live tick to advance the channel.
+/// Runs on the calling thread: it is a one-time cost when a log opens or the
+/// derived set changes, not a per-frame one.
+fn rebuild_derived_columns_for_range(
+    channels: &[DerivedChannelDto],
+    column_states: &mut HashMap<ColumnKeyDto, ColumnState>,
+    range: Option<(f64, f64)>,
+) {
+    let Some((start, end)) = range else {
+        return;
+    };
+
+    for channel in channels {
+        if channel.kind().is_none() {
+            continue;
+        }
+        let source_key = channel.source();
+        let Some((_, source)) = resolve_column_state(column_states, &source_key) else {
+            continue;
+        };
+        if source.sample_rate <= 0.0 {
+            continue;
+        }
+
+        let window = derived_window_seconds(channel);
+        let cadence = derived_cadence_seconds(channel);
+        let label = derived_label(&source.label, channel);
+        let units = channel.units(&source.units);
+        let sample_rate = source.sample_rate;
+        let detrend = channel.detrend;
+
+        // The first estimate needs a full window behind it, same rule as live.
+        let mut derived = Vec::new();
+        let mut x = start + window;
+        while x <= end {
+            let points = source.fft_window_points(window, Some(x));
+            if points.len() >= source.fft_window_sample_count(window) {
+                let spectrum = fft_points(&points, sample_rate, detrend);
+                if let Some(y) = estimate_white_noise_floor(&spectrum) {
+                    derived.push(Point { x, y });
+                }
+            }
+            x += cadence;
+        }
+
+        if derived.is_empty() {
+            continue;
+        }
+
+        let mut state = ColumnState::new(label, units, 1.0 / cadence);
+        for point in derived {
+            state.push_raw_profiled(point, f64::INFINITY, false);
+        }
+        column_states.insert(channel.key.clone(), state);
     }
 }
 
@@ -5521,11 +5983,24 @@ fn live_retention_seconds(view: &ViewConfig) -> f64 {
     (window * 1.5).max(window + 5.0).clamp(10.0, MAX_RETENTION_SECONDS)
 }
 
-fn live_retention_seconds_for_panes(plot_panes: &[PlotPaneConfig], fallback: &ViewConfig) -> f64 {
-    plot_panes
+/// Retention has to cover the longest derived window as well as the widest
+/// pane: a 60 s noise-floor window over a 10 s pane would otherwise never see
+/// a full window of source data and would never produce a point.
+fn live_retention_seconds_for_panes(
+    plot_panes: &[PlotPaneConfig],
+    fallback: &ViewConfig,
+    derived_channels: &[DerivedChannelDto],
+) -> f64 {
+    let pane_seconds = plot_panes
         .iter()
         .map(|pane| live_retention_seconds(&pane.view))
-        .fold(live_retention_seconds(fallback), f64::max)
+        .fold(live_retention_seconds(fallback), f64::max);
+
+    derived_channels
+        .iter()
+        .map(|channel| derived_window_seconds(channel) * 1.5)
+        .fold(pane_seconds, f64::max)
+        .clamp(10.0, MAX_RETENTION_SECONDS)
 }
 
 fn retained_point_count(column_states: &HashMap<ColumnKeyDto, ColumnState>) -> usize {
@@ -5625,6 +6100,10 @@ fn resolve_column_state<'a>(
     let mut candidates = column_states.iter().filter(|(candidate_key, state)| {
         candidate_key.stream_id == key.stream_id
             && candidate_key.column_index == key.column_index
+            // A derived key shares its source's stream id and column index, so
+            // without this the unify fallback would happily serve the source's
+            // samples under the derived key.
+            && candidate_key.derivation == key.derivation
             && !state.raw.is_empty()
     });
     let first = candidates.next();
@@ -5791,12 +6270,26 @@ fn build_live_timeseries_series<'a>(
     view: &ViewConfig,
     shared_view_end: Option<f64>,
 ) -> (Option<f64>, Vec<BinaryPlotSeries<'a>>, usize) {
+    // A derived column arrives at its own cadence — one point per second for a
+    // noise floor — so anchoring the window to it would advance the right edge
+    // in visible steps. Prefer a raw column; failing that, borrow the latest
+    // timestamp from a derived column's source, which is on the same axis.
+    let latest_x_of = |key: &ColumnKeyDto| {
+        resolve_column_state(column_states, key)
+            .and_then(|(_, state)| state.raw.back())
+            .map(|point| point.x)
+            .filter(|x| x.is_finite())
+    };
     let view_end = pane_columns
         .iter()
-        .filter_map(|key| resolve_column_state(column_states, key).map(|(_, state)| state))
-        .filter_map(|state| state.raw.back())
-        .map(|point| point.x)
-        .find(|x| x.is_finite())
+        .filter(|key| !key.is_derived())
+        .find_map(&latest_x_of)
+        .or_else(|| {
+            pane_columns
+                .iter()
+                .filter(|key| key.is_derived())
+                .find_map(|key| latest_x_of(&key.source()))
+        })
         .or(shared_view_end);
 
     let window_start = view_end
@@ -5809,9 +6302,33 @@ fn build_live_timeseries_series<'a>(
 
     for key in pane_columns {
         let Some((data_key, state)) = resolve_column_state(column_states, key) else {
+            // A derived channel is addressable as soon as the user creates it,
+            // before the engine has built any state for it. Report it rather
+            // than dropping it, so the legend can show it warming up instead
+            // of the trace simply not being there.
+            if key.is_derived() {
+                series.push(BinaryPlotSeries {
+                    key,
+                    sample_rate: 0.0,
+                    points: PlotPointSource::Slice(&[]),
+                    outside_window: false,
+                    warming_up: true,
+                    noise_floor: None,
+                });
+            }
             continue;
         };
         if state.raw.is_empty() {
+            if key.is_derived() {
+                series.push(BinaryPlotSeries {
+                    key: data_key,
+                    sample_rate: state.sample_rate,
+                    points: PlotPointSource::Slice(&[]),
+                    outside_window: false,
+                    warming_up: true,
+                    noise_floor: None,
+                });
+            }
             continue;
         }
         let points = match view.decimation_method {
@@ -5842,6 +6359,8 @@ fn build_live_timeseries_series<'a>(
                 sample_rate: state.sample_rate,
                 points: PlotPointSource::Slice(&[]),
                 outside_window: true,
+                warming_up: false,
+                noise_floor: None,
             });
             continue;
         }
@@ -5852,6 +6371,8 @@ fn build_live_timeseries_series<'a>(
             sample_rate: state.sample_rate,
             points,
             outside_window: false,
+            warming_up: false,
+            noise_floor: None,
         });
     }
 
@@ -5949,13 +6470,13 @@ fn emit_plot_at(
         };
         let label_state = column_states.get(&key).unwrap_or(state);
         let window_seconds = view.window_seconds.max(1e-6);
-        let points = match view.mode {
+        let (points, noise_floor) = match view.mode {
             PlotMode::Timeseries => {
                 let window_points = view_end.map(|end| {
                     let start = end - window_seconds;
                     state.points_between(start, end)
                 });
-                match view.decimation_method {
+                let points = match view.decimation_method {
                     DecimationMethod::Fpcs if is_live_latest_view => {
                         let start = state
                             .raw
@@ -5989,11 +6510,14 @@ fn emit_plot_at(
                     DecimationMethod::None => window_points
                         .clone()
                         .unwrap_or_else(|| state.recent_points(view.window_seconds)),
-                }
+                };
+                (points, None)
             }
             PlotMode::Fft => {
                 let points = state.fft_window_points(window_seconds, view_end);
-                fft_points(&points, state.sample_rate, view.detrend)
+                let points = fft_points(&points, state.sample_rate, view.detrend);
+                let noise_floor = estimate_white_noise_floor(&points);
+                (points, noise_floor)
             }
         };
 
@@ -6007,6 +6531,7 @@ fn emit_plot_at(
             units: label_state.units.clone(),
             sample_rate: state.sample_rate,
             points,
+            noise_floor,
         });
     }
 
@@ -6067,6 +6592,8 @@ fn emit_plot_series_frame(
             sample_rate: item.sample_rate,
             points: PlotPointSource::Slice(&item.points),
             outside_window: false,
+            warming_up: false,
+            noise_floor: item.noise_floor,
         })
         .collect();
     if let Err(err) = emitter.emit_plot_frame(pane_id, mode, viewport_end, &binary_series) {
@@ -6284,6 +6811,7 @@ fn calculate_fft_request(request: FftRequest) -> FftResult {
         .into_iter()
         .filter_map(|input| {
             let points = fft_points(&input.points, input.sample_rate, request.detrend);
+            let noise_floor = estimate_white_noise_floor(&points);
             let points = decimate_min_max_by_x(&points, request.target_points);
             if points.is_empty() {
                 return None;
@@ -6294,6 +6822,7 @@ fn calculate_fft_request(request: FftRequest) -> FftResult {
                 units: input.units,
                 sample_rate: input.sample_rate,
                 points,
+                noise_floor,
             })
         })
         .collect();
@@ -6355,14 +6884,164 @@ fn fft_points(points: &[Point], sample_rate: f64, detrend: DetrendMethod) -> Vec
 
     let welch: SpectralDensity<f64> = SpectralDensity::builder(&y, sample_rate).build();
     let psd = welch.periodogram();
-    let frequencies = psd.frequency().to_vec();
-    let asd: Vec<f64> = psd.to_vec().iter().map(|power| power.sqrt()).collect();
+    let frequencies = bin_frequencies(psd.len(), welch.dft_size, sample_rate);
+    let asd: Vec<f64> = one_sided_amplitude_density(&psd);
 
     frequencies
         .into_iter()
         .zip(asd)
         .map(|(x, y)| Point { x, y })
         .collect()
+}
+
+
+
+/// Centre frequencies of the bins `welch-sde` returns.
+///
+/// Its own `frequency()` spreads the `n` bins evenly over `0..=fs/2` as
+/// `i * fs / (2 * (n - 1))`, which puts the last bin exactly at Nyquist. But
+/// those bins are the first `n = dft_size / 2` DFT bins, spaced `fs / dft_size`
+/// apart, so the last one sits one spacing *below* Nyquist. The crate's mapping
+/// therefore stretches the whole axis by `n / (n - 1)` — about 0.05% for a
+/// 4096-point transform, and proportionally worse for the short transforms a
+/// brief window produces.
+fn bin_frequencies(bin_count: usize, dft_size: usize, sample_rate: f64) -> Vec<f64> {
+    if dft_size == 0 {
+        return Vec::new();
+    }
+    let spacing = sample_rate / dft_size as f64;
+    (0..bin_count).map(|index| index as f64 * spacing).collect()
+}
+
+/// Convert `welch-sde`'s spectral density to a one-sided amplitude density.
+///
+/// The crate windows a real signal into the real part of a complex buffer and
+/// transforms it, so the resulting spectrum is Hermitian: `X[N-k]` is the
+/// conjugate of `X[k]` and the two have identical magnitude. The negative
+/// frequencies are a mirror of the positive ones, not independent data — the
+/// in-phase and quadrature parts of each bin are already combined by
+/// `norm_sqr()`. The crate keeps the first `dft_size / 2` bins and scales them
+/// by `1 / (sum(w^2) * n_segment * fs)`, omitting the factor of two that folds
+/// the mirror back on. What it returns is therefore a *two-sided* density:
+/// integrating it over the frequencies it reports comes to half the signal
+/// variance.
+///
+/// A figure quoted in `units/sqrt(Hz)` is conventionally one-sided, so every
+/// bin that has a mirror partner carries twice the power. Only DC is exempt:
+/// the Nyquist bin would be too, but `dft_size / 2` bins spans indices
+/// `0..dft_size/2 - 1`, so Nyquist (index `dft_size / 2`) is never among them
+/// and the last kept bin is an ordinary mirrored one.
+fn one_sided_amplitude_density(psd: &[f64]) -> Vec<f64> {
+    psd.iter()
+        .enumerate()
+        .map(|(index, power)| {
+            if index == 0 {
+                power.sqrt()
+            } else {
+                (2.0 * power).sqrt()
+            }
+        })
+        .collect()
+}
+
+/// Estimate the flat, broadband ASD level while rejecting low-frequency 1/f
+/// content and narrow spectral peaks.
+///
+/// Equal-sized frequency bands make the band medians insensitive to narrow
+/// peaks. The quiet quartile of all but the lowest bands identifies the white
+/// plateau without assuming a fixed corner frequency. Only bands close to
+/// that plateau contribute samples, and a final one-sided MAD clip removes
+/// any peaks that survived their band's median.
+fn estimate_white_noise_floor(points: &[Point]) -> Option<f64> {
+    let log_values: Vec<f64> = points
+        .iter()
+        .filter(|point| point.x.is_finite() && point.x > 0.0 && point.y.is_finite() && point.y > 0.0)
+        .map(|point| point.y.ln())
+        .collect();
+    if log_values.len() < 16 {
+        return None;
+    }
+
+    let band_count = (log_values.len() / 16).clamp(8, 32).min(log_values.len());
+    let band_size = log_values.len().div_ceil(band_count);
+    let bands: Vec<&[f64]> = log_values.chunks(band_size).collect();
+    if bands.len() < 4 {
+        return None;
+    }
+
+    // Never seed the plateau from the lowest 1/8 of the frequency bands.
+    let low_band_count = (bands.len() / 8).max(1);
+    let mut usable_band_medians: Vec<f64> = bands[low_band_count..]
+        .iter()
+        .filter_map(|band| median(band))
+        .collect();
+    if usable_band_medians.len() < 3 {
+        return None;
+    }
+    usable_band_medians.sort_by(f64::total_cmp);
+
+    // A lower-quartile seed is resistant to both 1/f bands and broad peaks,
+    // while remaining representative of a noisy white plateau.
+    let plateau_seed = quantile_sorted(&usable_band_medians, 0.25)?;
+    let lower_half_end = usable_band_medians.len().div_ceil(2);
+    let lower_half = &usable_band_medians[..lower_half_end];
+    let band_mad = median_absolute_deviation(lower_half, plateau_seed).unwrap_or(0.0);
+    let plateau_tolerance = (3.0 * 1.4826 * band_mad).clamp((1.5_f64).ln(), (2.0_f64).ln());
+
+    let mut candidates = Vec::new();
+    for band in &bands[low_band_count..] {
+        let Some(band_median) = median(band) else {
+            continue;
+        };
+        if band_median <= plateau_seed + plateau_tolerance {
+            candidates.extend_from_slice(band);
+        }
+    }
+    if candidates.len() < 8 {
+        return None;
+    }
+
+    // Iterative, upper-only clipping preserves the center of the broadband
+    // distribution while removing spectral lines at any amplitude.
+    for _ in 0..4 {
+        let Some(center) = median(&candidates) else {
+            return None;
+        };
+        let mad = median_absolute_deviation(&candidates, center).unwrap_or(0.0);
+        let upper_limit = center + (3.5 * 1.4826 * mad).max((1.5_f64).ln());
+        let previous_len = candidates.len();
+        candidates.retain(|value| *value <= upper_limit);
+        if candidates.len() == previous_len || candidates.len() < 8 {
+            break;
+        }
+    }
+
+    median(&candidates).map(f64::exp).filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn median(values: &[f64]) -> Option<f64> {
+    let mut sorted: Vec<f64> = values.iter().copied().filter(|value| value.is_finite()).collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(f64::total_cmp);
+    quantile_sorted(&sorted, 0.5)
+}
+
+fn median_absolute_deviation(values: &[f64], center: f64) -> Option<f64> {
+    let deviations: Vec<f64> = values.iter().map(|value| (value - center).abs()).collect();
+    median(&deviations)
+}
+
+fn quantile_sorted(sorted: &[f64], quantile: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let position = quantile.clamp(0.0, 1.0) * (sorted.len() - 1) as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    let fraction = position - lower as f64;
+    Some(sorted[lower] + (sorted[upper] - sorted[lower]) * fraction)
 }
 
 fn detrended_values(y: &[f64], detrend: DetrendMethod) -> Vec<f64> {
@@ -7022,16 +7701,8 @@ mod tests {
 
     #[test]
     fn flags_series_outside_the_anchored_time_window() {
-        let key_a = ColumnKeyDto {
-            route: "/0".to_string(),
-            stream_id: 1,
-            column_index: 0,
-        };
-        let key_b = ColumnKeyDto {
-            route: "/1".to_string(),
-            stream_id: 1,
-            column_index: 0,
-        };
+        let key_a = ColumnKeyDto::raw("/0".to_string(), 1, 0);
+        let key_b = ColumnKeyDto::raw("/1".to_string(), 1, 0);
 
         // Stream A's clock is near x=1000; stream B's is near x=20: their
         // time references are not compatible within the 10 s default window.
@@ -7077,17 +7748,447 @@ mod tests {
     }
 
     #[test]
+    fn noise_floor_estimate_tracks_the_spectrum_it_is_taken_from() {
+        // Deterministic white noise of a known level, with a strong tone on
+        // top so peak rejection is exercised.
+        let sample_rate: f64 = 1000.0;
+        let target_asd = 0.02_f64;
+        let sigma = target_asd * (sample_rate / 2.0).sqrt();
+        let mut gauss = gaussian_noise(0x2545F4914F6CDD1D);
+
+        let points: Vec<Point> = (0..20_000)
+            .map(|index| {
+                let t = index as f64 / sample_rate;
+                Point {
+                    x: t,
+                    y: (std::f64::consts::TAU * 60.0 * t).sin() + sigma * gauss(),
+                }
+            })
+            .collect();
+
+        let spectrum = fft_points(&points, sample_rate, DetrendMethod::Quadratic);
+        let estimate = estimate_white_noise_floor(&spectrum).expect("estimate");
+
+        // The estimator's job is to recover the broadband level of the
+        // spectrum it was handed, rejecting the tone. Measured against that
+        // spectrum's own bins it is accurate to well under a percent.
+        let mut broadband: Vec<f64> = spectrum
+            .iter()
+            .filter(|point| point.x > 100.0 && point.x < 400.0 && point.y.is_finite())
+            .map(|point| point.y)
+            .collect();
+        broadband.sort_by(f64::total_cmp);
+        let median_bin = broadband[broadband.len() / 2];
+        let accuracy = estimate / median_bin;
+        assert!(
+            (0.97..1.03).contains(&accuracy),
+            "estimator drifted from its own spectrum: {accuracy}"
+        );
+
+        // And against the injected level it is accurate to a couple of
+        // percent. The small remaining shortfall is inherent to a median-based
+        // estimator over chi-squared distributed bins, not a scale error.
+        let against_truth = estimate / target_asd;
+        assert!(
+            (0.95..1.05).contains(&against_truth),
+            "noise floor no longer matches the injected level: {against_truth}"
+        );
+    }
+
+    #[test]
+    fn spectrum_places_a_tone_at_its_true_frequency() {
+        // A tone near the top of the band is where a stretched frequency axis
+        // shows up worst, since the error grows with frequency. The tolerance
+        // here is half a bin, well under the ~0.05% full-scale stretch the
+        // crate's own `frequency()` introduces.
+        let sample_rate: f64 = 1000.0;
+        let tone_hz = 400.0;
+        let points: Vec<Point> = (0..16_384)
+            .map(|index| {
+                let t = index as f64 / sample_rate;
+                Point {
+                    x: t,
+                    y: (std::f64::consts::TAU * tone_hz * t).sin(),
+                }
+            })
+            .collect();
+
+        let spectrum = fft_points(&points, sample_rate, DetrendMethod::Mean);
+        let peak = spectrum
+            .iter()
+            .max_by(|a, b| a.y.total_cmp(&b.y))
+            .expect("peak");
+        let spacing = spectrum[1].x - spectrum[0].x;
+        // Coarse by construction: the peak snaps to a bin, so this catches a
+        // grossly wrong axis but not a fractional stretch. The axis geometry
+        // itself is checked exactly in `spectrum_axis_is_spaced_by_fs_over_dft_size`.
+        assert!(
+            (peak.x - tone_hz).abs() <= spacing * 0.5,
+            "tone landed at {} Hz, expected {tone_hz} Hz (bin spacing {spacing})",
+            peak.x
+        );
+    }
+
+    #[test]
+    fn spectrum_axis_is_spaced_by_fs_over_dft_size() {
+        // The discriminating axis test: bins are spaced `fs / dft_size`, and
+        // the last sits one spacing below Nyquist. `welch-sde`'s own
+        // `frequency()` instead spreads them to land exactly on Nyquist, which
+        // stretches every frequency by `n / (n - 1)`. The tolerances here are
+        // far tighter than that stretch, so the old mapping fails both.
+        let sample_rate: f64 = 1000.0;
+        let points: Vec<Point> = (0..16_384)
+            .map(|index| {
+                let t = index as f64 / sample_rate;
+                Point {
+                    x: t,
+                    y: (std::f64::consts::TAU * 400.0 * t).sin(),
+                }
+            })
+            .collect();
+
+        let spectrum = fft_points(&points, sample_rate, DetrendMethod::None);
+        // `fft_points` keeps every bin, and the crate returns dft_size / 2 of
+        // them, so the transform length follows from the output length.
+        let dft_size = 2 * spectrum.len();
+        let expected_spacing = sample_rate / dft_size as f64;
+
+        let spacing = spectrum[1].x - spectrum[0].x;
+        assert!(
+            (spacing - expected_spacing).abs() < 1e-9,
+            "bin spacing {spacing}, expected {expected_spacing}"
+        );
+        assert_eq!(spectrum[0].x, 0.0, "first bin is DC");
+
+        let last = spectrum[spectrum.len() - 1].x;
+        let expected_last = sample_rate / 2.0 - expected_spacing;
+        assert!(
+            (last - expected_last).abs() < 1e-9,
+            "last bin {last}, expected {expected_last} (one spacing below Nyquist)"
+        );
+    }
+
+    #[test]
+    fn bin_frequencies_span_dc_to_just_below_nyquist() {
+        // n bins spaced fs/dft_size apart, starting at DC. The last is one
+        // spacing short of Nyquist — it is not Nyquist, and pretending it is
+        // stretches every frequency below it.
+        let sample_rate: f64 = 1000.0;
+        let dft_size = 4096;
+        let bins = bin_frequencies(dft_size / 2, dft_size, sample_rate);
+
+        assert_eq!(bins.len(), dft_size / 2);
+        assert_eq!(bins[0], 0.0);
+        let spacing = sample_rate / dft_size as f64;
+        assert!((bins[1] - spacing).abs() < 1e-12);
+        let last = bins[bins.len() - 1];
+        assert!(
+            (last - (sample_rate / 2.0 - spacing)).abs() < 1e-9,
+            "last bin {last} should sit one spacing below Nyquist"
+        );
+    }
+
+    #[test]
+    fn every_bin_but_dc_is_folded_and_nyquist_is_never_kept() {
+        // Only DC is exempt from the mirror fold. It is tempting to exempt the
+        // last bin too, since Nyquist has no mirror partner either — but
+        // `welch-sde` keeps `dft_size / 2` bins, which spans indices
+        // 0..dft_size/2 - 1, and Nyquist lives at index dft_size/2. The last
+        // kept bin is an ordinary mirrored bin and must be doubled like the
+        // rest; exempting it reads that bin a factor of sqrt(2) low.
+        let folded = one_sided_amplitude_density(&[4.0, 4.0, 4.0, 4.0]);
+        assert_eq!(folded[0], 2.0, "DC must not be doubled");
+        for (index, value) in folded.iter().enumerate().skip(1) {
+            assert!(
+                (value - 8.0_f64.sqrt()).abs() < 1e-12,
+                "bin {index} was not folded: {value}"
+            );
+        }
+
+        // Confirm the premise against the crate itself: the bins it hands back
+        // stop one short of Nyquist.
+        let sample_rate: f64 = 1000.0;
+        let mut gauss = gaussian_noise(0x1234_5678_9ABC_DEF0);
+        let signal: Vec<f64> = (0..16_384).map(|_| gauss()).collect();
+        let welch: SpectralDensity<f64> = SpectralDensity::builder(&signal, sample_rate).build();
+        let psd = welch.periodogram();
+        assert_eq!(psd.len(), welch.dft_size / 2);
+        let last_bin_hz = (psd.len() - 1) as f64 * sample_rate / welch.dft_size as f64;
+        assert!(
+            last_bin_hz < sample_rate / 2.0,
+            "last kept bin {last_bin_hz} Hz should sit below Nyquist"
+        );
+    }
+
+    #[test]
+    fn fft_points_returns_a_one_sided_spectral_density() {
+        // For white noise the integral of a one-sided PSD over frequency
+        // equals the signal's variance. The underlying Welch implementation
+        // returns the two-sided form, so `fft_points` folds it; without that
+        // every displayed ASD — the FFT plot's axis, the legend's floor
+        // readout, and the derived noise-floor channel alike — would sit a
+        // factor of sqrt(2) below the value a `units/sqrt(Hz)` figure denotes.
+        let sample_rate: f64 = 1000.0;
+        let mut gauss = gaussian_noise(0x9E3779B97F4A7C15);
+        let points: Vec<Point> = (0..20_000)
+            .map(|index| Point {
+                x: index as f64 / sample_rate,
+                y: 0.5 * gauss(),
+            })
+            .collect();
+
+        let mean = points.iter().map(|point| point.y).sum::<f64>() / points.len() as f64;
+        let variance = points
+            .iter()
+            .map(|point| (point.y - mean).powi(2))
+            .sum::<f64>()
+            / points.len() as f64;
+
+        let spectrum = fft_points(&points, sample_rate, DetrendMethod::None);
+        let df = spectrum[1].x - spectrum[0].x;
+        let integrated: f64 = spectrum.iter().map(|point| point.y * point.y * df).sum();
+
+        let ratio = integrated / variance;
+        assert!(
+            (0.97..1.03).contains(&ratio),
+            "spectral density convention changed: integral/variance = {ratio}"
+        );
+    }
+
+    /// Box-Muller over a xorshift stream: repeatable normal noise for tests
+    /// without pulling in an RNG dependency.
+    fn gaussian_noise(seed: u64) -> impl FnMut() -> f64 {
+        let mut state = seed;
+        move || {
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 11) as f64 / (1u64 << 53) as f64
+            };
+            let u1: f64 = next().max(1e-12);
+            let u2: f64 = next();
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        }
+    }
+
+    #[test]
+    fn parses_the_json_commands_the_app_encodes() {
+        // Captured verbatim from Swift's JSONEncoder. These strings are the
+        // contract between the two sides; if a field is renamed on either
+        // side, this test is what notices.
+        let json = r#"{"panes":[{"columns":[{"columnIndex":2,"route":"/0","streamId":1},{"columnIndex":2,"derivation":"noiseFloor","route":"/0","streamId":1}],"id":0,"view":{"decimationMethod":"fpcs","detrend":"quadratic","fftLogX":true,"fftLogY":true,"logY":false,"mode":"timeseries","plotWidthPixels":800,"resolutionMultiplier":100,"windowSeconds":10}}],"type":"setPlotPanes"}"#;
+        let ClientCommand::SetPlotPanes { panes } = serde_json::from_str(json).unwrap() else {
+            panic!("expected SetPlotPanes");
+        };
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].id, 0);
+        assert_eq!(panes[0].view.mode, PlotMode::Timeseries);
+        assert_eq!(panes[0].view.decimation_method, DecimationMethod::Fpcs);
+        assert_eq!(panes[0].view.detrend, DetrendMethod::Quadratic);
+        assert!(!panes[0].view.log_y);
+        assert_eq!(panes[0].columns[0], ColumnKeyDto::raw("/0", 1, 2));
+        assert_eq!(panes[0].columns[1].derivation, Some(Derivation::NoiseFloor));
+        // Same source, different channel.
+        assert_eq!(panes[0].columns[1].source(), panes[0].columns[0]);
+
+        let json = r#"{"channels":[{"cadenceSeconds":1,"detrend":"quadratic","key":{"columnIndex":2,"derivation":"noiseFloor","route":"/0","streamId":1},"windowSeconds":10}],"type":"setDerivedChannels"}"#;
+        let ClientCommand::SetDerivedChannels { channels } = serde_json::from_str(json).unwrap()
+        else {
+            panic!("expected SetDerivedChannels");
+        };
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].kind(), Some(Derivation::NoiseFloor));
+        assert_eq!(channels[0].window_seconds, 10.0);
+        assert_eq!(channels[0].cadence_seconds, 1.0);
+        assert_eq!(channels[0].units("T"), "T/sqrt(Hz)");
+        assert_eq!(channels[0].units(""), "1/sqrt(Hz)");
+
+        let json = r#"{"type":"setView","view":{"decimationMethod":"fpcs","detrend":"quadratic","fftLogX":true,"fftLogY":true,"logY":false,"mode":"timeseries","plotWidthPixels":800,"resolutionMultiplier":100,"windowSeconds":10}}"#;
+        let ClientCommand::SetView { view } = serde_json::from_str(json).unwrap() else {
+            panic!("expected SetView");
+        };
+        assert_eq!(view.window_seconds, 10.0);
+        assert!(!view.log_y);
+    }
+
+    #[test]
+    fn keeps_raw_column_keys_unchanged_on_the_wire() {
+        // Layouts and commands written before derived channels existed carry
+        // no `derivation` field; they must still parse, and a raw key must
+        // still serialise without one.
+        let key: ColumnKeyDto =
+            serde_json::from_str(r#"{"route":"/0","streamId":1,"columnIndex":2}"#).unwrap();
+        assert_eq!(key, ColumnKeyDto::raw("/0", 1, 2));
+        assert!(!key.is_derived());
+        assert_eq!(
+            serde_json::to_string(&key).unwrap(),
+            r#"{"route":"/0","streamId":1,"columnIndex":2}"#
+        );
+    }
+
+    #[test]
+    fn derived_keys_never_resolve_to_their_source_column() {
+        let source = ColumnKeyDto::raw("/0".to_string(), 1, 0);
+        let derived = ColumnKeyDto {
+            derivation: Some(Derivation::NoiseFloor),
+            ..source.clone()
+        };
+
+        let mut state = ColumnState::new("a".to_string(), "T".to_string(), 10.0);
+        state.push_raw(Point { x: 1.0, y: 1.0 }, 1e9);
+        let states = HashMap::from([(source.clone(), state)]);
+
+        // The unify fallback matches on stream id and column index, which a
+        // derived key shares with its source. It must not serve the source's
+        // samples under the derived key.
+        assert!(resolve_column_state(&states, &derived).is_none());
+        assert!(resolve_column_state(&states, &source).is_some());
+    }
+
+    #[test]
+    fn derived_columns_do_not_anchor_the_pane_time_window() {
+        let source = ColumnKeyDto::raw("/0".to_string(), 1, 0);
+        let derived = ColumnKeyDto {
+            derivation: Some(Derivation::NoiseFloor),
+            ..source.clone()
+        };
+
+        // Source runs at 10 Hz out to t=5.0; the derived channel emits once a
+        // second and has only reached t=3.0.
+        let mut source_state = ColumnState::new("a".to_string(), "T".to_string(), 10.0);
+        for index in 0..=50 {
+            source_state.push_raw(
+                Point {
+                    x: index as f64 / 10.0,
+                    y: 1.0,
+                },
+                1e9,
+            );
+        }
+        let mut derived_state =
+            ColumnState::new("a noise floor".to_string(), "T/sqrt(Hz)".to_string(), 1.0);
+        for index in 0..=3 {
+            derived_state.push_raw(
+                Point {
+                    x: index as f64,
+                    y: 1e-12,
+                },
+                1e9,
+            );
+        }
+        let states = HashMap::from([
+            (source.clone(), source_state),
+            (derived.clone(), derived_state),
+        ]);
+        let view = ViewConfig::default();
+
+        // Derived listed first: the window must still track the raw column,
+        // or the right edge would advance in one-second steps.
+        let panes = vec![derived.clone(), source.clone()];
+        let (view_end, _, _) = build_live_timeseries_series(0, &states, &panes, &view, None);
+        assert_eq!(view_end, Some(5.0));
+
+        // Derived alone: fall back to the source's clock, not the derived
+        // channel's own cadence.
+        let panes = vec![derived.clone()];
+        let (view_end, _, _) = build_live_timeseries_series(0, &states, &panes, &view, None);
+        assert_eq!(view_end, Some(5.0));
+    }
+
+    #[test]
+    fn derived_channel_waits_for_a_full_window_then_emits_on_cadence() {
+        let source = ColumnKeyDto::raw("/0".to_string(), 1, 0);
+        let channel = DerivedChannelDto {
+            key: ColumnKeyDto {
+                derivation: Some(Derivation::NoiseFloor),
+                ..source.clone()
+            },
+            window_seconds: 4.0,
+            cadence_seconds: 1.0,
+            detrend: DetrendMethod::Mean,
+        };
+
+        let sample_rate = 64.0;
+        let mut state = ColumnState::new("a".to_string(), "T".to_string(), sample_rate);
+        let mut states = HashMap::from([(source.clone(), state.clone())]);
+        let mut worker = DerivedWorker::new();
+
+        // Half a window in: the channel exists but must not have emitted.
+        for index in 0..(2 * sample_rate as usize) {
+            state.push_raw(
+                Point {
+                    x: index as f64 / sample_rate,
+                    y: ((index * 37) % 101) as f64 - 50.0,
+                },
+                1e9,
+            );
+        }
+        states.insert(source.clone(), state.clone());
+        update_derived_channels(&[channel.clone()], &mut states, &mut worker, 1e9);
+        assert!(states.contains_key(&channel.key), "state is created eagerly");
+        assert!(states[&channel.key].raw.is_empty(), "no estimate yet");
+
+        // Past a full window, a point lands once the worker reports back.
+        for index in (2 * sample_rate as usize)..(6 * sample_rate as usize) {
+            state.push_raw(
+                Point {
+                    x: index as f64 / sample_rate,
+                    y: ((index * 37) % 101) as f64 - 50.0,
+                },
+                1e9,
+            );
+        }
+        states.insert(source.clone(), state.clone());
+        update_derived_channels(&[channel.clone()], &mut states, &mut worker, 1e9);
+        for _ in 0..200 {
+            update_derived_channels(&[channel.clone()], &mut states, &mut worker, 1e9);
+            if !states[&channel.key].raw.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let derived = &states[&channel.key];
+        assert_eq!(derived.raw.len(), 1, "one point per cadence interval");
+        assert_eq!(derived.units, "T/sqrt(Hz)");
+        assert_eq!(derived.sample_rate, 1.0);
+        let point = derived.raw.back().copied().unwrap();
+        // Stamped at the end of the window it summarises, on the source clock.
+        assert!((point.x - state.raw.back().unwrap().x).abs() < 1e-9);
+        assert!(point.y > 0.0 && point.y.is_finite());
+    }
+
+    #[test]
+    fn derived_retention_covers_the_longest_derived_window() {
+        let view = ViewConfig {
+            window_seconds: 10.0,
+            ..ViewConfig::default()
+        };
+        let panes = default_plot_panes(&view);
+        let channel = DerivedChannelDto {
+            key: ColumnKeyDto {
+                derivation: Some(Derivation::NoiseFloor),
+                ..ColumnKeyDto::raw("/0".to_string(), 1, 0)
+            },
+            window_seconds: 200.0,
+            cadence_seconds: 1.0,
+            detrend: DetrendMethod::Mean,
+        };
+
+        // A 10 s pane would retain 15 s, which a 200 s derived window could
+        // never fill.
+        assert_eq!(live_retention_seconds_for_panes(&panes, &view, &[]), 15.0);
+        assert_eq!(
+            live_retention_seconds_for_panes(&panes, &view, &[channel]),
+            300.0
+        );
+    }
+
+    #[test]
     fn plots_series_with_compatible_time_references_together() {
-        let key_a = ColumnKeyDto {
-            route: "/0".to_string(),
-            stream_id: 1,
-            column_index: 0,
-        };
-        let key_b = ColumnKeyDto {
-            route: "/1".to_string(),
-            stream_id: 1,
-            column_index: 0,
-        };
+        let key_a = ColumnKeyDto::raw("/0".to_string(), 1, 0);
+        let key_b = ColumnKeyDto::raw("/1".to_string(), 1, 0);
 
         // Clocks differ by a couple of seconds: both fit the 10 s window.
         let mut state_a = ColumnState::new("a".to_string(), "V".to_string(), 1.0);
@@ -7172,16 +8273,8 @@ mod tests {
 
     #[test]
     fn resolves_active_column_to_unique_live_route_fallback() {
-        let active_key = ColumnKeyDto {
-            route: "/2".to_string(),
-            stream_id: 1,
-            column_index: 0,
-        };
-        let live_key = ColumnKeyDto {
-            route: "/".to_string(),
-            stream_id: 1,
-            column_index: 0,
-        };
+        let active_key = ColumnKeyDto::raw("/2".to_string(), 1, 0);
+        let live_key = ColumnKeyDto::raw("/".to_string(), 1, 0);
         let mut live_state = ColumnState::new("live".to_string(), "V".to_string(), 100.0);
         live_state.push_raw(Point { x: 1.0, y: 2.0 }, 10.0);
 
@@ -7235,11 +8328,7 @@ mod tests {
 
     #[test]
     fn fft_request_uses_displayed_time_window() {
-        let key = ColumnKeyDto {
-            route: "/".to_string(),
-            stream_id: 1,
-            column_index: 0,
-        };
+        let key = ColumnKeyDto::raw("/".to_string(), 1, 0);
         let mut state = ColumnState::new("signal".to_string(), "V".to_string(), 1.0);
         for index in 0..=100 {
             let value = index as f64;
@@ -7351,11 +8440,7 @@ mod tests {
 
     #[test]
     fn hydrate_fpcs_drops_cache_when_pane_leaves_timeseries() {
-        let key = ColumnKeyDto {
-            route: "/".to_string(),
-            stream_id: 1,
-            column_index: 0,
-        };
+        let key = ColumnKeyDto::raw("/".to_string(), 1, 0);
         let mut view = ViewConfig::default();
         view.window_seconds = 10.0;
         view.plot_width_pixels = 200;
@@ -7525,16 +8610,8 @@ mod tests {
 
     #[test]
     fn copied_view_data_is_wide_by_active_channel() {
-        let key_1 = ColumnKeyDto {
-            route: "/".to_string(),
-            stream_id: 1,
-            column_index: 0,
-        };
-        let key_2 = ColumnKeyDto {
-            route: "/".to_string(),
-            stream_id: 1,
-            column_index: 1,
-        };
+        let key_1 = ColumnKeyDto::raw("/".to_string(), 1, 0);
+        let key_2 = ColumnKeyDto::raw("/".to_string(), 1, 1);
 
         let mut ch_1 = ColumnState::new("ch1".to_string(), "V".to_string(), 100.0);
         ch_1.push_raw(Point { x: 0.0, y: 1.0 }, 10.0);
@@ -7574,12 +8651,46 @@ mod tests {
     }
 
     #[test]
+    fn white_noise_floor_rejects_one_over_f_and_spectral_peaks() {
+        let expected_floor = 2.5e-6;
+        let points: Vec<Point> = (1..=1024)
+            .map(|index| {
+                let frequency = index as f64;
+                let broadband_variation = 1.0 + 0.08 * (frequency * 0.37).sin();
+                let one_over_f = if index < 320 {
+                    expected_floor * 18.0 * (320.0 / frequency - 1.0)
+                } else {
+                    0.0
+                };
+                let peak = if index % 47 == 0 || index == 731 {
+                    expected_floor * 1_000.0
+                } else {
+                    0.0
+                };
+                Point {
+                    x: frequency,
+                    y: expected_floor * broadband_variation + one_over_f + peak,
+                }
+            })
+            .collect();
+
+        let estimate = estimate_white_noise_floor(&points).unwrap();
+        let relative_error = (estimate / expected_floor - 1.0).abs();
+        assert!(
+            relative_error < 0.05,
+            "expected {expected_floor:e}, estimated {estimate:e}"
+        );
+    }
+
+    #[test]
+    fn white_noise_floor_requires_enough_valid_spectrum_bins() {
+        let points = vec![Point { x: 1.0, y: 1.0 }; 15];
+        assert_eq!(estimate_white_noise_floor(&points), None);
+    }
+
+    #[test]
     fn binary_plot_source_streams_deque_range() {
-        let key = ColumnKeyDto {
-            route: "/leaf".to_string(),
-            stream_id: 1,
-            column_index: 2,
-        };
+        let key = ColumnKeyDto::raw("/leaf".to_string(), 1, 2);
         let points: VecDeque<_> = [
             Point { x: 0.0, y: 10.0 },
             Point { x: 1.0, y: 11.0 },
@@ -7597,12 +8708,14 @@ mod tests {
             sample_rate: 100.0,
             points: source,
             outside_window: false,
+            warming_up: false,
+            noise_floor: None,
         }];
 
         assert_eq!(source.len(), 2);
         assert_eq!(
             binary_plot_payload_len(&series).unwrap(),
-            20 + 2 + key.route.len() + 1 + 4 + 8 + 1 + 4 + 2 * 16
+            20 + 2 + key.route.len() + 1 + 4 + 1 + 8 + 1 + 8 + 4 + 2 * 16
         );
 
         let mut bytes = Vec::new();

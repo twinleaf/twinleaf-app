@@ -203,140 +203,32 @@ mod direct {
         );
     }
 
+    /// Structured commands cross the boundary as a JSON `ClientCommand`.
+    ///
+    /// Commands whose payload is a list of records (plot panes, active
+    /// columns, derived channels) used to be marshalled as a dozen parallel
+    /// C arrays, which meant every new field cost another array on both
+    /// sides. `ClientCommand` already derives `Deserialize`, so encoding the
+    /// command on the Swift side is both less code and immune to the arrays
+    /// silently falling out of step.
+    ///
+    /// Returns false if the pointer is null or the payload does not parse.
     #[no_mangle]
-    pub unsafe extern "C" fn twinleaf_runtime_set_plot_panes(
+    pub unsafe extern "C" fn twinleaf_runtime_send_command_json(
         runtime: *mut TwinleafRuntime,
-        pane_ids: *const usize,
-        modes: *const u8,
-        window_seconds: *const f64,
-        resolution_multipliers: *const usize,
-        plot_width_pixels: *const usize,
-        decimation_methods: *const u8,
-        detrends: *const u8,
-        fft_log_xs: *const u8,
-        fft_log_ys: *const u8,
-        pane_count: usize,
-        column_pane_ids: *const usize,
-        routes: *const *const c_char,
-        stream_ids: *const u8,
-        column_indices: *const usize,
-        column_count: usize,
-    ) {
-        if pane_ids.is_null()
-            || modes.is_null()
-            || window_seconds.is_null()
-            || resolution_multipliers.is_null()
-            || plot_width_pixels.is_null()
-            || decimation_methods.is_null()
-            || detrends.is_null()
-            || fft_log_xs.is_null()
-            || fft_log_ys.is_null()
-        {
-            send_runtime_command(runtime, ClientCommand::SetPlotPanes { panes: vec![] });
-            return;
-        }
+        json: *const c_char,
+    ) -> bool {
+        let Some(text) = c_string(json) else {
+            return false;
+        };
 
-        let mut panes = Vec::with_capacity(pane_count);
-        for index in 0..pane_count {
-            let id = *pane_ids.add(index);
-            let mut columns = Vec::new();
-
-            if !column_pane_ids.is_null()
-                && !routes.is_null()
-                && !stream_ids.is_null()
-                && !column_indices.is_null()
-            {
-                for column_index in 0..column_count {
-                    if *column_pane_ids.add(column_index) != id {
-                        continue;
-                    }
-                    let route_ptr = *routes.add(column_index);
-                    let Some(route) = c_string(route_ptr) else {
-                        continue;
-                    };
-                    columns.push(ColumnKeyDto {
-                        route,
-                        stream_id: *stream_ids.add(column_index),
-                        column_index: *column_indices.add(column_index),
-                    });
-                }
+        match serde_json::from_str::<ClientCommand>(&text) {
+            Ok(command) => {
+                send_runtime_command(runtime, command);
+                true
             }
-
-            panes.push(PlotPaneConfig {
-                id,
-                view: ViewConfig {
-                    mode: plot_mode_from_code(*modes.add(index)),
-                    window_seconds: *window_seconds.add(index),
-                    resolution_multiplier: *resolution_multipliers.add(index),
-                    plot_width_pixels: *plot_width_pixels.add(index),
-                    decimation_method: decimation_method_from_code(*decimation_methods.add(index)),
-                    detrend: detrend_from_code(*detrends.add(index)),
-                    fft_log_x: *fft_log_xs.add(index) != 0,
-                    fft_log_y: *fft_log_ys.add(index) != 0,
-                },
-                columns,
-            });
+            Err(_) => false,
         }
-
-        send_runtime_command(runtime, ClientCommand::SetPlotPanes { panes });
-    }
-
-    #[no_mangle]
-    pub unsafe extern "C" fn twinleaf_runtime_set_active_columns(
-        runtime: *mut TwinleafRuntime,
-        routes: *const *const c_char,
-        stream_ids: *const u8,
-        column_indices: *const usize,
-        count: usize,
-    ) {
-        if routes.is_null() || stream_ids.is_null() || column_indices.is_null() {
-            send_runtime_command(runtime, ClientCommand::SetActiveColumns { columns: vec![] });
-            return;
-        }
-
-        let mut columns = Vec::with_capacity(count);
-        for index in 0..count {
-            let route_ptr = *routes.add(index);
-            let Some(route) = c_string(route_ptr) else {
-                continue;
-            };
-            columns.push(ColumnKeyDto {
-                route,
-                stream_id: *stream_ids.add(index),
-                column_index: *column_indices.add(index),
-            });
-        }
-
-        send_runtime_command(runtime, ClientCommand::SetActiveColumns { columns });
-    }
-
-    #[no_mangle]
-    pub unsafe extern "C" fn twinleaf_runtime_set_view(
-        runtime: *mut TwinleafRuntime,
-        mode: u8,
-        window_seconds: f64,
-        resolution_multiplier: usize,
-        plot_width_pixels: usize,
-        decimation_method: u8,
-        detrend: u8,
-        fft_log_x: u8,
-        fft_log_y: u8,
-    ) {
-        send_runtime_command(
-            runtime,
-            ClientCommand::SetView {
-                view: ViewConfig {
-                    mode: plot_mode_from_code(mode),
-                    window_seconds,
-                    resolution_multiplier,
-                    plot_width_pixels,
-                    decimation_method: decimation_method_from_code(decimation_method),
-                    detrend: detrend_from_code(detrend),
-                    fft_log_x: fft_log_x != 0,
-                    fft_log_y: fft_log_y != 0,
-                },
-            },
-        );
     }
 
     #[no_mangle]
@@ -534,6 +426,15 @@ mod direct {
                         playback.set_plot_panes(panes);
                         emit_active_columns(&emitter, &playback.active_columns);
                         playback.emit_state(&emitter);
+                        playback.emit_plot(&emitter);
+                        playback.emit_stream_values(&emitter);
+                    }
+                }
+                ClientCommand::SetDerivedChannels { channels } => {
+                    if let Some((tx, _)) = &session {
+                        let _ = tx.send(SessionCommand::SetDerivedChannels(channels));
+                    } else if let Some(playback) = playback.as_mut() {
+                        playback.set_derived_channels(channels);
                         playback.emit_plot(&emitter);
                         playback.emit_stream_values(&emitter);
                     }

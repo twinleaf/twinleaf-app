@@ -19,6 +19,7 @@ private protocol BridgeRuntime: AnyObject {
     func setPlayback(position: Double)
     func copyViewData(requestId: String, paneID: Int, viewportEnd: Double?)
     func setPlotPanes(_ panes: [PlotPaneSelection])
+    func setDerivedChannels(_ channels: [DerivedChannelSpec])
     func setView(_ view: ViewConfig)
     func callRpc(requestId: String, route: String, name: String, argument: Any?)
     func checkUpgrade()
@@ -38,6 +39,7 @@ private final class UnavailableBridgeRuntime: BridgeRuntime {
     func setPlayback(position: Double) {}
     func copyViewData(requestId: String, paneID: Int, viewportEnd: Double?) {}
     func setPlotPanes(_ panes: [PlotPaneSelection]) {}
+    func setDerivedChannels(_ channels: [DerivedChannelSpec]) {}
     func setView(_ view: ViewConfig) {}
     func callRpc(requestId: String, route: String, name: String, argument: Any?) {}
     func checkUpgrade() {}
@@ -143,6 +145,12 @@ final class BridgeClient: ObservableObject {
     @Published private(set) var rememberedDeviceURLs: [String] = []
     @Published var devices: [DeviceInfo] = []
     @Published private(set) var activeColumns: Set<ColumnKey> = []
+    /// Channels computed from a source column rather than received from a
+    /// device, keyed by their derived `ColumnKey`. A channel lives here until
+    /// the user removes it — not until it leaves the last pane — so that
+    /// un-plotting and re-plotting one does not discard its accumulated
+    /// history.
+    @Published private(set) var derivedChannels: [ColumnKey: DerivedChannelSpec] = [:]
     @Published private(set) var plotPanes: [PlotPaneSelection] = [
         PlotPaneSelection(id: 0, columns: [])
     ]
@@ -506,15 +514,26 @@ final class BridgeClient: ObservableObject {
     }
 
     @discardableResult
-    func addPlotPane(columns keys: [ColumnKey]) -> Int? {
+    func addPlotPane(
+        columns keys: [ColumnKey],
+        mode: PlotMode? = nil,
+        logY: Bool? = nil
+    ) -> Int? {
         guard !keys.isEmpty,
               plotPanes.count < Self.maxPlotPaneCount else {
             return nil
         }
         let id = nextPlotPaneID
+        var paneViewConfig = viewConfig
+        if let mode {
+            paneViewConfig.mode = mode
+        }
+        if let logY {
+            paneViewConfig.logY = logY
+        }
         plotPanes.append(PlotPaneSelection(
             id: id,
-            viewConfig: viewConfig,
+            viewConfig: paneViewConfig,
             columns: limitedColumnSet(from: keys)
         ))
         nextPlotPaneID += 1
@@ -522,8 +541,131 @@ final class BridgeClient: ObservableObject {
         return id
     }
 
+    /// Create the noise-floor channels for `keys` and open a pane showing
+    /// them. Log Y by default: a noise floor drifting across decades is
+    /// unreadable on a linear axis.
+    @discardableResult
+    func addNoiseFloorPlotPane(
+        for keys: [ColumnKey],
+        windowSeconds: Double = DerivedChannelDefaults.windowSeconds,
+        cadenceSeconds: Double = DerivedChannelDefaults.cadenceSeconds
+    ) -> Int? {
+        let derivedKeys = addDerivedChannels(
+            .noiseFloor,
+            for: keys,
+            windowSeconds: windowSeconds,
+            cadenceSeconds: cadenceSeconds
+        )
+        return addPlotPane(columns: derivedKeys, mode: .timeseries, logY: true)
+    }
+
     var canAddPlotPane: Bool {
         plotPanes.count < Self.maxPlotPaneCount
+    }
+
+    // MARK: - Derived channels
+
+    /// Create derived channels for `keys` if they do not exist yet, and return
+    /// every derived key for those sources — existing ones included, so
+    /// repeating the action re-plots rather than duplicating.
+    @discardableResult
+    func addDerivedChannels(
+        _ derivation: Derivation,
+        for keys: [ColumnKey],
+        windowSeconds: Double = DerivedChannelDefaults.windowSeconds,
+        cadenceSeconds: Double = DerivedChannelDefaults.cadenceSeconds
+    ) -> [ColumnKey] {
+        // Deriving from a derived channel is not meaningful for a noise floor
+        // and there is no second-order estimator behind it, so sources are
+        // always raw columns.
+        let sources = Array(Set(keys.filter { !$0.isDerived })).sorted()
+        guard !sources.isEmpty else { return [] }
+
+        var didChange = false
+        var derivedKeys: [ColumnKey] = []
+        for source in sources {
+            let key = source.derived(derivation)
+            derivedKeys.append(key)
+            guard derivedChannels[key] == nil else { continue }
+            derivedChannels[key] = DerivedChannelSpec(
+                key: key,
+                windowSeconds: DerivedChannelDefaults.clampedWindow(windowSeconds),
+                cadenceSeconds: DerivedChannelDefaults.clampedCadence(cadenceSeconds),
+                detrend: viewConfig.detrend
+            )
+            didChange = true
+        }
+
+        if didChange {
+            sendDerivedChannels()
+        }
+        return derivedKeys
+    }
+
+    func removeDerivedChannels(_ keys: [ColumnKey]) {
+        let removable = keys.filter { derivedChannels[$0] != nil }
+        guard !removable.isEmpty else { return }
+
+        for key in removable {
+            derivedChannels[key] = nil
+            streamDisplayValues[key] = nil
+        }
+        for index in plotPanes.indices {
+            plotPanes[index].columns.subtract(removable)
+        }
+        sendDerivedChannels()
+        updateRuntimePlotPanes()
+    }
+
+    func derivedChannel(for key: ColumnKey) -> DerivedChannelSpec? {
+        derivedChannels[key]
+    }
+
+    /// Derived channels sourced from `key`, in a stable order.
+    func derivedChannels(from key: ColumnKey) -> [DerivedChannelSpec] {
+        derivedChannels.values
+            .filter { $0.source == key }
+            .sorted { $0.key < $1.key }
+    }
+
+    func setDerivedWindowSeconds(_ seconds: Double, for key: ColumnKey) {
+        updateDerivedChannel(key) {
+            $0.windowSeconds = DerivedChannelDefaults.clampedWindow(seconds)
+        }
+    }
+
+    func setDerivedCadenceSeconds(_ seconds: Double, for key: ColumnKey) {
+        updateDerivedChannel(key) {
+            $0.cadenceSeconds = DerivedChannelDefaults.clampedCadence(seconds)
+        }
+    }
+
+    /// Retuning discards the channel's history on the runtime side: estimates
+    /// taken over different windows are not the same measurement and must not
+    /// share a trace. The plot simply warms up again.
+    private func updateDerivedChannel(_ key: ColumnKey, _ update: (inout DerivedChannelSpec) -> Void) {
+        guard var spec = derivedChannels[key] else { return }
+        let previous = spec
+        update(&spec)
+        guard spec != previous else { return }
+        derivedChannels[key] = spec
+        streamDisplayValues[key] = nil
+        sendDerivedChannels()
+    }
+
+    /// The label and units a derived channel presents, resolved from its
+    /// source column's metadata.
+    func derivedMetadata(for key: ColumnKey) -> (label: String, units: String)? {
+        guard let derivation = key.derivation else { return nil }
+        let source = plotMetadata(for: key.source)
+        return (
+            derivation.label(fromSource: source.label),
+            derivation.units(fromSource: source.units)
+        )
+    }
+
+    func derivedDisplayValue(for key: ColumnKey) -> Double? {
+        streamDisplayValues[key]?.value
     }
 
     func removePlotPane(id: Int) {
@@ -546,10 +688,25 @@ final class BridgeClient: ObservableObject {
         updateRuntimePlotPanes()
     }
 
+    /// Replace every pane wholesale, as a saved-layout restore does.
+    ///
+    /// Unlike removing a column from a graph, this discards the previous
+    /// layout entirely, so derived channels the new layout does not reference
+    /// are dropped rather than lingering unreachable in the registry.
     @discardableResult
     func replacePlotPanes(with requests: [PlotPaneRestoreRequest]) -> [Int] {
         clearPlotOutput()
         plotPanes.removeAll()
+
+        let referenced = Set(requests.flatMap(\.columns))
+        let orphaned = derivedChannels.keys.filter { !referenced.contains($0) }
+        if !orphaned.isEmpty {
+            for key in orphaned {
+                derivedChannels[key] = nil
+                streamDisplayValues[key] = nil
+            }
+            sendDerivedChannels()
+        }
 
         var restoredIDs: [Int] = []
         for request in requests.prefix(Self.maxPlotPaneCount) {
@@ -685,6 +842,24 @@ final class BridgeClient: ObservableObject {
         plotPanes[index].viewConfig.fftLogX = enabled
         if index == 0 {
             viewConfig.fftLogX = enabled
+        }
+        updateRuntimePlotPanes()
+    }
+
+    func setLogY(_ enabled: Bool) {
+        guard viewConfig.logY != enabled else { return }
+        viewConfig.logY = enabled
+        updateAllPaneViewConfigs { $0.logY = enabled }
+    }
+
+    func setLogY(_ enabled: Bool, for paneID: Int) {
+        guard let index = plotPanes.firstIndex(where: { $0.id == paneID }),
+              plotPanes[index].viewConfig.logY != enabled else {
+            return
+        }
+        plotPanes[index].viewConfig.logY = enabled
+        if index == 0 {
+            viewConfig.logY = enabled
         }
         updateRuntimePlotPanes()
     }
@@ -1071,6 +1246,14 @@ final class BridgeClient: ObservableObject {
         plotPanes = [PlotPaneSelection(id: 0, viewConfig: viewConfig, columns: [])]
         nextPlotPaneID = 1
         activeColumns.removeAll()
+        // Derived channels name a specific route, stream and column, so they
+        // are session state in the same way pane selections are: keeping them
+        // across a disconnect would leave the runtime deriving from sources
+        // the next device may not have.
+        if !derivedChannels.isEmpty {
+            derivedChannels.removeAll()
+            sendDerivedChannels()
+        }
     }
 
     private func removeAllPlotPanes() {
@@ -1126,6 +1309,10 @@ final class BridgeClient: ObservableObject {
 
     private func sendPlotPanes() {
         runtime?.setPlotPanes(plotPanes)
+    }
+
+    private func sendDerivedChannels() {
+        runtime?.setDerivedChannels(Array(derivedChannels.values))
     }
 
     private func updateAllPaneViewConfigs(_ update: (inout ViewConfig) -> Void) {
@@ -1727,13 +1914,21 @@ final class BridgeClient: ObservableObject {
                 let route = try reader.readString(byteCount: routeLength)
                 let streamId = try reader.readUInt8()
                 let columnIndex = Int(try reader.readUInt32())
+                let derivation = frameVersion >= 5
+                    ? try Self.derivation(fromCode: reader.readUInt8())
+                    : nil
                 let sampleRate = try reader.readDouble()
                 let seriesFlags = frameVersion >= 3 ? try reader.readUInt8() : 0
+                let encodedNoiseFloor = frameVersion >= 4 ? try reader.readDouble() : .nan
+                let noiseFloor = encodedNoiseFloor.isFinite && encodedNoiseFloor > 0
+                    ? encodedNoiseFloor
+                    : nil
                 let pointCount = Int(try reader.readUInt32())
                 let key = ColumnKey(
                     route: route,
                     streamId: streamId,
-                    columnIndex: columnIndex
+                    columnIndex: columnIndex,
+                    derivation: derivation
                 )
                 let metadata = plotMetadata(for: key)
                 var points: [PlotPoint] = []
@@ -1750,7 +1945,9 @@ final class BridgeClient: ObservableObject {
                     units: metadata.units,
                     sampleRate: sampleRate,
                     points: points,
-                    isOutsideTimeWindow: (seriesFlags & 0x01) != 0
+                    noiseFloor: noiseFloor,
+                    isOutsideTimeWindow: (seriesFlags & 0x01) != 0,
+                    isWarmingUp: (seriesFlags & 0x02) != 0
                 ))
             }
 
@@ -1759,7 +1956,25 @@ final class BridgeClient: ObservableObject {
         }
     }
 
+    private static func derivation(fromCode code: UInt8) -> Derivation? {
+        switch code {
+        case 1: .noiseFloor
+        default: nil
+        }
+    }
+
     private func plotMetadata(for key: ColumnKey) -> (label: String, units: String) {
+        // A derived channel has no metadata of its own: its identity is its
+        // source's, restated. Resolving through the source also means a
+        // renamed or re-enumerated device carries its derived channels along.
+        if let derivation = key.derivation {
+            let source = plotMetadata(for: key.source)
+            return (
+                derivation.label(fromSource: source.label),
+                derivation.units(fromSource: source.units)
+            )
+        }
+
         guard let resolved = resolveColumnIndex(for: key, in: devices) else {
             return (
                 "\(key.route) stream \(key.streamId) column \(key.columnIndex)",
@@ -1805,6 +2020,12 @@ final class BridgeClient: ObservableObject {
         for key: ColumnKey,
         in targetDevices: [DeviceInfo]
     ) -> (device: Int, stream: Int, column: Int)? {
+        // Derived channels are not device columns. The unify fallback below
+        // matches on stream id and column index, which a derived key shares
+        // with its source, so without this guard it would resolve to — and
+        // overwrite the displayed value of — the very column it derives from.
+        guard !key.isDerived else { return nil }
+
         if let exact = findColumnIndex(for: key, in: targetDevices) {
             return exact
         }

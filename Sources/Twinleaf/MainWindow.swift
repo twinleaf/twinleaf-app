@@ -18,6 +18,7 @@ private struct PlotCanvasFrameHost: View {
     let recordingStartSeconds: Double?
     let fftLogX: Bool
     let fftLogY: Bool
+    let logY: Bool
     let showKey: Bool
     let showsTimeseriesXAxisLabels: Bool
     var topPlotInset: CGFloat = 0
@@ -28,6 +29,7 @@ private struct PlotCanvasFrameHost: View {
     var onTimeseriesPan: (Double) -> Void = { _ in }
     var onTimeseriesZoom: (Double, Double) -> Void = { _, _ in }
     var onPlotColumnsDropped: (PlotColumnDragPayload) -> Void = { _ in }
+    var legendMenu: (PlotSeries) -> AnyView = { _ in AnyView(EmptyView()) }
 
     var body: some View {
         let series = frames.series(for: pane, maxCount: BridgeClient.maxPlotLineCount)
@@ -46,6 +48,7 @@ private struct PlotCanvasFrameHost: View {
             recordingStartSeconds: recordingStartSeconds,
             fftLogX: fftLogX,
             fftLogY: fftLogY,
+            logY: logY,
             showKey: showKey,
             showsXAxisLabels: usesFFT || showsTimeseriesXAxisLabels,
             topPlotInset: topPlotInset,
@@ -55,7 +58,8 @@ private struct PlotCanvasFrameHost: View {
             onCopyViewData: onCopyViewData,
             onTimeseriesPan: onTimeseriesPan,
             onTimeseriesZoom: onTimeseriesZoom,
-            onPlotColumnsDropped: onPlotColumnsDropped
+            onPlotColumnsDropped: onPlotColumnsDropped,
+            legendMenu: legendMenu
         )
     }
 }
@@ -868,6 +872,9 @@ struct DocumentWindow: View {
                 guard !columns.isEmpty else { continue }
                 var viewConfig = bridge.viewConfig
                 viewConfig.mode = pane.mode
+                if let logY = pane.logY {
+                    viewConfig.logY = logY
+                }
                 paneRestores.append(RestoredBoardPlotPane(
                     request: PlotPaneRestoreRequest(viewConfig: viewConfig, columns: columns),
                     axisMode: pane.axisMode,
@@ -940,13 +947,23 @@ struct DocumentWindow: View {
             let columns = pane.columns
                 .filter { $0.route == device.route }
                 .sorted()
-                .map { BoardColumnReference(streamId: $0.streamId, columnIndex: $0.columnIndex) }
+                .map { key -> BoardColumnReference in
+                    let spec = bridge.derivedChannel(for: key)
+                    return BoardColumnReference(
+                        streamId: key.streamId,
+                        columnIndex: key.columnIndex,
+                        derivation: key.derivation,
+                        derivedWindowSeconds: spec?.windowSeconds,
+                        derivedCadenceSeconds: spec?.cadenceSeconds
+                    )
+                }
             guard !columns.isEmpty else { return nil }
             return BoardPlotPaneLayout(
                 columns: columns,
                 mode: pane.viewConfig.mode,
                 axisMode: effectiveVerticalAxisMode(for: pane.id),
-                showsIndependentAxisLabels: showsIndependentAxisLabels(for: pane.id)
+                showsIndependentAxisLabels: showsIndependentAxisLabels(for: pane.id),
+                logY: pane.viewConfig.logY
             )
         }
 
@@ -957,16 +974,26 @@ struct DocumentWindow: View {
         return BoardViewLayout(panes: panes, sliders: sliders)
     }
 
+    /// Resolve a saved reference against a live device, recreating the derived
+    /// channel it names if the layout carried one.
     private func columnKey(for reference: BoardColumnReference, in device: DeviceInfo) -> ColumnKey? {
         guard let stream = device.streams.first(where: { $0.streamId == reference.streamId }),
               stream.columns.contains(where: { $0.key.columnIndex == reference.columnIndex }) else {
             return nil
         }
-        return ColumnKey(
+        let source = ColumnKey(
             route: device.route,
             streamId: reference.streamId,
             columnIndex: reference.columnIndex
         )
+        guard let derivation = reference.derivation else { return source }
+
+        return bridge.addDerivedChannels(
+            derivation,
+            for: [source],
+            windowSeconds: reference.derivedWindowSeconds ?? DerivedChannelDefaults.windowSeconds,
+            cadenceSeconds: reference.derivedCadenceSeconds ?? DerivedChannelDefaults.cadenceSeconds
+        ).first
     }
 
     private func uniqueSliders(_ sliders: [RPCSliderConfiguration]) -> [RPCSliderConfiguration] {
@@ -1232,6 +1259,7 @@ struct DocumentWindow: View {
                     recordingStartSeconds: bridge.plotTimeOriginSeconds,
                     fftLogX: pane.viewConfig.fftLogX,
                     fftLogY: pane.viewConfig.fftLogY,
+                    logY: pane.viewConfig.logY,
                     showKey: showPlotKey,
                     showsTimeseriesXAxisLabels: index == paneCount - 1,
                     topPlotInset: topPlotInset(for: pane, index: index),
@@ -1247,6 +1275,9 @@ struct DocumentWindow: View {
                     },
                     onPlotColumnsDropped: { payload in
                         bridge.dropPlotColumns(payload, into: pane.id)
+                    },
+                    legendMenu: { series in
+                        AnyView(PlotLegendMenu(bridge: bridge, series: series, paneID: pane.id))
                     }
                 )
                 .frame(width: canvasWidth, height: geometry.size.height)
@@ -1365,6 +1396,7 @@ struct DocumentWindow: View {
             let showsAxisLabels = showsIndependentAxisLabels(for: pane.id)
             let fftLogX = pane.viewConfig.fftLogX
             let fftLogY = pane.viewConfig.fftLogY
+            let logY = pane.viewConfig.logY
 
             if !isFFT {
                 GraphControlToggleButton(
@@ -1393,16 +1425,23 @@ struct DocumentWindow: View {
                         bridge.setFFTLogX(!fftLogX, for: pane.id)
                     }
                 )
-
-                GraphControlToggleButton(
-                    title: "Log Y",
-                    icon: .logY,
-                    isOn: fftLogY,
-                    action: {
-                        bridge.setFFTLogY(!fftLogY, for: pane.id)
-                    }
-                )
             }
+
+            // Log Y applies in both modes — a noise floor spanning decades is
+            // unreadable on a linear axis — but each mode keeps its own flag,
+            // so toggling the pane's mode restores the axis it had before.
+            GraphControlToggleButton(
+                title: "Log Y",
+                icon: .logY,
+                isOn: isFFT ? fftLogY : logY,
+                action: {
+                    if isFFT {
+                        bridge.setFFTLogY(!fftLogY, for: pane.id)
+                    } else {
+                        bridge.setLogY(!logY, for: pane.id)
+                    }
+                }
+            )
 
             GraphControlToggleButton(
                 title: "FFT",
@@ -1988,6 +2027,7 @@ private struct PlotPopoutWindowView: View {
                 recordingStartSeconds: bridge.plotTimeOriginSeconds,
                 fftLogX: pane.viewConfig.fftLogX,
                 fftLogY: pane.viewConfig.fftLogY,
+                logY: pane.viewConfig.logY,
                 showKey: showPlotKey,
                 showsTimeseriesXAxisLabels: true,
                 rightAxisReservationCount: rightAxisReservationCount,
@@ -2002,6 +2042,9 @@ private struct PlotPopoutWindowView: View {
                 },
                 onPlotColumnsDropped: { payload in
                     bridge.dropPlotColumns(payload, into: pane.id)
+                },
+                legendMenu: { series in
+                    AnyView(PlotLegendMenu(bridge: bridge, series: series, paneID: pane.id))
                 }
             )
 
@@ -2076,6 +2119,7 @@ private struct PlotPopoutWindowView: View {
             let showsAxisLabels = independentAxisLabelVisibility[pane.id] ?? false
             let fftLogX = pane.viewConfig.fftLogX
             let fftLogY = pane.viewConfig.fftLogY
+            let logY = pane.viewConfig.logY
 
             if !isFFT {
                 GraphControlToggleButton(
@@ -2104,16 +2148,23 @@ private struct PlotPopoutWindowView: View {
                         bridge.setFFTLogX(!fftLogX, for: pane.id)
                     }
                 )
-
-                GraphControlToggleButton(
-                    title: "Log Y",
-                    icon: .logY,
-                    isOn: fftLogY,
-                    action: {
-                        bridge.setFFTLogY(!fftLogY, for: pane.id)
-                    }
-                )
             }
+
+            // Log Y applies in both modes — a noise floor spanning decades is
+            // unreadable on a linear axis — but each mode keeps its own flag,
+            // so toggling the pane's mode restores the axis it had before.
+            GraphControlToggleButton(
+                title: "Log Y",
+                icon: .logY,
+                isOn: isFFT ? fftLogY : logY,
+                action: {
+                    if isFFT {
+                        bridge.setFFTLogY(!fftLogY, for: pane.id)
+                    } else {
+                        bridge.setLogY(!logY, for: pane.id)
+                    }
+                }
+            )
 
             GraphControlToggleButton(
                 title: "FFT",
@@ -3898,6 +3949,8 @@ private struct PlotSettingsWindow: View {
     @AppStorage(ViewPreferenceKeys.logMessageLineLimit) private var logMessageLineLimit = LogMessageScrollback.defaultLineLimit
     @AppStorage(ViewPreferenceKeys.yAxisHysteresis) private var yAxisHysteresis = PlotAxisHysteresis.defaultFraction
     @AppStorage(ViewPreferenceKeys.fftAxisHysteresis) private var fftAxisHysteresis = PlotAxisHysteresis.defaultFraction
+    @AppStorage(ViewPreferenceKeys.noiseFloorWindowSeconds) private var noiseFloorWindowSeconds = DerivedChannelDefaults.windowSeconds
+    @AppStorage(ViewPreferenceKeys.noiseFloorCadenceSeconds) private var noiseFloorCadenceSeconds = DerivedChannelDefaults.cadenceSeconds
     @AppStorage(ViewPreferenceKeys.traceColorPaletteLight) private var traceColorPaletteLightRaw = PlotTracePalette.defaultLightRawValue
     @AppStorage(ViewPreferenceKeys.traceColorPaletteDark) private var traceColorPaletteDarkRaw = PlotTracePalette.defaultDarkRawValue
     @AppStorage(ViewPreferenceKeys.favoriteRPCs) private var favoriteRPCsRaw = ""
@@ -4094,7 +4147,43 @@ private struct PlotSettingsWindow: View {
                                 .monospacedDigit()
                                 .frame(width: 48, alignment: .trailing)
                         }
-                        .help("FFT axis range hysteresis. Log axes use this as a fraction of an order of magnitude.")
+                        .help("Axis range hysteresis for FFT and log axes. Log axes use this as a fraction of an order of magnitude.")
+                    }
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Noise Floor")
+                            .font(.headline)
+
+                        Text("Defaults for new noise-floor channels. Changing these leaves existing channels alone — retune those from the channel's own menu.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        HStack(spacing: 12) {
+                            Text("FFT window")
+                                .frame(width: 112, alignment: .leading)
+                            Picker("FFT window", selection: noiseFloorWindowBinding) {
+                                ForEach(noiseFloorWindowChoices, id: \.self) { seconds in
+                                    Text("\(formatNoiseFloorSeconds(seconds)) s").tag(seconds)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+                        .help("Seconds of data behind each estimate. Longer windows give finer frequency resolution and a steadier floor, at the cost of responding more slowly to a change.")
+
+                        HStack(spacing: 12) {
+                            Text("Update every")
+                                .frame(width: 112, alignment: .leading)
+                            Picker("Update every", selection: noiseFloorCadenceBinding) {
+                                ForEach(noiseFloorCadenceChoices, id: \.self) { seconds in
+                                    Text("\(formatNoiseFloorSeconds(seconds)) s").tag(seconds)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+                        .help("How often an estimate is taken. When this is shorter than the window, successive points share data and are correlated rather than independent measurements.")
                     }
 
                     Divider()
@@ -4347,6 +4436,20 @@ private struct PlotSettingsWindow: View {
 
     private var yAxisHysteresisPercentText: String {
         "\(Int((PlotAxisHysteresis.clamped(yAxisHysteresis) * 100).rounded()))%"
+    }
+
+    private var noiseFloorWindowBinding: Binding<Double> {
+        Binding(
+            get: { DerivedChannelDefaults.clampedWindow(noiseFloorWindowSeconds) },
+            set: { noiseFloorWindowSeconds = DerivedChannelDefaults.clampedWindow($0) }
+        )
+    }
+
+    private var noiseFloorCadenceBinding: Binding<Double> {
+        Binding(
+            get: { DerivedChannelDefaults.clampedCadence(noiseFloorCadenceSeconds) },
+            set: { noiseFloorCadenceSeconds = DerivedChannelDefaults.clampedCadence($0) }
+        )
     }
 
     private var fftAxisHysteresisBinding: Binding<Double> {
@@ -5859,6 +5962,18 @@ private struct StreamSidebar: View {
                             .equatable()
                             .padding(.leading, streamChildRowLeadingPadding)
                             .listRowInsets(denseSidebarRowInsets)
+
+                            ForEach(bridge.derivedChannels(from: column.key)) { spec in
+                                DerivedColumnRow(
+                                    spec: spec,
+                                    showDetails: showStreamDetails,
+                                    bridge: bridge,
+                                    plotState: plotState(for: [spec.key]),
+                                    onOpenPlotWindow: onOpenPlotWindow
+                                )
+                                .padding(.leading, streamChildRowLeadingPadding * 2)
+                                .listRowInsets(denseSidebarRowInsets)
+                            }
                         }
                     }
                 }
@@ -5912,6 +6027,18 @@ private struct StreamSidebar: View {
                                 .equatable()
                                 .padding(.leading, streamChildRowLeadingPadding * 2)
                                 .listRowInsets(denseSidebarRowInsets)
+
+                                ForEach(bridge.derivedChannels(from: deviceColumn.key)) { spec in
+                                    DerivedColumnRow(
+                                        spec: spec,
+                                        showDetails: showStreamDetails,
+                                        bridge: bridge,
+                                        plotState: plotState(for: [spec.key]),
+                                        onOpenPlotWindow: onOpenPlotWindow
+                                    )
+                                    .padding(.leading, streamChildRowLeadingPadding * 3)
+                                    .listRowInsets(denseSidebarRowInsets)
+                                }
                             }
                         }
                     }
@@ -6180,6 +6307,128 @@ private struct StreamPlotRowState: Equatable {
     let canAddPlotPane: Bool
 }
 
+/// Right-click menu for one legend entry.
+///
+/// This is where a noise-floor channel is most naturally discovered: an FFT
+/// pane already prints each trace's floor in the legend, so "plot that over
+/// time" belongs next to the number itself.
+private struct PlotLegendMenu: View {
+    @ObservedObject var bridge: BridgeClient
+    let series: PlotSeries
+    let paneID: Int
+    private var noiseFloorDefaults = NoiseFloorDefaults()
+
+    init(bridge: BridgeClient, series: PlotSeries, paneID: Int) {
+        self.bridge = bridge
+        self.series = series
+        self.paneID = paneID
+    }
+
+    var body: some View {
+        if let spec = bridge.derivedChannel(for: series.key) {
+            derivedChannelItems(spec)
+        } else {
+            sourceColumnItems
+        }
+
+        Divider()
+
+        Button(role: .destructive) {
+            bridge.setColumns([series.key], in: paneID, enabled: false)
+        } label: {
+            Label("Remove from Graph", systemImage: "minus")
+        }
+    }
+
+    @ViewBuilder
+    private var sourceColumnItems: some View {
+        Button {
+            bridge.addNoiseFloorPlotPane(
+                for: [series.key],
+                windowSeconds: noiseFloorDefaults.windowSeconds,
+                cadenceSeconds: noiseFloorDefaults.cadenceSeconds
+            )
+        } label: {
+            Label("Plot Noise Floor Over Time", systemImage: "chart.line.flattrend.xyaxis")
+        }
+        .disabled(!bridge.canAddPlotPane)
+        .help(noiseFloorDefaults.menuHelp)
+    }
+
+    @ViewBuilder
+    private func derivedChannelItems(_ spec: DerivedChannelSpec) -> some View {
+        Menu("FFT Window") {
+            ForEach(noiseFloorWindowChoices, id: \.self) { seconds in
+                Button {
+                    bridge.setDerivedWindowSeconds(seconds, for: spec.key)
+                } label: {
+                    windowLabel(seconds, isSelected: matches(spec.windowSeconds, seconds))
+                }
+            }
+        }
+
+        Menu("Update Every") {
+            ForEach(noiseFloorCadenceChoices, id: \.self) { seconds in
+                Button {
+                    bridge.setDerivedCadenceSeconds(seconds, for: spec.key)
+                } label: {
+                    windowLabel(seconds, isSelected: matches(spec.cadenceSeconds, seconds))
+                }
+            }
+        }
+
+        Divider()
+
+        Button(role: .destructive) {
+            bridge.removeDerivedChannels([spec.key])
+        } label: {
+            Label("Delete Noise Floor Channel", systemImage: "trash")
+        }
+        .help("Removes the channel from every graph and discards its history.")
+    }
+
+    @ViewBuilder
+    private func windowLabel(_ seconds: Double, isSelected: Bool) -> some View {
+        let text = "\(formatNoiseFloorSeconds(seconds)) s"
+        if isSelected {
+            Label(text, systemImage: "checkmark")
+        } else {
+            Text(text)
+        }
+    }
+
+    private func matches(_ lhs: Double, _ rhs: Double) -> Bool {
+        abs(lhs - rhs) < 1e-6
+    }
+}
+
+private let noiseFloorWindowChoices: [Double] = [1, 2, 5, 10, 30, 60, 300, 1000]
+private let noiseFloorCadenceChoices: [Double] = [0.1, 0.25, 0.5, 1, 2, 5, 10, 60]
+
+/// Global defaults applied to newly created noise-floor channels.
+///
+/// A `DynamicProperty` rather than plain reads so the menus that create
+/// channels re-render when the defaults change in Settings.
+private struct NoiseFloorDefaults: DynamicProperty {
+    @AppStorage(ViewPreferenceKeys.noiseFloorWindowSeconds)
+    private var storedWindow = DerivedChannelDefaults.windowSeconds
+    @AppStorage(ViewPreferenceKeys.noiseFloorCadenceSeconds)
+    private var storedCadence = DerivedChannelDefaults.cadenceSeconds
+
+    var windowSeconds: Double { DerivedChannelDefaults.clampedWindow(storedWindow) }
+    var cadenceSeconds: Double { DerivedChannelDefaults.clampedCadence(storedCadence) }
+
+    var menuHelp: String {
+        "Track the FFT's white-noise floor over time: one point every "
+            + "\(formatNoiseFloorSeconds(cadenceSeconds)) s, each from a "
+            + "\(formatNoiseFloorSeconds(windowSeconds)) s window."
+    }
+}
+
+private func formatNoiseFloorSeconds(_ value: Double) -> String {
+    NumericDisplayPolicy.fixed(value, fractionDigits: value < 1 ? 2 : 0)
+}
+
 private struct StreamHeaderRow: View {
     let stream: StreamInfo
     let showDetails: Bool
@@ -6190,6 +6439,7 @@ private struct StreamHeaderRow: View {
     /// Unify mode: plot/drag keys spanning every sensor in the group rather
     /// than just this stream's own device.
     var plotKeysOverride: [ColumnKey]? = nil
+    private var noiseFloorDefaults = NoiseFloorDefaults()
 
     var body: some View {
         SidebarValueRowLayout() {
@@ -6283,6 +6533,25 @@ private struct StreamHeaderRow: View {
         }
         .disabled(plotKeys.isEmpty || !plotState.canAddPlotPane)
 
+        Button {
+            bridge.addPlotPane(columns: plotKeys, mode: .fft)
+        } label: {
+            Label("New FFT Plot", systemImage: "waveform")
+        }
+        .disabled(plotKeys.isEmpty || !plotState.canAddPlotPane)
+
+        Button {
+            bridge.addNoiseFloorPlotPane(
+                for: plotKeys,
+                windowSeconds: noiseFloorDefaults.windowSeconds,
+                cadenceSeconds: noiseFloorDefaults.cadenceSeconds
+            )
+        } label: {
+            Label("New Noise Floor Plot", systemImage: "chart.line.flattrend.xyaxis")
+        }
+        .disabled(plotKeys.isEmpty || !plotState.canAddPlotPane)
+        .help(noiseFloorDefaults.menuHelp)
+
         if let onOpenPlotWindow {
             Divider()
 
@@ -6334,6 +6603,7 @@ private struct StreamColumnRow: View, @MainActor Equatable {
     /// Unify mode: label per-device value rows by sensor route/serial instead
     /// of repeating the column name.
     var labelOverride: String? = nil
+    private var noiseFloorDefaults = NoiseFloorDefaults()
 
     static func == (lhs: StreamColumnRow, rhs: StreamColumnRow) -> Bool {
         lhs.column == rhs.column
@@ -6423,6 +6693,25 @@ private struct StreamColumnRow: View, @MainActor Equatable {
         }
         .disabled(!plotState.canAddPlotPane)
 
+        Button {
+            bridge.addPlotPane(columns: plotKeys, mode: .fft)
+        } label: {
+            Label("New FFT Plot", systemImage: "waveform")
+        }
+        .disabled(!plotState.canAddPlotPane)
+
+        Button {
+            bridge.addNoiseFloorPlotPane(
+                for: plotKeys,
+                windowSeconds: noiseFloorDefaults.windowSeconds,
+                cadenceSeconds: noiseFloorDefaults.cadenceSeconds
+            )
+        } label: {
+            Label("New Noise Floor Plot", systemImage: "chart.line.flattrend.xyaxis")
+        }
+        .disabled(!plotState.canAddPlotPane)
+        .help(noiseFloorDefaults.menuHelp)
+
         if let onOpenPlotWindow {
             Divider()
 
@@ -6447,6 +6736,162 @@ private struct StreamColumnRow: View, @MainActor Equatable {
         let label = column.description.isEmpty ? column.name : column.description
         let verb = isSelectedInLowestPlot ? "Remove" : "Plot"
         return "\(verb) \(label) in the lowest graph"
+    }
+}
+
+/// Sidebar row for a derived channel, shown under the column it comes from.
+///
+/// Unlike `StreamColumnRow` this has no `ColumnInfo` behind it: a derived
+/// channel is not a device column, so its label, units and live value are all
+/// resolved from the bridge rather than from device metadata.
+private struct DerivedColumnRow: View {
+    let spec: DerivedChannelSpec
+    let showDetails: Bool
+    @ObservedObject var bridge: BridgeClient
+    let plotState: StreamPlotRowState
+    let onOpenPlotWindow: (([ColumnKey]) -> Void)?
+
+    var body: some View {
+        SidebarValueRowLayout() {
+            labelContent
+            valueContent
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            bridge.toggleColumnsInLowestPlot([spec.key])
+        }
+        .plotColumnDragSource(keys: [spec.key])
+        .contextMenu { menu }
+        .help(helpText)
+    }
+
+    private var labelContent: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 4) {
+                Image(systemName: "function")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text(spec.derivation?.title ?? "Derived")
+                    .lineLimit(1)
+                    .foregroundStyle(plotState.isPlottedInAnyPlot ? Color.accentColor : Color.primary)
+            }
+
+            if showDetails {
+                Text(detailText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+    }
+
+    private var valueContent: some View {
+        Text(displayValue)
+            .font(.body.monospacedDigit())
+            .foregroundStyle(bridge.derivedDisplayValue(for: spec.key) == nil ? .secondary : .primary)
+            .lineLimit(1)
+            .frame(width: streamValueColumnWidth, alignment: .trailing)
+    }
+
+    private var units: String {
+        bridge.derivedMetadata(for: spec.key)?.units ?? ""
+    }
+
+    private var displayValue: String {
+        guard let value = bridge.derivedDisplayValue(for: spec.key) else {
+            return units.isEmpty ? "—" : "— \(units)"
+        }
+        let text = formatStreamValue(value)
+        return units.isEmpty ? text : "\(text) \(units)"
+    }
+
+    private var detailText: String {
+        "\(formatNoiseFloorSeconds(spec.windowSeconds)) s window · every "
+            + "\(formatNoiseFloorSeconds(spec.cadenceSeconds)) s"
+    }
+
+    private var helpText: String {
+        let verb = plotState.isSelectedInLowestPlot ? "Remove" : "Plot"
+        return "\(verb) the \(spec.derivation?.title.lowercased() ?? "derived") channel in the lowest graph."
+            + " Each point summarises the \(formatNoiseFloorSeconds(spec.windowSeconds)) s ending at that time,"
+            + " so successive points overlap."
+    }
+
+    @ViewBuilder
+    private var menu: some View {
+        if !plotState.paneEntries.isEmpty {
+            ForEach(plotState.paneEntries) { entry in
+                Button {
+                    bridge.setColumns([spec.key], in: entry.id, enabled: !entry.isSelected)
+                } label: {
+                    if entry.isSelected {
+                        Label("Plot \(entry.index + 1)", systemImage: "checkmark")
+                    } else {
+                        Text("Plot \(entry.index + 1)")
+                    }
+                }
+            }
+
+            Divider()
+        }
+
+        Button {
+            bridge.addPlotPane(columns: [spec.key], mode: .timeseries, logY: true)
+        } label: {
+            Label("New Plot", systemImage: "plus")
+        }
+        .disabled(!plotState.canAddPlotPane)
+
+        if let onOpenPlotWindow {
+            Button {
+                onOpenPlotWindow([spec.key])
+            } label: {
+                Label("Open in Window", systemImage: "arrow.up.right.square")
+            }
+            .disabled(!plotState.canAddPlotPane)
+        }
+
+        Divider()
+
+        Menu("FFT Window") {
+            ForEach(noiseFloorWindowChoices, id: \.self) { seconds in
+                Button {
+                    bridge.setDerivedWindowSeconds(seconds, for: spec.key)
+                } label: {
+                    choiceLabel(seconds, current: spec.windowSeconds)
+                }
+            }
+        }
+
+        Menu("Update Every") {
+            ForEach(noiseFloorCadenceChoices, id: \.self) { seconds in
+                Button {
+                    bridge.setDerivedCadenceSeconds(seconds, for: spec.key)
+                } label: {
+                    choiceLabel(seconds, current: spec.cadenceSeconds)
+                }
+            }
+        }
+
+        Divider()
+
+        Button(role: .destructive) {
+            bridge.removeDerivedChannels([spec.key])
+        } label: {
+            Label("Delete Channel", systemImage: "trash")
+        }
+        .help("Removes the channel from every graph and discards its history.")
+    }
+
+    @ViewBuilder
+    private func choiceLabel(_ seconds: Double, current: Double) -> some View {
+        let text = "\(formatNoiseFloorSeconds(seconds)) s"
+        if abs(current - seconds) < 1e-6 {
+            Label(text, systemImage: "checkmark")
+        } else {
+            Text(text)
+        }
     }
 }
 
@@ -6663,11 +7108,20 @@ private struct BoardPlotPaneLayout: Codable, Equatable {
     var mode: PlotMode
     var axisMode: VerticalAxisMode
     var showsIndependentAxisLabels: Bool
+    /// Absent in layouts saved before the timeseries log axis existed.
+    var logY: Bool?
 }
 
 private struct BoardColumnReference: Codable, Hashable {
     var streamId: UInt8
     var columnIndex: Int
+    /// Absent in layouts saved before derived channels existed, and for every
+    /// raw column, so it decodes as nil rather than failing.
+    var derivation: Derivation?
+    /// Derived channels are recreated on restore, so their parameters travel
+    /// with the layout. Nil for raw columns.
+    var derivedWindowSeconds: Double?
+    var derivedCadenceSeconds: Double?
 }
 
 private struct BoardStreamReference: Codable, Hashable {
