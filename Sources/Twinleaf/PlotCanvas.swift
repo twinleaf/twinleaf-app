@@ -104,26 +104,41 @@ fileprivate func plotNiceTicks(from minValue: Double, to maxValue: Double, targe
     return ticks
 }
 
-fileprivate func plotLogTicks(from minValue: Double, to maxValue: Double) -> [Double] {
+fileprivate func plotLogTicks(from minValue: Double, to maxValue: Double, maxCount: Int = 12) -> [Double] {
     guard minValue.isFinite, maxValue.isFinite, minValue > 0, minValue < maxValue else {
         return []
     }
     let lowerPower = Int(floor(log10(minValue)))
     let upperPower = Int(ceil(log10(maxValue)))
-    var ticks: [Double] = []
-    for power in lowerPower...upperPower {
-        let decade = pow(10.0, Double(power))
-        for multiplier in [1.0, 2.0, 5.0] {
-            let tick = multiplier * decade
-            if tick >= minValue && tick <= maxValue {
-                ticks.append(tick)
+
+    // Try progressively sparser per-decade multiplier sets so that thinning
+    // drops the 2×/5× ticks first and the decades (1×10ⁿ) are always labeled.
+    for multipliers in [[1.0, 2.0, 5.0], [1.0, 3.0], [1.0]] {
+        var ticks: [Double] = []
+        for power in lowerPower...upperPower {
+            let decade = pow(10.0, Double(power))
+            for multiplier in multipliers {
+                let tick = multiplier * decade
+                if tick >= minValue && tick <= maxValue {
+                    ticks.append(tick)
+                }
             }
         }
+        if ticks.count <= maxCount {
+            return ticks
+        }
     }
-    if ticks.count > 8 {
-        ticks = ticks.enumerated()
-            .filter { index, _ in index.isMultiple(of: 2) }
-            .map(\.element)
+
+    // More decades than maxCount: keep every Nth decade, anchored at exponents
+    // divisible by the stride so the surviving labels sit at round powers.
+    let decadeCount = upperPower - lowerPower + 1
+    let stride = max(2, Int(ceil(Double(decadeCount) / Double(max(maxCount, 1)))))
+    var ticks: [Double] = []
+    for power in lowerPower...upperPower where power.isMultiple(of: stride) {
+        let tick = pow(10.0, Double(power))
+        if tick >= minValue && tick <= maxValue {
+            ticks.append(tick)
+        }
     }
     return ticks
 }
