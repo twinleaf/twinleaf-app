@@ -6441,6 +6441,24 @@ private struct StreamHeaderRow: View {
     var plotKeysOverride: [ColumnKey]? = nil
     private var noiseFloorDefaults = NoiseFloorDefaults()
 
+    init(
+        stream: StreamInfo,
+        showDetails: Bool,
+        isExpanded: Binding<Bool>,
+        bridge: BridgeClient,
+        plotState: StreamPlotRowState,
+        onOpenPlotWindow: (([ColumnKey]) -> Void)?,
+        plotKeysOverride: [ColumnKey]? = nil
+    ) {
+        self.stream = stream
+        self.showDetails = showDetails
+        self._isExpanded = isExpanded
+        self.bridge = bridge
+        self.plotState = plotState
+        self.onOpenPlotWindow = onOpenPlotWindow
+        self.plotKeysOverride = plotKeysOverride
+    }
+
     var body: some View {
         SidebarValueRowLayout() {
             headerContent
@@ -6604,6 +6622,22 @@ private struct StreamColumnRow: View, @MainActor Equatable {
     /// of repeating the column name.
     var labelOverride: String? = nil
     private var noiseFloorDefaults = NoiseFloorDefaults()
+
+    init(
+        column: ColumnInfo,
+        showDetails: Bool,
+        bridge: BridgeClient,
+        plotState: StreamPlotRowState,
+        onOpenPlotWindow: (([ColumnKey]) -> Void)?,
+        labelOverride: String? = nil
+    ) {
+        self.column = column
+        self.showDetails = showDetails
+        self.bridge = bridge
+        self.plotState = plotState
+        self.onOpenPlotWindow = onOpenPlotWindow
+        self.labelOverride = labelOverride
+    }
 
     static func == (lhs: StreamColumnRow, rhs: StreamColumnRow) -> Bool {
         lhs.column == rhs.column
