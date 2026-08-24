@@ -11,6 +11,7 @@ import UIKit
 
 private protocol BridgeRuntime: AnyObject {
     func listDevices(includeAll: Bool)
+    func setDiscovery(active: Bool, includeAll: Bool)
     func connect(url: String, route: String, logPath: String?)
     func setLogging(enabled: Bool, logPath: String?)
     func openLog(path: String)
@@ -31,6 +32,7 @@ extension RustRuntime: BridgeRuntime {}
 #else
 private final class UnavailableBridgeRuntime: BridgeRuntime {
     func listDevices(includeAll: Bool) {}
+    func setDiscovery(active: Bool, includeAll: Bool) {}
     func connect(url: String, route: String, logPath: String?) {}
     func setLogging(enabled: Bool, logPath: String?) {}
     func openLog(path: String) {}
@@ -293,6 +295,28 @@ final class BridgeClient: ObservableObject {
             "remembered=\(rememberedDeviceURLs.count) discovered=\(discoveredDevices.count) available=\(availableDevices.count)"
         )
         runtime?.listDevices(includeAll: includeAll)
+    }
+
+    /// Start or stop live device discovery. While active, the Rust core
+    /// pushes a fresh deviceList whenever the set of reachable devices
+    /// changes, so the picker needs no polling. Starting again restarts the
+    /// browse with a clean slate (and applies a new includeAll).
+    func setDiscovery(active: Bool, includeAllSerial: Bool? = nil) {
+        startIfNeeded()
+        #if os(iOS)
+        // Browse the local network natively on iOS (the Rust core's raw-socket
+        // mDNS is macOS-only). Idempotent; keeps running and republishes as
+        // devices appear or vanish.
+        if active {
+            bonjourBrowser.start()
+        }
+        #endif
+        if active {
+            refreshAvailableDevices()
+        }
+        let includeAll = includeAllSerial ?? Self.loadShowAllSerialPorts()
+        logDeviceDiscovery("setDiscovery active=\(active) includeAll=\(includeAll)")
+        runtime?.setDiscovery(active: active, includeAll: includeAll)
     }
 
     func debugDevicePicker(_ message: String) {

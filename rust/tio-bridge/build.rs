@@ -8,8 +8,8 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "macos" {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        let plist = std::path::Path::new(&manifest_dir)
-            .join("../../Packaging/TioBridge-Info.plist");
+        let plist =
+            std::path::Path::new(&manifest_dir).join("../../Packaging/TioBridge-Info.plist");
         let plist = plist.canonicalize().unwrap_or(plist);
         println!(
             "cargo:rustc-link-arg-bins=-Wl,-sectcreate,__TEXT,__info_plist,{}",

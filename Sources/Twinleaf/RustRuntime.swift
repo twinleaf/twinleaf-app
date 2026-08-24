@@ -17,6 +17,7 @@ private typealias RustEventCallback = @convention(c) (
 private typealias RuntimeCreateFn = @convention(c) (RustEventCallback?, UInt) -> OpaquePointer?
 private typealias RuntimeDestroyFn = @convention(c) (OpaquePointer?) -> Void
 private typealias RuntimeListDevicesFn = @convention(c) (OpaquePointer?, UInt8) -> Void
+private typealias RuntimeSetDiscoveryFn = @convention(c) (OpaquePointer?, UInt8, UInt8) -> Void
 private typealias RuntimeConnectFn = @convention(c) (
     OpaquePointer?,
     UnsafePointer<CChar>?,
@@ -87,6 +88,13 @@ private func twinleaf_runtime_destroy(_ runtime: OpaquePointer?)
 
 @_silgen_name("twinleaf_runtime_list_devices")
 private func twinleaf_runtime_list_devices(_ runtime: OpaquePointer?, _ includeAll: UInt8)
+
+@_silgen_name("twinleaf_runtime_set_discovery")
+private func twinleaf_runtime_set_discovery(
+    _ runtime: OpaquePointer?,
+    _ active: UInt8,
+    _ includeAll: UInt8
+)
 
 @_silgen_name("twinleaf_runtime_connect")
 private func twinleaf_runtime_connect(
@@ -201,6 +209,7 @@ final class RustRuntime {
 
     private let destroyFn: RuntimeDestroyFn
     private let listDevicesFn: RuntimeListDevicesFn
+    private let setDiscoveryFn: RuntimeSetDiscoveryFn
     private let connectFn: RuntimeConnectFn
     private let setLoggingFn: RuntimeSetLoggingFn
     private let openLogFn: RuntimeOpenLogFn
@@ -223,6 +232,7 @@ final class RustRuntime {
         let createFn: RuntimeCreateFn = twinleaf_runtime_create
         destroyFn = twinleaf_runtime_destroy
         listDevicesFn = twinleaf_runtime_list_devices
+        setDiscoveryFn = twinleaf_runtime_set_discovery
         connectFn = twinleaf_runtime_connect
         setLoggingFn = twinleaf_runtime_set_logging
         openLogFn = twinleaf_runtime_open_log
@@ -247,6 +257,7 @@ final class RustRuntime {
         let createFn: RuntimeCreateFn = try Self.load(library, "twinleaf_runtime_create")
         destroyFn = try Self.load(library, "twinleaf_runtime_destroy")
         listDevicesFn = try Self.load(library, "twinleaf_runtime_list_devices")
+        setDiscoveryFn = try Self.load(library, "twinleaf_runtime_set_discovery")
         connectFn = try Self.load(library, "twinleaf_runtime_connect")
         setLoggingFn = try Self.load(library, "twinleaf_runtime_set_logging")
         openLogFn = try Self.load(library, "twinleaf_runtime_open_log")
@@ -289,6 +300,11 @@ final class RustRuntime {
     func listDevices(includeAll: Bool) {
         logRustRuntime("calling twinleaf_runtime_list_devices includeAll=\(includeAll)")
         listDevicesFn(runtime, includeAll ? 1 : 0)
+    }
+
+    func setDiscovery(active: Bool, includeAll: Bool) {
+        logRustRuntime("calling twinleaf_runtime_set_discovery active=\(active) includeAll=\(includeAll)")
+        setDiscoveryFn(runtime, active ? 1 : 0, includeAll ? 1 : 0)
     }
 
     func connect(url: String, route: String, logPath: String?) {

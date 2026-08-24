@@ -9,38 +9,27 @@ use std::io::{self, BufRead, BufWriter, Write};
 use std::ops::RangeInclusive;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use twinleaf::data::{BoundaryReason, DeviceDataParser, DeviceFullMetadata, Sample};
-use twinleaf::device::capture::{read_capture, CaptureReadout, CaptureRpc};
-use twinleaf::device::{
-    DeviceEvent, DeviceTree, RpcDescriptor, RpcMetaFlags, RpcValueType, TreeEvent,
+use twinleaf::data::ColumnOp;
+use twinleaf::data::{
+    BoundaryReason, ColumnArray, DeviceMetadataSnapshot, LogFile, PacketParser, SampleBatch,
 };
-#[cfg(any(feature = "serial", feature = "mdns"))]
-use twinleaf::device::discovery::{self};
-#[cfg(feature = "serial")]
-use twinleaf::device::discovery::PortInterface;
+use twinleaf::device::capture::{read_capture, CaptureReadout, CaptureRpc};
+use twinleaf::device::discovery::{Discovery, DiscoveryConfig, DiscoveryEvent, PortInterface};
+use twinleaf::device::{
+    DeviceEvent, DeviceTree, NamedRoute, RpcClient, RpcDescriptor, RpcRegistryError, TreeEvent,
+    TreeItem,
+};
 #[cfg(feature = "firmware")]
 use twinleaf::firmware::{self, FirmwareCatalog, FlashEvent, StopOutcome, UpdateStatus};
 use twinleaf::tio::proto::meta::MetadataEpoch;
-use twinleaf::tio::proto::{DeviceRoute, Payload, RpcMethod};
+use twinleaf::tio::proto::{DeviceRoute, Payload, RpcMetaFlags, RpcMethod, RpcValue, RpcValueType};
 use twinleaf::tio::proxy;
-use twinleaf::tio::util::TioRpcReplyable;
 use twinleaf::{tio, Device};
-use welch_sde::{Build, SpectralDensity};
-
-#[cfg(feature = "serial")]
-const DEVICE_LIST_DISCOVERY_WINDOW: Duration = Duration::from_millis(300);
-#[cfg(feature = "serial")]
-const DEVICE_LIST_NAME_RPC_TIMEOUT: Duration = Duration::from_millis(200);
-#[cfg(feature = "serial")]
-const DEVICE_LIST_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
-/// Upper bound on each mDNS browse. `enumerate_mdns` exits early once results
-/// go quiet, so a warm cache resolves well under this; the cap only applies on
-/// a cold first browse. Kept short so periodic refreshes stay snappy.
-#[cfg(feature = "mdns")]
-const MDNS_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(1500);
+use twinleaf_tools::tui::spectral::WelchOp;
 
 const EVENT_JSON: u32 = 0;
 const EVENT_PLOT: u32 = 1;
@@ -601,7 +590,11 @@ fn u64_field(value: &Value, field: &str) -> u64 {
 fn i64_field(value: &Value, field: &str) -> i64 {
     value
         .get(field)
-        .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|value| value as i64)))
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().map(|value| value as i64))
+        })
         .unwrap_or(0)
 }
 
@@ -610,7 +603,9 @@ fn optional_u64(value: Option<&Value>) -> Option<u64> {
         if value.is_null() {
             None
         } else {
-            value.as_u64().or_else(|| value.as_i64().map(|value| value.max(0) as u64))
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().map(|value| value.max(0) as u64))
         }
     })
 }
@@ -681,6 +676,13 @@ fn write_plot_payload<W: Write>(
 )]
 enum ClientCommand {
     ListDevices {
+        include_all: Option<bool>,
+    },
+    /// Start or stop live device discovery for the connection view. While
+    /// active, the bridge pushes a full `deviceList` snapshot whenever the
+    /// set of reachable devices changes.
+    SetDiscovery {
+        active: bool,
         include_all: Option<bool>,
     },
     Connect {
@@ -1386,7 +1388,7 @@ impl SessionLoopProfiler {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AvailableDevice {
     url: String,
@@ -1396,7 +1398,7 @@ struct AvailableDevice {
     routes: Vec<AvailableRoute>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AvailableRoute {
     route: String,
@@ -1412,7 +1414,7 @@ struct DeviceDto {
     streams: Vec<StreamDto>,
     rpcs: Vec<RpcDto>,
     #[serde(skip_serializing)]
-    full_metadata: Option<DeviceFullMetadata>,
+    full_metadata: Option<DeviceMetadataSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1852,10 +1854,7 @@ impl ColumnState {
     }
 
     fn fft_window_sample_count(&self, window_seconds: f64) -> usize {
-        if !window_seconds.is_finite()
-            || !self.sample_rate.is_finite()
-            || self.sample_rate <= 0.0
-        {
+        if !window_seconds.is_finite() || !self.sample_rate.is_finite() || self.sample_rate <= 0.0 {
             return 0;
         }
 
@@ -2255,11 +2254,11 @@ impl PacketLogger {
                     self.bytes_written += raw.len() as u64;
                 }
             }
-            Err(()) => {
+            Err(err) => {
                 self.serialize_errors += 1;
                 if self.serialize_errors <= 3 {
                     emitter.error(format!(
-                        "Failed to serialize packet for log: route={}, payload={}",
+                        "Failed to serialize packet for log: route={}, payload={}: {err:?}",
                         packet.routing,
                         payload_name(&packet.payload)
                     ));
@@ -2307,7 +2306,7 @@ impl PacketLogger {
     fn write_metadata_packets(
         &mut self,
         route: &DeviceRoute,
-        metadata: &DeviceFullMetadata,
+        metadata: &DeviceMetadataSnapshot,
         emitter: &Emitter,
     ) -> usize {
         let before = self.packets_written;
@@ -2511,6 +2510,7 @@ fn main() {
     }));
 
     let emitter = Emitter::new();
+    install_bridge_logger(&emitter);
     emitter.status("ready", "tio-bridge started");
 
     let (command_tx, command_rx) = channel::unbounded::<ClientCommand>();
@@ -2518,6 +2518,7 @@ fn main() {
 
     let mut session_tx: Option<Sender<SessionCommand>> = None;
     let mut playback: Option<PlaybackSession> = None;
+    let mut discovery_hub: Option<DiscoveryHubHandle> = None;
 
     while let Ok(command) = command_rx.recv() {
         match command {
@@ -2527,6 +2528,13 @@ fn main() {
                     "type": "deviceList",
                     "devices": devices
                 }));
+            }
+            ClientCommand::SetDiscovery {
+                active,
+                include_all,
+            } => {
+                discovery_hub = active
+                    .then(|| spawn_discovery_hub(include_all.unwrap_or(false), emitter.clone()));
             }
             ClientCommand::Connect {
                 url,
@@ -2717,6 +2725,46 @@ fn main() {
             }
         }
     }
+    drop(discovery_hub);
+}
+
+/// Routes the twinleaf library's `log` records into the debug event stream.
+/// The library reports diagnostics only through the `log` facade; without a
+/// sink they vanish.
+struct BridgeLogger;
+
+static BRIDGE_LOG_EMITTER: Mutex<Option<Emitter>> = Mutex::new(None);
+static BRIDGE_LOGGER: BridgeLogger = BridgeLogger;
+
+impl log::Log for BridgeLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let line = format!("{} {}: {}", record.level(), record.target(), record.args());
+        if let Ok(guard) = BRIDGE_LOG_EMITTER.lock() {
+            if let Some(emitter) = guard.as_ref() {
+                emitter.debug(line);
+                return;
+            }
+        }
+        eprintln!("{line}");
+    }
+
+    fn flush(&self) {}
+}
+
+fn install_bridge_logger(emitter: &Emitter) {
+    if let Ok(mut guard) = BRIDGE_LOG_EMITTER.lock() {
+        *guard = Some(emitter.clone());
+    }
+    if log::set_logger(&BRIDGE_LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
 }
 
 fn spawn_stdin_reader(command_tx: Sender<ClientCommand>, emitter: Emitter) {
@@ -2745,230 +2793,147 @@ fn spawn_stdin_reader(command_tx: Sender<ClientCommand>, emitter: Emitter) {
         .expect("failed to spawn stdin reader");
 }
 
-fn list_available_devices(include_all: bool) -> Vec<AvailableDevice> {
-    let mut devices = vec![AvailableDevice {
+/// How long the one-shot `listDevices` path browses before reporting.
+/// Discovery keeps producing events past this; the live path (`setDiscovery`)
+/// streams them instead of sampling once.
+const DEVICE_LIST_WINDOW: Duration = Duration::from_millis(1500);
+
+fn local_proxy_row() -> AvailableDevice {
+    AvailableDevice {
         url: "tcp://localhost".to_string(),
         label: "Local tio-proxy".to_string(),
         kind: "tcp".to_string(),
         detail: "tcp://localhost:7855".to_string(),
         routes: Vec::new(),
-    }];
-
-    append_mdns_devices(&mut devices);
-    append_serial_devices(&mut devices, include_all);
-
-    devices
-}
-
-/// Browse the local network for Twinleaf devices advertised over mDNS and add
-/// any that aren't already in the list. No-op when the `mdns` feature is off.
-fn append_mdns_devices(devices: &mut Vec<AvailableDevice>) {
-    #[cfg(feature = "mdns")]
-    {
-        let existing: HashSet<String> = devices.iter().map(|d| d.url.clone()).collect();
-        for found in discovery::enumerate_mdns(MDNS_DISCOVERY_TIMEOUT) {
-            if existing.contains(&found.url) {
-                continue;
-            }
-            let scheme = found.url.split("://").next().unwrap_or("network");
-            devices.push(AvailableDevice {
-                label: found.name.clone().unwrap_or_else(|| found.url.clone()),
-                kind: "network".to_string(),
-                detail: format!("{} · {found_url}", scheme.to_uppercase(), found_url = found.url),
-                url: found.url,
-                routes: Vec::new(),
-            });
-        }
-    }
-    #[cfg(not(feature = "mdns"))]
-    {
-        let _ = devices;
     }
 }
 
-#[cfg(feature = "serial")]
-fn append_serial_devices(devices: &mut Vec<AvailableDevice>, include_all: bool) {
-    let discovered = discovery::enumerate_serial(include_all);
-    #[cfg(target_os = "macos")]
-    let discovered_urls: HashSet<String> =
-        discovered.iter().map(|device| device.url.clone()).collect();
-    let mut probe_candidates = Vec::new();
-    let mut unknown_devices = Vec::new();
-
-    for device in discovered {
-        #[cfg(target_os = "macos")]
-        if should_skip_macos_tty_device(&device.url, &discovered_urls) {
-            continue;
-        }
-
-        match &device.interface {
-            PortInterface::Unknown(_, _) => unknown_devices.push(device),
-            PortInterface::FTDI | PortInterface::STM32 => probe_candidates.push(device),
-            // Network devices come from mDNS, not serial enumeration.
-            PortInterface::Network => {}
-        }
-    }
-
-    let probes: Vec<ListedDevice> = thread::scope(|scope| {
-        let handles: Vec<_> = probe_candidates
-            .into_iter()
-            .map(|device| scope.spawn(move || probe_list_device(device.url, device.interface)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("device list probe thread panicked"))
-            .collect()
-    });
-
-    devices.extend(probes.into_iter().map(available_device_from_probe));
-
-    if include_all {
-        devices.extend(unknown_devices.into_iter().map(|device| {
-            let detail = interface_detail(&device.interface);
-            AvailableDevice {
-                url: device.url,
-                label: "USB serial".to_string(),
-                kind: "USB serial".to_string(),
-                detail,
-                routes: Vec::new(),
-            }
-        }));
+fn discovery_config(include_all: bool) -> DiscoveryConfig {
+    DiscoveryConfig {
+        include_unknown: include_all,
+        network: true,
+        probe_names: true,
+        prefer_udp: false,
     }
 }
 
-#[cfg(feature = "serial")]
-struct ListedDevice {
+/// Folds `DiscoveryEvent`s into the `deviceList` snapshot the UI renders. The
+/// library owns enumeration and probing (names, subdevice routes); this only
+/// maps its events onto the Swift-facing DTOs.
+struct DiscoveryState {
+    entries: Vec<DiscoveredEntry>,
+    network_unavailable: Option<String>,
+}
+
+struct DiscoveredEntry {
     url: String,
     interface: PortInterface,
-    status: ListedStatus,
-}
-
-#[cfg(feature = "serial")]
-enum ListedStatus {
-    Unreachable(String),
-    Silent,
-    Alive(Vec<ListedRoute>),
-}
-
-#[cfg(feature = "serial")]
-struct ListedRoute {
-    route: DeviceRoute,
     name: Option<String>,
+    routes: Option<Vec<AvailableRoute>>,
 }
 
-#[cfg(feature = "serial")]
-fn probe_list_device(url: String, interface: PortInterface) -> ListedDevice {
-    let ifc = proxy::Interface::new_proxy(&url, Some(DEVICE_LIST_CONNECT_TIMEOUT), None);
-    let port = match ifc.subtree_full(DeviceRoute::root()) {
-        Ok(port) => port,
-        Err(error) => {
-            return ListedDevice {
-                url,
-                interface,
-                status: ListedStatus::Unreachable(error.to_string()),
+impl DiscoveryState {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            network_unavailable: None,
+        }
+    }
+
+    fn apply(&mut self, event: DiscoveryEvent) {
+        match event {
+            DiscoveryEvent::Added(device) => {
+                if let Some(entry) = self.entries.iter_mut().find(|e| e.url == device.url) {
+                    if device.name.is_some() {
+                        entry.name = device.name;
+                    }
+                } else {
+                    self.entries.push(DiscoveredEntry {
+                        url: device.url,
+                        interface: device.interface,
+                        name: device.name,
+                        routes: None,
+                    });
+                }
+            }
+            DiscoveryEvent::Named { url, name } => {
+                if let Some(entry) = self.entries.iter_mut().find(|e| e.url == url) {
+                    entry.name = Some(name);
+                }
+            }
+            DiscoveryEvent::Subdevices { url, routes } => {
+                if let Some(entry) = self.entries.iter_mut().find(|e| e.url == url) {
+                    entry.routes = Some(
+                        routes
+                            .into_iter()
+                            .map(|named| AvailableRoute {
+                                route: route_string(&named.route),
+                                name: named.name,
+                            })
+                            .collect(),
+                    );
+                }
+            }
+            DiscoveryEvent::Removed { url } => {
+                self.entries.retain(|e| e.url != url);
+            }
+            DiscoveryEvent::NetworkUnavailable { reason } => {
+                self.network_unavailable = Some(reason);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Vec<AvailableDevice> {
+        let mut devices = vec![local_proxy_row()];
+        devices.extend(self.entries.iter().map(DiscoveredEntry::to_available));
+        devices
+    }
+}
+
+impl DiscoveredEntry {
+    fn to_available(&self) -> AvailableDevice {
+        if matches!(self.interface, PortInterface::Network) {
+            let scheme = self.url.split("://").next().unwrap_or("network");
+            return AvailableDevice {
+                label: self.name.clone().unwrap_or_else(|| self.url.clone()),
+                kind: "network".to_string(),
+                detail: format!("{} \u{b7} {}", scheme.to_uppercase(), self.url),
+                url: self.url.clone(),
+                routes: self.routes.clone().unwrap_or_default(),
             };
         }
-    };
 
-    let mut seen: HashSet<DeviceRoute> = HashSet::new();
-    let deadline = Instant::now() + DEVICE_LIST_DISCOVERY_WINDOW;
-    loop {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            break;
-        };
-        match port.receiver().recv_timeout(remaining) {
-            Ok(packet) => {
-                seen.insert(packet.routing);
-            }
-            Err(_) => break,
-        }
-    }
-
-    if seen.is_empty() {
-        return ListedDevice {
-            url,
-            interface,
-            status: ListedStatus::Silent,
-        };
-    }
-
-    let mut routes: Vec<DeviceRoute> = seen.into_iter().collect();
-    routes.sort();
-    let routes = routes
-        .into_iter()
-        .map(|route| {
-            let name = ifc
-                .new_port(
-                    Some(DEVICE_LIST_NAME_RPC_TIMEOUT),
-                    route.clone(),
-                    0,
-                    false,
-                    false,
-                )
-                .ok()
-                .and_then(|port| port.rpc::<(), String>("dev.name", ()).ok());
-            ListedRoute { route, name }
-        })
-        .collect();
-
-    ListedDevice {
-        url,
-        interface,
-        status: ListedStatus::Alive(routes),
-    }
-}
-
-#[cfg(feature = "serial")]
-fn available_device_from_probe(device: ListedDevice) -> AvailableDevice {
-    let kind = serial_device_kind(&device.interface).to_string();
-    let interface = interface_detail(&device.interface);
-    match device.status {
-        ListedStatus::Unreachable(reason) => AvailableDevice {
-            url: device.url,
-            label: kind.clone(),
-            kind,
-            detail: format!("{interface}; unreachable: {reason}"),
-            routes: Vec::new(),
-        },
-        ListedStatus::Silent => AvailableDevice {
-            url: device.url,
-            label: kind.clone(),
-            kind,
-            detail: format!("{interface}; silent"),
-            routes: Vec::new(),
-        },
-        ListedStatus::Alive(routes) => {
-            let root_name = routes
-                .iter()
-                .find(|route| route.route.len() == 0)
-                .and_then(|route| route.name.as_deref())
-                .filter(|name| !name.is_empty())
-                .map(str::to_string);
-            let routes: Vec<AvailableRoute> = routes
-                .into_iter()
-                .map(|route| AvailableRoute {
-                    route: route_string(&route.route),
-                    name: route.name,
-                })
-                .collect();
+        let kind = serial_device_kind(&self.interface).to_string();
+        let interface = interface_detail(&self.interface);
+        let routes = self.routes.clone().unwrap_or_default();
+        let root_name = routes
+            .iter()
+            .find(|route| route.route == "/")
+            .and_then(|route| route.name.as_deref())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.name.clone());
+        let detail = if self.routes.is_some() {
             let attached_count = routes.iter().filter(|route| route.route != "/").count();
             let attached_detail = match attached_count {
                 0 => "no attached sensors".to_string(),
                 1 => "1 attached sensor".to_string(),
                 count => format!("{count} attached sensors"),
             };
-            AvailableDevice {
-                url: device.url,
-                label: root_name.unwrap_or_else(|| kind.clone()),
-                kind,
-                detail: format!("{interface}; {attached_detail}"),
-                routes,
-            }
+            format!("{interface}; {attached_detail}")
+        } else {
+            interface
+        };
+        AvailableDevice {
+            url: self.url.clone(),
+            label: root_name.unwrap_or_else(|| kind.clone()),
+            kind,
+            detail,
+            routes,
         }
     }
 }
 
-#[cfg(feature = "serial")]
 fn serial_device_kind(interface: &PortInterface) -> &'static str {
     match interface {
         PortInterface::FTDI => "Twinleaf FTDI",
@@ -2978,7 +2943,6 @@ fn serial_device_kind(interface: &PortInterface) -> &'static str {
     }
 }
 
-#[cfg(feature = "serial")]
 fn route_string(route: &DeviceRoute) -> String {
     let route = route.to_string();
     if route.is_empty() {
@@ -2988,18 +2952,6 @@ fn route_string(route: &DeviceRoute) -> String {
     }
 }
 
-#[cfg(all(feature = "serial", target_os = "macos"))]
-fn should_skip_macos_tty_device(url: &str, discovered_urls: &HashSet<String>) -> bool {
-    let Some(callout_url) = url
-        .strip_prefix("serial:///dev/tty.")
-        .map(|suffix| format!("serial:///dev/cu.{suffix}"))
-    else {
-        return false;
-    };
-    discovered_urls.contains(&callout_url)
-}
-
-#[cfg(feature = "serial")]
 fn interface_detail(interface: &PortInterface) -> String {
     match interface {
         PortInterface::FTDI => "VID 0403, PID 6015".to_string(),
@@ -3009,8 +2961,94 @@ fn interface_detail(interface: &PortInterface) -> String {
     }
 }
 
-#[cfg(not(feature = "serial"))]
-fn append_serial_devices(_devices: &mut Vec<AvailableDevice>, _include_all: bool) {}
+fn list_available_devices(include_all: bool) -> Vec<AvailableDevice> {
+    #[cfg(not(any(feature = "serial", feature = "mdns")))]
+    {
+        let _ = include_all;
+        vec![local_proxy_row()]
+    }
+    #[cfg(any(feature = "serial", feature = "mdns"))]
+    {
+        let discovery = Discovery::start(discovery_config(include_all));
+        let mut state = DiscoveryState::new();
+        let deadline = Instant::now() + DEVICE_LIST_WINDOW;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match discovery.events().recv_timeout(remaining) {
+                Ok(event) => state.apply(event),
+                Err(_) => break,
+            }
+        }
+        state.snapshot()
+    }
+}
+
+/// Live device discovery for the connection view: a background thread owns a
+/// `Discovery`, folds its events, and pushes a fresh `deviceList` snapshot
+/// whenever it changes. Dropping the handle stops the thread and the browse.
+struct DiscoveryHubHandle {
+    stop_tx: Sender<()>,
+}
+
+impl Drop for DiscoveryHubHandle {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+    }
+}
+
+fn spawn_discovery_hub(include_all: bool, emitter: Emitter) -> DiscoveryHubHandle {
+    let (stop_tx, stop_rx) = channel::bounded(1);
+    thread::Builder::new()
+        .name("discovery-hub".into())
+        .spawn(move || {
+            let discovery = Discovery::start(discovery_config(include_all));
+            let mut state = DiscoveryState::new();
+            let mut last_snapshot: Option<Vec<AvailableDevice>> = None;
+            let mut warned_network = false;
+
+            let sync = |state: &DiscoveryState,
+                        last_snapshot: &mut Option<Vec<AvailableDevice>>,
+                        warned_network: &mut bool| {
+                if !*warned_network {
+                    if let Some(reason) = state.network_unavailable.as_ref() {
+                        emitter.debug(format!("network discovery unavailable: {reason}"));
+                        *warned_network = true;
+                    }
+                }
+                let snapshot = state.snapshot();
+                if last_snapshot.as_ref() != Some(&snapshot) {
+                    emitter.emit(&json!({
+                        "type": "deviceList",
+                        "devices": snapshot
+                    }));
+                    *last_snapshot = Some(snapshot);
+                }
+            };
+
+            // Serial rows are queued synchronously by `start`, so the first
+            // snapshot is useful immediately.
+            for event in discovery.events().try_iter() {
+                state.apply(event);
+            }
+            sync(&state, &mut last_snapshot, &mut warned_network);
+
+            loop {
+                channel::select! {
+                    recv(discovery.events()) -> event => {
+                        let Ok(event) = event else { return };
+                        state.apply(event);
+                        // Coalesce the burst a probe pass produces.
+                        for event in discovery.events().try_iter() {
+                            state.apply(event);
+                        }
+                        sync(&state, &mut last_snapshot, &mut warned_network);
+                    },
+                    recv(stop_rx) -> _ => return,
+                }
+            }
+        })
+        .expect("failed to spawn discovery hub");
+    DiscoveryHubHandle { stop_tx }
+}
 
 /// Serve several sensors as one device tree on a loopback TCP port: sensor k
 /// is mounted at route /k. The session connects to the returned URL and the
@@ -3090,10 +3128,10 @@ fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, em
     drop(listener);
 
     let (rx_send, client_rx) =
-        tio::port::Port::rx_channel_custom(proxy::Interface::get_client_tx_channel_size());
-    let client = match tio::port::Port::from_tcp_stream_custom(
+        tio::transport::Port::rx_channel_custom(proxy::Interface::get_client_tx_channel_size());
+    let client = match tio::transport::Port::from_tcp_stream_custom(
         stream,
-        tio::port::Port::rx_to_channel(rx_send),
+        tio::transport::Port::rx_to_channel(rx_send),
         proxy::Interface::get_client_rx_channel_size(),
     ) {
         Ok(client) => client,
@@ -3158,13 +3196,16 @@ fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, em
                     emitter.debug(format!("multi-mount: lost the sensor at {}", link.prefix));
                     break;
                 };
-                pkt.routing = link.prefix.absolute_route(&pkt.routing);
+                let Ok(absolute) = link.prefix.absolute_route(&pkt.routing) else {
+                    continue;
+                };
+                pkt.routing = absolute;
                 if pkt.routing.len() > tio::proto::TIO_PACKET_MAX_ROUTING_SIZE {
                     continue;
                 }
                 match client.try_send(pkt) {
                     Ok(()) => {}
-                    Err(tio::SendError::Full) => {
+                    Err(tio::transport::SendError::Full) => {
                         dropped_packets += 1;
                         if dropped_packets.is_power_of_two() {
                             emitter.debug(format!(
@@ -3264,12 +3305,20 @@ impl JitterWindow {
     }
 
     fn std_ms(&self) -> f64 {
-        let n = if self.filled { self.buf.len() } else { self.idx };
+        let n = if self.filled {
+            self.buf.len()
+        } else {
+            self.idx
+        };
         if n == 0 {
             return 0.0;
         }
         let mean = self.buf[..n].iter().sum::<f64>() / n as f64;
-        let var = self.buf[..n].iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+        let var = self.buf[..n]
+            .iter()
+            .map(|x| (x - mean).powi(2))
+            .sum::<f64>()
+            / n as f64;
         var.sqrt()
     }
 }
@@ -3367,29 +3416,32 @@ struct HealthMonitor {
 }
 
 impl HealthMonitor {
-    fn observe(&mut self, sample: &Sample, route: &DeviceRoute, now: Instant) {
-        let key = (route.clone(), sample.stream.stream_id);
+    fn observe_batch(&mut self, batch: &SampleBatch, now: Instant) {
+        let key = (batch.route(), batch.stream_key().stream_id);
         let stats = self.streams.entry(key).or_insert_with(|| StreamHealth {
-            name: sample.stream.name.clone(),
-            session_id: Some(sample.device.session_id),
+            name: batch.stream().name.clone(),
+            session_id: Some(batch.device().session_id),
             ..Default::default()
         });
-        stats.name = sample.stream.name.clone();
+        stats.name = batch.stream().name.clone();
 
-        if let Some(boundary) = &sample.boundary {
-            match &boundary.reason {
-                BoundaryReason::SessionChanged { new, .. } => stats.reset_for_new_session(*new),
+        // A batch carries at most one boundary, anchored at its first row.
+        if let Some(boundary) = batch.boundary() {
+            match boundary.reason {
+                BoundaryReason::SessionChanged { new, .. } => stats.reset_for_new_session(new),
                 BoundaryReason::SamplesLost { expected, received } => {
-                    stats.samples_dropped += u64::from(received.wrapping_sub(*expected));
+                    stats.samples_dropped += u64::from(received.wrapping_sub(expected));
                 }
                 _ => {}
             }
         }
 
-        if stats.last_n.map(|n| sample.n != n).unwrap_or(true) {
-            stats.last_seen = Some(now);
+        for (&n, &t) in batch.sample_numbers().iter().zip(batch.timestamps()) {
+            if stats.last_n.map(|last| n != last).unwrap_or(true) {
+                stats.last_seen = Some(now);
+            }
+            stats.on_sample(n, t, now);
         }
-        stats.on_sample(sample.n, sample.timestamp_end(), now);
     }
 
     /// Drop all streams for a route (device reset / disconnect).
@@ -3428,6 +3480,45 @@ fn finite_or_null(value: f64) -> Value {
     } else {
         Value::Null
     }
+}
+
+enum BridgeTreeMsg {
+    Item(TreeItem),
+    /// The parser panicked inside `recv`; the worker backs off and keeps
+    /// reading, so a malformed packet degrades one drain rather than the
+    /// whole session.
+    Panic(String),
+    Disconnected,
+}
+
+/// Owns the `DeviceTree` on a dedicated thread and forwards its items over a
+/// channel, so the session loop can `select!` across data, commands, proxy
+/// status, and timers. The worker exits when the receiver is dropped.
+fn spawn_bridge_tree_worker(mut tree: DeviceTree) -> Receiver<BridgeTreeMsg> {
+    let (tx, rx) = channel::unbounded();
+    thread::Builder::new()
+        .name("tree-worker".into())
+        .spawn(move || loop {
+            match panic::catch_unwind(AssertUnwindSafe(|| tree.recv())) {
+                Ok(Ok(item)) => {
+                    if tx.send(BridgeTreeMsg::Item(item)).is_err() {
+                        return;
+                    }
+                }
+                Ok(Err(_)) => {
+                    let _ = tx.send(BridgeTreeMsg::Disconnected);
+                    return;
+                }
+                Err(panic) => {
+                    if tx.send(BridgeTreeMsg::Panic(panic_message(panic))).is_err() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(250));
+                }
+            }
+        })
+        .expect("failed to spawn tree worker");
+    rx
 }
 
 fn run_session(
@@ -3471,7 +3562,7 @@ fn run_session(
     };
 
     let (proxy_status_tx, proxy_status_rx) = channel::unbounded();
-    let (status_tx, status_rx) = channel::unbounded();
+    let (status_tx, mut status_rx) = channel::unbounded();
     spawn_proxy_status_forwarder(url.clone(), proxy_status_rx, status_tx, emitter.clone());
     let proxy = Arc::new(proxy::Interface::new_proxy(
         &connect_url,
@@ -3532,20 +3623,24 @@ fn run_session(
             None
         }
     };
-    let mut device_tree = match DeviceTree::open(&proxy, root_route.clone()) {
+    let device_tree = match DeviceTree::open(&proxy, root_route) {
         Ok(tree) => tree,
         Err(err) => {
             emitter.error(format!("Failed to open device tree: {err:?}"));
             return;
         }
     };
+    let mut tree_rx = spawn_bridge_tree_worker(device_tree);
 
     emitter.status("streaming", format!("Streaming from {url}"));
     // Lazily check for available firmware upgrades on a background thread so
     // neither the network round-trip nor the per-device dev.desc RPC blocks the
     // streaming loop.
-    spawn_upgrade_check(Arc::clone(&proxy), discovery.devices.clone(), emitter.clone());
-    let mut last_plot_emit = Instant::now();
+    spawn_upgrade_check(
+        Arc::clone(&proxy),
+        discovery.devices.clone(),
+        emitter.clone(),
+    );
     let mut last_stream_value_emit = Instant::now();
     let mut health = HealthMonitor::default();
     let mut last_health_emit = Instant::now();
@@ -3559,23 +3654,306 @@ fn run_session(
     let mut last_sample_number_by_stream: HashMap<(DeviceRoute, u8), u32> = HashMap::new();
     let mut last_reset_refresh_by_route: HashMap<DeviceRoute, Instant> = HashMap::new();
 
+    // Accumulates across select iterations; recorded and reset on every tick,
+    // so a profile window covers one tick interval like the old poll loop.
+    let mut loop_profile = SessionLoopProfile::default();
+    let mut monitor_rx = packet_monitor_port
+        .as_ref()
+        .map(|port| port.receiver().clone())
+        .unwrap_or_else(channel::never);
+    let tick = channel::tick(Duration::from_millis(10));
+    // Plot frames get their own timer: gating the emit on the 10 ms tick
+    // quantizes a 33 ms budget up to ~40 ms and drops the frame rate.
+    let plot_tick = channel::tick(Duration::from_millis(33));
+
     loop {
-        let loop_start = Instant::now();
-        let mut loop_profile = SessionLoopProfile::default();
+        // Startup commands queued while connecting run before live traffic.
+        let command = if let Some(queued) = pending_startup_commands.pop_front() {
+            Ok(queued)
+        } else {
+            channel::select! {
+                recv(tree_rx) -> msg => {
+                    match msg {
+                        Ok(BridgeTreeMsg::Item(TreeItem::Batch(batch))) => {
+                            let process_start = Instant::now();
+                            let now = Instant::now();
+                            health.observe_batch(&batch, now);
+                            let route = batch.route();
+                            let stream_key = (route, batch.stream_key().stream_id);
+                            // A sample counter that goes backward means the
+                            // device rebooted (its counter restarted).
+                            let mut device_reset = false;
+                            if let (Some(&first_n), Some(&last_n)) = (
+                                batch.sample_numbers().first(),
+                                last_sample_number_by_stream.get(&stream_key),
+                            ) {
+                                if first_n < last_n {
+                                    device_reset = true;
+                                }
+                            }
+                            if let Some(&n) = batch.sample_numbers().last() {
+                                last_sample_number_by_stream.insert(stream_key, n);
+                            }
 
-        let status_start = Instant::now();
-        for status in status_rx.try_iter() {
-            loop_profile.status_events += 1;
-            emitter.emit(&json!({
-                "type": "proxyEvent",
-                "event": format!("{status:?}")
-            }));
-        }
-        loop_profile.status_elapsed = status_start.elapsed();
+                            if let Some(first_row) = batch.row(0) {
+                                let batch_start = first_row.timestamp_begin();
+                                if batch_start.is_finite() {
+                                    log_data_start = Some(
+                                        log_data_start
+                                            .map(|start| start.min(batch_start))
+                                            .unwrap_or(batch_start),
+                                    );
+                                }
+                            }
+                            if let Some(&batch_end) = batch.timestamps().last() {
+                                if batch_end.is_finite() {
+                                    log_data_end = Some(
+                                        log_data_end
+                                            .map(|end| end.max(batch_end))
+                                            .unwrap_or(batch_end),
+                                    );
+                                    latest_stream_timestamp_by_route.insert(route, batch_end);
+                                }
+                            }
+                            log_time_reference_start = earliest_time(
+                                log_time_reference_start,
+                                batch_time_reference_start(&batch),
+                            );
+                            process_batch(
+                                &batch,
+                                &mut column_states,
+                                &active_columns,
+                                &plot_panes,
+                                live_retention_seconds_for_panes(&plot_panes, &view, &derived_channels),
+                                Some(&mut ingest_profiler),
+                            );
+                            loop_profile.samples += batch.len();
+                            loop_profile.process_elapsed += process_start.elapsed();
 
+                            if device_reset {
+                                emitter.debug(format!(
+                                    "sample number went backward on {route}; treating as device reset"
+                                ));
+                                flush_route_history(&route.to_string(), &mut column_states);
+                                fft_workers.clear();
+                                health.reset_route(&route);
+                                // Drop baselines for the route's other streams so their
+                                // first post-reset sample doesn't re-trigger.
+                                last_sample_number_by_stream.retain(|(r, _), _| r != &route);
+
+                                let refresh_due = last_reset_refresh_by_route
+                                    .get(&route)
+                                    .is_none_or(|at| at.elapsed() >= DEVICE_RESET_REFRESH_COOLDOWN);
+                                if refresh_due {
+                                    last_reset_refresh_by_route.insert(route, Instant::now());
+                                    emitter.status(
+                                        "metadata",
+                                        format!("Device on {route} restarted; reloading settings"),
+                                    );
+                                    if refresh_route_metadata(
+                                        &proxy,
+                                        &url,
+                                        &route,
+                                        &root_route,
+                                        &emitter,
+                                        &mut discovery,
+                                        &mut column_states,
+                                        &mut rpc_index,
+                                    ) {
+                                        emit_metadata_devices(&emitter, &discovery.devices);
+                                    }
+                                    emitter.status("streaming", format!("Streaming from {url}"));
+                                }
+                            }
+                        }
+                        Ok(BridgeTreeMsg::Item(TreeItem::Event(event))) => {
+                            let event_start = Instant::now();
+                            loop_profile.device_events += 1;
+                            match event {
+                                TreeEvent::Device { route, event } => {
+                                    if let DeviceEvent::RpcInvalidated(method) = &event {
+                                        emit_rpc_invalidated(&emitter, &route, method);
+                                    }
+                                    emitter.emit(&json!({
+                                        "type": "deviceEvent",
+                                        "route": route.to_string(),
+                                        "event": format!("{event:?}")
+                                    }));
+                                }
+                                TreeEvent::RouteDiscovered(route) => {
+                                    if add_late_discovered_route(
+                                        &proxy,
+                                        &url,
+                                        &route,
+                                        &root_route,
+                                        &emitter,
+                                        &mut discovery,
+                                        &mut column_states,
+                                        &mut rpc_index,
+                                    ) {
+                                        emit_metadata_devices(&emitter, &discovery.devices);
+                                    }
+                                }
+                            }
+                            loop_profile.event_elapsed += event_start.elapsed();
+                        }
+                        Ok(BridgeTreeMsg::Panic(message)) => {
+                            emitter.error(format!(
+                                "Twinleaf parser panic while draining stream data: {message}"
+                            ));
+                        }
+                        Ok(BridgeTreeMsg::Disconnected) | Err(_) => {
+                            emitter.error("Twinleaf stream ended: proxy disconnected");
+                            tree_rx = channel::never();
+                        }
+                    }
+                    continue;
+                },
+                recv(status_rx) -> status => {
+                    match status {
+                        Ok(status) => {
+                            loop_profile.status_events += 1;
+                            emitter.emit(&json!({
+                                "type": "proxyEvent",
+                                "event": format!("{status:?}")
+                            }));
+                        }
+                        Err(_) => status_rx = channel::never(),
+                    }
+                    continue;
+                },
+                recv(monitor_rx) -> packet => {
+                    match packet {
+                        Ok(packet) => {
+                            let raw_log_start = Instant::now();
+                            handle_monitor_packet(
+                                packet,
+                                &root_route,
+                                &mut logger,
+                                &latest_stream_timestamp_by_route,
+                                &emitter,
+                            );
+                            loop_profile.raw_packets += 1;
+                            if let Some(port) = &packet_monitor_port {
+                                loop_profile.raw_packets += drain_packet_monitor_port(
+                                    port,
+                                    &root_route,
+                                    &mut logger,
+                                    &latest_stream_timestamp_by_route,
+                                    &emitter,
+                                );
+                            }
+                            loop_profile.raw_log_elapsed += raw_log_start.elapsed();
+                        }
+                        Err(_) => {
+                            emitter.error("Raw logging port closed");
+                            monitor_rx = channel::never();
+                        }
+                    }
+                    continue;
+                },
+                recv(plot_tick) -> _ => {
+                    let emit_start = Instant::now();
+                    let stats = emit_live_plot(
+                        &emitter,
+                        &column_states,
+                        &active_columns,
+                        &plot_panes,
+                        &mut fft_workers,
+                    );
+                    loop_profile.plot_elapsed = emit_start.elapsed();
+                    if let Some(stats) = stats {
+                        plot_profiler.record(emit_start.elapsed(), stats);
+                        loop_profile.plot_emits = 1;
+                    }
+                    continue;
+                },
+                recv(tick) -> _ => {
+                    let tick_start = Instant::now();
+                    if !discovery.incomplete_rpc_routes.is_empty()
+                        && last_rpc_metadata_recovery.elapsed() >= RPC_METADATA_RECOVERY_INTERVAL
+                    {
+                        if recover_incomplete_rpc_metadata(&proxy, &mut discovery, &emitter) {
+                            rpc_index = build_rpc_index(&discovery.devices);
+                            emit_metadata_devices(&emitter, &discovery.devices);
+                        }
+                        last_rpc_metadata_recovery = Instant::now();
+                    }
+
+                    if !derived_channels.is_empty() {
+                        update_derived_channels(
+                            &derived_channels,
+                            &mut column_states,
+                            &mut derived_worker,
+                            live_retention_seconds_for_panes(&plot_panes, &view, &derived_channels),
+                        );
+                    }
+
+                    if last_stream_value_emit.elapsed() >= Duration::from_millis(100) {
+                        let emit_start = Instant::now();
+                        let value_count = emit_stream_values(&emitter, &column_states);
+                        loop_profile.stream_values = value_count;
+                        loop_profile.stream_value_elapsed = emit_start.elapsed();
+                        stream_value_profiler.record(emit_start.elapsed(), value_count, column_states.len());
+                        last_stream_value_emit = Instant::now();
+                    }
+
+                    if last_health_emit.elapsed() >= HEALTH_EMIT_INTERVAL {
+                        emitter.emit(&health.snapshot(Instant::now()));
+                        last_health_emit = Instant::now();
+                    }
+
+                    if last_log_flush.elapsed() >= Duration::from_secs(1) {
+                        let flush_start = Instant::now();
+                        logger.flush();
+                        if logger.packets_written != last_log_progress_packets {
+                            logger.emit_progress(
+                                &emitter,
+                                log_data_start,
+                                log_data_end,
+                                log_time_reference_start,
+                            );
+                            last_log_progress_packets = logger.packets_written;
+                        }
+                        loop_profile.flushes = 1;
+                        loop_profile.flush_elapsed = flush_start.elapsed();
+                        last_log_flush = Instant::now();
+                    }
+
+                    loop_profile.busy_elapsed = loop_profile.status_elapsed
+                        + loop_profile.command_elapsed
+                        + loop_profile.process_elapsed
+                        + loop_profile.raw_log_elapsed
+                        + loop_profile.event_elapsed
+                        + loop_profile.plot_elapsed
+                        + loop_profile.stream_value_elapsed
+                        + loop_profile.flush_elapsed
+                        + tick_start.elapsed();
+                    loop_profiler.record(
+                        std::mem::take(&mut loop_profile),
+                        column_states.len(),
+                        active_columns.len(),
+                        retained_point_count(&column_states),
+                    );
+                    continue;
+                },
+                recv(command_rx) -> command => command,
+            }
+        };
+
+        let command = match command {
+            Ok(command) => command,
+            Err(_) => {
+                // The client side dropped the command channel; no Stop is
+                // coming, so shut down as if one arrived.
+                logger.flush();
+                emitter.status("disconnected", "Stopped streaming");
+                return;
+            }
+        };
         let command_start = Instant::now();
-        while let Some(command) = next_session_command(&command_rx, &mut pending_startup_commands) {
-            loop_profile.commands += 1;
+        loop_profile.commands += 1;
+        {
             match command {
                 SessionCommand::Stop => {
                     logger.flush();
@@ -3633,8 +4011,7 @@ fn run_session(
                     }
                     let retained: HashSet<_> =
                         channels.iter().map(|channel| channel.key.clone()).collect();
-                    column_states
-                        .retain(|key, _| !key.is_derived() || retained.contains(key));
+                    column_states.retain(|key, _| !key.is_derived() || retained.contains(key));
                     derived_channels = channels;
                     emitter.debug(format!(
                         "derived channels updated: {} active",
@@ -3663,248 +4040,18 @@ fn run_session(
                     emit_view_data(&emitter, request_id, Ok(text));
                 }
                 SessionCommand::CheckUpgrade => {
-                    spawn_upgrade_check(Arc::clone(&proxy), discovery.devices.clone(), emitter.clone());
+                    spawn_upgrade_check(
+                        Arc::clone(&proxy),
+                        discovery.devices.clone(),
+                        emitter.clone(),
+                    );
                 }
                 SessionCommand::PerformUpgrade { route } => {
                     spawn_upgrade_flash(Arc::clone(&proxy), route, emitter.clone());
                 }
             }
         }
-        loop_profile.command_elapsed = command_start.elapsed();
-
-        if !discovery.incomplete_rpc_routes.is_empty()
-            && last_rpc_metadata_recovery.elapsed() >= RPC_METADATA_RECOVERY_INTERVAL
-        {
-            if recover_incomplete_rpc_metadata(&proxy, &mut discovery, &emitter) {
-                rpc_index = build_rpc_index(&discovery.devices);
-                emit_metadata_devices(&emitter, &discovery.devices);
-            }
-            last_rpc_metadata_recovery = Instant::now();
-        }
-
-        let drain_start = Instant::now();
-        let drain_result = panic::catch_unwind(AssertUnwindSafe(|| device_tree.drain()));
-        loop_profile.drain_elapsed = drain_start.elapsed();
-        match drain_result {
-            Ok(Ok(samples)) => {
-                loop_profile.samples = samples.len();
-                let process_start = Instant::now();
-                let sample_now = Instant::now();
-                let mut reset_routes: HashSet<DeviceRoute> = HashSet::new();
-                for (sample, sample_route) in samples {
-                    health.observe(&sample, &sample_route, sample_now);
-                    // A sample counter that goes backward means the device
-                    // rebooted (its counter restarted). Note the route so the
-                    // stale history gets flushed after this batch.
-                    let stream_key = (sample_route.clone(), sample.stream.stream_id);
-                    if let Some(&last_n) = last_sample_number_by_stream.get(&stream_key) {
-                        if sample.n < last_n {
-                            reset_routes.insert(sample_route.clone());
-                        }
-                    }
-                    last_sample_number_by_stream.insert(stream_key, sample.n);
-
-                    let sample_start = sample.timestamp_begin();
-                    let sample_end = sample.timestamp_end();
-                    if sample_start.is_finite() {
-                        log_data_start = Some(
-                            log_data_start
-                                .map(|start| start.min(sample_start))
-                                .unwrap_or(sample_start),
-                        );
-                    }
-                    if sample_end.is_finite() {
-                        log_data_end = Some(
-                            log_data_end
-                                .map(|end| end.max(sample_end))
-                                .unwrap_or(sample_end),
-                        );
-                        latest_stream_timestamp_by_route.insert(sample_route.clone(), sample_end);
-                    }
-                    log_time_reference_start = earliest_time(
-                        log_time_reference_start,
-                        sample_time_reference_start(&sample),
-                    );
-                    process_sample(
-                        &sample,
-                        &sample_route,
-                        &mut column_states,
-                        &active_columns,
-                        &plot_panes,
-                        live_retention_seconds_for_panes(&plot_panes, &view, &derived_channels),
-                        Some(&mut ingest_profiler),
-                    );
-                }
-                loop_profile.process_elapsed = process_start.elapsed();
-
-                for route in reset_routes {
-                    emitter.debug(format!(
-                        "sample number went backward on {route}; treating as device reset"
-                    ));
-                    flush_route_history(&route.to_string(), &mut column_states);
-                    fft_workers.clear();
-                    health.reset_route(&route);
-                    // Drop baselines for the route's other streams so their
-                    // first post-reset sample doesn't re-trigger.
-                    last_sample_number_by_stream.retain(|(r, _), _| r != &route);
-
-                    let refresh_due = last_reset_refresh_by_route
-                        .get(&route)
-                        .is_none_or(|at| at.elapsed() >= DEVICE_RESET_REFRESH_COOLDOWN);
-                    if refresh_due {
-                        last_reset_refresh_by_route.insert(route.clone(), Instant::now());
-                        emitter.status(
-                            "metadata",
-                            format!("Device on {route} restarted; reloading settings"),
-                        );
-                        if refresh_route_metadata(
-                            &proxy,
-                            &url,
-                            &route,
-                            &root_route,
-                            &emitter,
-                            &mut discovery,
-                            &mut column_states,
-                            &mut rpc_index,
-                        ) {
-                            emit_metadata_devices(&emitter, &discovery.devices);
-                        }
-                        emitter.status("streaming", format!("Streaming from {url}"));
-                    }
-                }
-            }
-            Ok(Err(err)) => {
-                emitter.error(format!("Twinleaf stream error: {err:?}"));
-                thread::sleep(Duration::from_millis(250));
-            }
-            Err(err) => {
-                emitter.error(format!(
-                    "Twinleaf parser panic while draining stream data: {}",
-                    panic_message(err)
-                ));
-                thread::sleep(Duration::from_millis(250));
-            }
-        }
-
-        if let Some(port) = &packet_monitor_port {
-            let raw_log_start = Instant::now();
-            loop_profile.raw_packets = drain_packet_monitor_port(
-                port,
-                &root_route,
-                &mut logger,
-                &latest_stream_timestamp_by_route,
-                &emitter,
-            );
-            loop_profile.raw_log_elapsed = raw_log_start.elapsed();
-        }
-
-        let event_start = Instant::now();
-        let device_events = device_tree.drain_events();
-        loop_profile.device_events = device_events.len();
-        let mut new_routes: Vec<DeviceRoute> = Vec::new();
-        for event in device_events {
-            match event {
-                TreeEvent::Device { route, event } => {
-                    if let DeviceEvent::RpcInvalidated(method) = &event {
-                        emit_rpc_invalidated(&emitter, &route, method);
-                    }
-                    emitter.emit(&json!({
-                        "type": "deviceEvent",
-                        "route": route.to_string(),
-                        "event": format!("{event:?}")
-                    }));
-                }
-                TreeEvent::RouteDiscovered(route) => {
-                    new_routes.push(route);
-                }
-            }
-        }
-        let mut devices_changed = false;
-        for route in new_routes {
-            if add_late_discovered_route(
-                &proxy,
-                &url,
-                &route,
-                &root_route,
-                &emitter,
-                &mut discovery,
-                &mut column_states,
-                &mut rpc_index,
-            ) {
-                devices_changed = true;
-            }
-        }
-        if devices_changed {
-            emit_metadata_devices(&emitter, &discovery.devices);
-        }
-        loop_profile.event_elapsed = event_start.elapsed();
-
-        if !derived_channels.is_empty() {
-            update_derived_channels(
-                &derived_channels,
-                &mut column_states,
-                &mut derived_worker,
-                live_retention_seconds_for_panes(&plot_panes, &view, &derived_channels),
-            );
-        }
-
-        if last_plot_emit.elapsed() >= Duration::from_millis(33) {
-            let emit_start = Instant::now();
-            let stats = emit_live_plot(
-                &emitter,
-                &column_states,
-                &active_columns,
-                &plot_panes,
-                &mut fft_workers,
-            );
-            loop_profile.plot_elapsed = emit_start.elapsed();
-            if let Some(stats) = stats {
-                plot_profiler.record(emit_start.elapsed(), stats);
-                loop_profile.plot_emits = 1;
-            }
-            last_plot_emit = Instant::now();
-        }
-
-        if last_stream_value_emit.elapsed() >= Duration::from_millis(100) {
-            let emit_start = Instant::now();
-            let value_count = emit_stream_values(&emitter, &column_states);
-            loop_profile.stream_values = value_count;
-            loop_profile.stream_value_elapsed = emit_start.elapsed();
-            stream_value_profiler.record(emit_start.elapsed(), value_count, column_states.len());
-            last_stream_value_emit = Instant::now();
-        }
-
-        if last_health_emit.elapsed() >= HEALTH_EMIT_INTERVAL {
-            emitter.emit(&health.snapshot(Instant::now()));
-            last_health_emit = Instant::now();
-        }
-
-        if last_log_flush.elapsed() >= Duration::from_secs(1) {
-            let flush_start = Instant::now();
-            logger.flush();
-            if logger.packets_written != last_log_progress_packets {
-                logger.emit_progress(
-                    &emitter,
-                    log_data_start,
-                    log_data_end,
-                    log_time_reference_start,
-                );
-                last_log_progress_packets = logger.packets_written;
-            }
-            loop_profile.flushes = 1;
-            loop_profile.flush_elapsed = flush_start.elapsed();
-            last_log_flush = Instant::now();
-        }
-
-        loop_profile.busy_elapsed = loop_start.elapsed();
-        loop_profiler.record(
-            loop_profile,
-            column_states.len(),
-            active_columns.len(),
-            retained_point_count(&column_states),
-        );
-
-        thread::sleep(Duration::from_millis(10));
+        loop_profile.command_elapsed += command_start.elapsed();
     }
 }
 
@@ -3960,7 +4107,7 @@ fn refresh_route_metadata(
     rpc_index: &mut HashMap<(String, String), RpcDto>,
 ) -> bool {
     let fetched = match panic::catch_unwind(AssertUnwindSafe(|| {
-        fetch_device(proxy, url, route, emitter, false)
+        fetch_device(proxy, url, route, None, emitter, false)
     })) {
         Ok(Ok(fetched)) => fetched,
         Ok(Err(err)) => {
@@ -4139,14 +4286,14 @@ fn run_upgrade_flash(
     route: &str,
     progress: &dyn Fn(&str, Value),
 ) -> Result<(), String> {
-    let device_route = DeviceRoute::from_str(route)
-        .map_err(|_| format!("invalid device route: {route}"))?;
+    let device_route =
+        DeviceRoute::from_str(route).map_err(|_| format!("invalid device route: {route}"))?;
     let port = proxy
         .device_rpc(device_route)
         .map_err(|err| format!("could not open device: {err:?}"))?;
 
-    let installed =
-        firmware::query_installed(&port).map_err(|err| format!("could not read firmware: {err}"))?;
+    let installed = firmware::query_installed(&port)
+        .map_err(|err| format!("could not read firmware: {err}"))?;
     let catalog = firmware::github::GithubCatalog::twinleaf();
     let report = firmware::check_for_update(installed, &catalog)
         .map_err(|err| format!("could not check for update: {err}"))?;
@@ -4225,13 +4372,15 @@ fn add_late_discovered_route(
         return false;
     }
 
-    emitter.debug(format!("route {route} appeared mid-session; fetching metadata"));
+    emitter.debug(format!(
+        "route {route} appeared mid-session; fetching metadata"
+    ));
     emitter.status(
         "metadata",
         format!("Discovering new device on route {route}"),
     );
     let fetched = match panic::catch_unwind(AssertUnwindSafe(|| {
-        fetch_device(proxy, url, route, emitter, false)
+        fetch_device(proxy, url, route, None, emitter, false)
     })) {
         Ok(Ok(fetched)) => fetched,
         Ok(Err(err)) => {
@@ -4299,7 +4448,7 @@ fn recover_incomplete_rpc_metadata(
             continue;
         };
 
-        let RpcFetchResult { rpcs, complete } = fetch_rpcs(&port, &route, emitter);
+        let RpcFetchResult { rpcs, complete } = fetch_rpcs(port, &route, emitter);
         if !rpc_lists_equivalent(&discovery.devices[device_index].rpcs, &rpcs) {
             discovery.devices[device_index].rpcs = rpcs;
             metadata_changed = true;
@@ -4328,6 +4477,29 @@ fn rpc_lists_equivalent(lhs: &[RpcDto], rhs: &[RpcDto]) -> bool {
         })
 }
 
+fn handle_monitor_packet(
+    mut packet: tio::Packet,
+    root_route: &DeviceRoute,
+    logger: &mut PacketLogger,
+    latest_stream_timestamp_by_route: &HashMap<DeviceRoute, f64>,
+    emitter: &Emitter,
+) {
+    // The port's scope guarantees the route resolves; a failure would mean a
+    // packet from outside the subtree, which is safe to drop.
+    let Ok(absolute) = root_route.absolute_route(&packet.routing) else {
+        return;
+    };
+    packet.routing = absolute;
+    emit_tio_log_message(
+        &packet,
+        latest_stream_timestamp_by_route
+            .get(&packet.routing)
+            .copied(),
+        emitter,
+    );
+    logger.write_packet(packet, emitter);
+}
+
 fn drain_packet_monitor_port(
     port: &proxy::Port,
     root_route: &DeviceRoute,
@@ -4338,16 +4510,14 @@ fn drain_packet_monitor_port(
     let mut packet_count = 0;
     loop {
         match port.try_recv() {
-            Ok(mut packet) => {
-                packet.routing = root_route.absolute_route(&packet.routing);
-                emit_tio_log_message(
-                    &packet,
-                    latest_stream_timestamp_by_route
-                        .get(&packet.routing)
-                        .copied(),
+            Ok(packet) => {
+                handle_monitor_packet(
+                    packet,
+                    root_route,
+                    logger,
+                    latest_stream_timestamp_by_route,
                     emitter,
                 );
-                logger.write_packet(packet, emitter);
                 packet_count += 1;
             }
             Err(proxy::RecvError::WouldBlock) => break,
@@ -4399,15 +4569,6 @@ fn spawn_proxy_status_forwarder(
 
 fn is_retryable_connect_url(url: &str) -> bool {
     url.starts_with("udp://") || url.starts_with("tcp://")
-}
-
-fn next_session_command(
-    command_rx: &Receiver<SessionCommand>,
-    pending_commands: &mut VecDeque<SessionCommand>,
-) -> Option<SessionCommand> {
-    pending_commands
-        .pop_front()
-        .or_else(|| command_rx.try_recv().ok())
 }
 
 fn collect_startup_commands(
@@ -4593,45 +4754,52 @@ fn discover_devices(
     emitter: &Emitter,
     report_errors: bool,
 ) -> DeviceDiscoveryResult {
-    let mut routes = HashSet::new();
-
-    if let Ok(discovery_port) = proxy.tree_full() {
-        emitter.debug("opened tree_full discovery port");
-        let mut deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if let Ok(packet) = discovery_port
-                .receiver()
-                .recv_timeout(Duration::from_millis(100))
-            {
-                let route = packet.routing.clone();
-                let payload = payload_name(&packet.payload);
+    // A short-lived tree over the whole topology; `named_routes` observes
+    // heartbeats passively and pairs each route with its dev.name over the
+    // same port. It is a client port on the in-process proxy Interface, not
+    // a second connection to the hardware.
+    let mut named_routes = Vec::new();
+    match proxy.tree_full() {
+        Ok(discovery_port) => {
+            emitter.debug("opened tree_full discovery port");
+            let mut scan = DeviceTree::new(discovery_port, DeviceRoute::root());
+            named_routes = scan.named_routes(Duration::from_secs(2));
+            for named in &named_routes {
                 emitter.debug(format!(
-                    "discovery packet: route={route}, payload={payload}"
+                    "discovered route {} ({})",
+                    named.route,
+                    named.name.as_deref().unwrap_or("unnamed")
                 ));
-                if routes.insert(route.clone()) {
-                    emitter.debug(format!("discovered route {route} from {payload} packet"));
-                    deadline = Instant::now() + Duration::from_secs(2);
-                }
             }
         }
-    } else {
-        emitter.debug("failed to open tree_full discovery port");
+        Err(_) => emitter.debug("failed to open tree_full discovery port"),
     }
 
-    if routes.is_empty() {
+    if named_routes.is_empty() {
         emitter.debug(format!(
-            "no packet-discovered routes; falling back to requested route {root_route}"
+            "no discovered routes; falling back to requested route {root_route}"
         ));
-        routes.insert(root_route.clone());
+        named_routes.push(NamedRoute {
+            route: *root_route,
+            name: None,
+        });
     }
 
     let mut devices = Vec::new();
     let mut incomplete_rpc_routes = HashSet::new();
-    for route in routes {
+    for named in named_routes {
+        let route = named.route;
         emitter.status("metadata", format!("Fetching metadata for route {route}"));
         emitter.debug(format!("fetching device metadata/RPCs for route {route}"));
         match panic::catch_unwind(AssertUnwindSafe(|| {
-            fetch_device(proxy, url, &route, emitter, report_errors)
+            fetch_device(
+                proxy,
+                url,
+                &route,
+                named.name.as_deref(),
+                emitter,
+                report_errors,
+            )
         })) {
             Ok(Ok(fetched)) => {
                 if !fetched.rpc_metadata_complete {
@@ -4752,11 +4920,12 @@ fn fetch_device(
     proxy: &Arc<proxy::Interface>,
     url: &str,
     route: &DeviceRoute,
+    fallback_name: Option<&str>,
     emitter: &Emitter,
     report_errors: bool,
 ) -> Result<FetchedDevice, String> {
     let rpc_fetch = match proxy.device_rpc(route.clone()) {
-        Ok(port) => fetch_rpcs(&port, route, emitter),
+        Ok(port) => fetch_rpcs(port, route, emitter),
         Err(err) => {
             emit_metadata_issue(
                 emitter,
@@ -4770,32 +4939,33 @@ fn fetch_device(
         }
     };
 
-    let (meta, streams, full_metadata) =
-        match panic::catch_unwind(AssertUnwindSafe(|| fetch_stream_metadata(proxy, route))) {
-            Ok(Ok(metadata)) => {
-                let (meta, streams) = metadata_to_stream_dtos(route, &metadata);
-                (meta, streams, Some(metadata))
-            }
-            Ok(Err(err)) => {
-                emit_metadata_issue(
-                    emitter,
-                    report_errors,
-                    format!("Failed to fetch stream metadata for route {route}: {err}"),
-                );
-                (fallback_device_meta(route), Vec::new(), None)
-            }
-            Err(err) => {
-                emit_metadata_issue(
-                    emitter,
-                    report_errors,
-                    format!(
-                        "Twinleaf parser panic while fetching stream metadata for route {route}: {}",
-                        panic_message(err)
-                    ),
-                );
-                (fallback_device_meta(route), Vec::new(), None)
-            }
-        };
+    let (meta, streams, full_metadata) = match panic::catch_unwind(AssertUnwindSafe(|| {
+        fetch_stream_metadata(proxy, route)
+    })) {
+        Ok(Ok(metadata)) => {
+            let (meta, streams) = metadata_to_stream_dtos(route, &metadata);
+            (meta, streams, Some(metadata))
+        }
+        Ok(Err(err)) => {
+            emit_metadata_issue(
+                emitter,
+                report_errors,
+                format!("Failed to fetch stream metadata for route {route}: {err}"),
+            );
+            (fallback_device_meta(route, fallback_name), Vec::new(), None)
+        }
+        Err(err) => {
+            emit_metadata_issue(
+                emitter,
+                report_errors,
+                format!(
+                    "Twinleaf parser panic while fetching stream metadata for route {route}: {}",
+                    panic_message(err)
+                ),
+            );
+            (fallback_device_meta(route, fallback_name), Vec::new(), None)
+        }
+    };
 
     if streams.is_empty() && rpc_fetch.rpcs.is_empty() {
         return Err("No stream metadata or RPC metadata returned".to_string());
@@ -4814,20 +4984,23 @@ fn fetch_device(
     })
 }
 
-fn fallback_device_meta(route: &DeviceRoute) -> DeviceMetaDto {
+fn fallback_device_meta(route: &DeviceRoute, fallback_name: Option<&str>) -> DeviceMetaDto {
     DeviceMetaDto {
         serial_number: String::new(),
         firmware_hash: String::new(),
         n_streams: 0,
         session_id: 0,
-        name: route.to_string(),
+        name: fallback_name
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| route.to_string()),
     }
 }
 
 fn fetch_stream_metadata(
     proxy: &Arc<proxy::Interface>,
     route: &DeviceRoute,
-) -> Result<DeviceFullMetadata, String> {
+) -> Result<DeviceMetadataSnapshot, String> {
     let mut data_device = Device::open(proxy, route.clone()).map_err(|err| format!("{err:?}"))?;
     data_device.get_metadata().map_err(|err| format!("{err:?}"))
 }
@@ -4835,7 +5008,7 @@ fn fetch_stream_metadata(
 fn metadata_to_device_dto(
     url: String,
     route: &DeviceRoute,
-    metadata: &DeviceFullMetadata,
+    metadata: &DeviceMetadataSnapshot,
     rpcs: Vec<RpcDto>,
 ) -> DeviceDto {
     let (meta, streams) = metadata_to_stream_dtos(route, metadata);
@@ -4851,7 +5024,7 @@ fn metadata_to_device_dto(
 
 fn metadata_to_stream_dtos(
     route: &DeviceRoute,
-    metadata: &DeviceFullMetadata,
+    metadata: &DeviceMetadataSnapshot,
 ) -> (DeviceMetaDto, Vec<StreamDto>) {
     let meta = DeviceMetaDto {
         serial_number: metadata.device.serial_number.clone(),
@@ -4901,99 +5074,67 @@ fn metadata_to_stream_dtos(
     (meta, streams)
 }
 
-fn fetch_rpcs(port: &proxy::Port, route: &DeviceRoute, emitter: &Emitter) -> RpcFetchResult {
+fn fetch_rpcs(port: proxy::Port, route: &DeviceRoute, emitter: &Emitter) -> RpcFetchResult {
     emitter.debug(format!("fetching RPC list for route {route}"));
-    let mut rpcs = Vec::new();
-    let count = match retry_rpc_metadata_request(route, "rpc.listinfo count", emitter, || {
-        port.get::<u16>("rpc.listinfo")
-            .map_err(RpcMetadataRequestError::Rpc)
+    let client = RpcClient::new(port);
+    let registry = match retry_rpc_metadata_request(route, "rpc registry", emitter, || {
+        client
+            .registry(route)
+            .map_err(RpcMetadataRequestError::Registry)
     }) {
-        Ok(count) => count,
+        Ok(registry) => registry,
         Err(err) => {
             if matches!(err, RpcMetadataRequestError::Panic(_)) {
                 emitter.error(format!(
-                    "Twinleaf parser panic while counting RPCs for route {route}: {err}"
+                    "Twinleaf parser panic while listing RPCs for route {route}: {err}"
                 ));
             } else {
                 emitter.debug(format!(
-                    "rpc.listinfo count failed for route {route}: {err}"
+                    "rpc registry fetch failed for route {route}: {err}"
                 ));
             }
             return RpcFetchResult {
-                rpcs,
+                rpcs: Vec::new(),
                 complete: false,
             };
         }
     };
 
-    emitter.debug(format!("route {route} reports {count} RPC(s)"));
-    let mut missing_rpcs = 0usize;
-    for rpc_id in 0..count {
-        let label = format!("rpc.listinfo({rpc_id})");
-        let rpc_info = retry_rpc_metadata_request(route, &label, emitter, || {
-            port.raw_rpc("rpc.listinfo", &rpc_id.to_le_bytes())
-                .map_err(RpcMetadataRequestError::Rpc)
-                .and_then(|reply| {
-                    decode_rpc_listinfo_reply(&reply).map_err(RpcMetadataRequestError::Decode)
-                })
-        });
-
-        let (meta_bits, name) = match rpc_info {
-            Ok(info) => info,
-            Err(RpcMetadataRequestError::Panic(err)) => {
-                emitter.error(format!(
-                    "Twinleaf parser panic while reading RPC {rpc_id} for route {route}: {err}"
-                ));
-                continue;
-            }
-            Err(err) => {
-                emitter.debug(format!(
-                    "rpc.listinfo({rpc_id}) failed for route {route}: {err}"
-                ));
-                missing_rpcs += 1;
-                continue;
-            }
-        };
-
-        let descriptor = RpcDescriptor::from_meta(meta_bits, name);
-        let arg_type = rpc_arg_type(&descriptor);
-        let size = rpc_size(&descriptor);
-
-        rpcs.push(RpcDto {
+    let mut rpcs: Vec<RpcDto> = registry
+        .iter()
+        .map(|descriptor| RpcDto {
             route: route.to_string(),
             name: descriptor.full_name.clone(),
-            size,
-            permissions: rpc_permissions(&descriptor),
-            arg_type,
-            readable: rpc_readable(&descriptor),
+            size: rpc_size(descriptor),
+            permissions: rpc_permissions(descriptor),
+            arg_type: rpc_arg_type(descriptor),
+            readable: rpc_readable(descriptor),
             writable: descriptor.meta.flags().contains(RpcMetaFlags::WRITABLE),
             persistent: descriptor.meta.is_persistent(),
-            unknown: rpc_unknown(&descriptor),
+            unknown: rpc_unknown(descriptor),
             value: None,
-        });
-    }
+        })
+        .collect();
 
     rpcs.sort_by(|a, b| a.name.cmp(&b.name));
-    let complete = missing_rpcs == 0 && rpcs.len() == usize::from(count);
-    emitter.debug(format!(
-        "loaded {} of {count} RPC(s) for route {route}",
-        rpcs.len()
-    ));
-    RpcFetchResult { rpcs, complete }
+    emitter.debug(format!("loaded {} RPC(s) for route {route}", rpcs.len()));
+    RpcFetchResult {
+        rpcs,
+        complete: true,
+    }
 }
 
 #[derive(Debug)]
 enum RpcMetadataRequestError {
-    Rpc(proxy::RpcError),
-    Decode(String),
+    Registry(RpcRegistryError),
     Panic(String),
 }
 
 impl std::fmt::Display for RpcMetadataRequestError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Rpc(err) => write!(formatter, "{err:?}"),
-            Self::Decode(err) | Self::Panic(err) => formatter.write_str(err),
+            Self::Registry(err) => write!(formatter, "{err:?}"),
+            Self::Panic(err) => formatter.write_str(err),
         }
     }
 }
@@ -5001,11 +5142,14 @@ impl std::fmt::Display for RpcMetadataRequestError {
 impl RpcMetadataRequestError {
     fn is_retryable(&self) -> bool {
         match self {
-            Self::Rpc(proxy::RpcError::RecvFailed(_)) => true,
-            Self::Rpc(proxy::RpcError::ExecError(payload)) => {
-                matches!(payload.error, tio::proto::RpcErrorCode::Timeout)
-            }
-            Self::Rpc(_) | Self::Decode(_) | Self::Panic(_) => false,
+            Self::Registry(RpcRegistryError::DeviceRpcError(err)) => match err {
+                proxy::RpcError::ResponseLost | proxy::RpcError::Timeout => true,
+                proxy::RpcError::DeviceError(payload) => {
+                    matches!(payload.error, tio::proto::RpcErrorCode::Timeout)
+                }
+                _ => false,
+            },
+            Self::Registry(_) | Self::Panic(_) => false,
         }
     }
 }
@@ -5046,37 +5190,53 @@ where
     unreachable!("retry loop must either return a value or the last error")
 }
 
-fn decode_rpc_listinfo_reply(reply: &[u8]) -> Result<(u16, String), String> {
-    if reply.len() < 2 {
-        return Err(format!(
-            "rpc.listinfo reply too short: {} byte(s)",
-            reply.len()
-        ));
+/// Fold one parsed log batch into the playback ingestion state.
+#[allow(clippy::too_many_arguments)]
+fn ingest_log_batch(
+    batch: &SampleBatch,
+    column_states: &mut HashMap<ColumnKeyDto, ColumnState>,
+    active_columns: &HashSet<ColumnKeyDto>,
+    plot_panes: &[PlotPaneConfig],
+    recording_start: &mut Option<f64>,
+    time_reference_start: &mut Option<f64>,
+    latest_stream_timestamp_by_route: &mut HashMap<DeviceRoute, f64>,
+    samples: &mut usize,
+) {
+    *samples += batch.len();
+    if let Some(first_row) = batch.row(0) {
+        let batch_start = first_row.timestamp_begin();
+        if batch_start.is_finite() {
+            *recording_start = Some(
+                recording_start
+                    .map(|start| start.min(batch_start))
+                    .unwrap_or(batch_start),
+            );
+        }
     }
-
-    let meta_bits = u16::from_le_bytes([reply[0], reply[1]]);
-    let name_bytes = reply[2..].split(|byte| *byte == 0).next().unwrap_or(&[]);
-    if name_bytes.is_empty() {
-        return Err("rpc.listinfo reply did not include a name".to_string());
+    if let Some(&batch_end) = batch.timestamps().last() {
+        if batch_end.is_finite() {
+            latest_stream_timestamp_by_route.insert(batch.route(), batch_end);
+        }
     }
-
-    let name = String::from_utf8_lossy(name_bytes).trim().to_string();
-    if name.is_empty() {
-        return Err("rpc.listinfo reply name was blank".to_string());
-    }
-
-    Ok((meta_bits, name))
+    *time_reference_start = earliest_time(*time_reference_start, batch_time_reference_start(batch));
+    process_batch(
+        batch,
+        column_states,
+        active_columns,
+        plot_panes,
+        f64::INFINITY,
+        None,
+    );
 }
 
 fn load_log_file(path: &str, emitter: &Emitter) -> Result<PlaybackSession, String> {
     emitter.status("loading", format!("Loading log file {path}"));
-    let file_data = std::fs::read(path).map_err(|err| err.to_string())?;
-    if file_data.is_empty() {
+    let log = LogFile::open(Path::new(path)).map_err(|err| err.to_string())?;
+    if log.is_empty() {
         return Err("Log file is empty".to_string());
     }
 
-    let mut rest: &[u8] = &file_data;
-    let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
+    let mut parser = PacketParser::new(DeviceRoute::root(), false).with_batch_rows(4096);
     let mut routes_seen: HashSet<DeviceRoute> = HashSet::new();
     let mut column_states: HashMap<ColumnKeyDto, ColumnState> = HashMap::new();
     let active_columns = HashSet::new();
@@ -5088,101 +5248,78 @@ fn load_log_file(path: &str, emitter: &Emitter) -> Result<PlaybackSession, Strin
     let mut time_reference_start: Option<f64> = None;
     let mut latest_stream_timestamp_by_route: HashMap<DeviceRoute, f64> = HashMap::new();
 
-    while !rest.is_empty() {
-        let (packet, len) = match tio::Packet::deserialize(rest) {
-            Ok(result) => result,
-            Err(err) => {
+    let mut packet_iter = log.packets();
+    loop {
+        let packet = match packet_iter.next() {
+            Some(Ok(packet)) => packet,
+            Some(Err(err)) => {
                 emitter.debug(format!(
                     "stopped log parsing at byte {} of {}: {err:?}",
-                    file_data.len() - rest.len(),
-                    file_data.len()
+                    packet_iter.position(),
+                    log.len()
                 ));
                 break;
             }
+            None => break,
         };
-
-        if len == 0 {
-            break;
-        }
-        rest = &rest[len..];
         packets += 1;
 
-        let route = packet.routing.clone();
+        let route = packet.routing;
         emit_tio_log_message(
             &packet,
             latest_stream_timestamp_by_route.get(&route).copied(),
             emitter,
         );
-        routes_seen.insert(route.clone());
-        let parser = parsers
-            .entry(route.clone())
-            .or_insert_with(|| DeviceDataParser::new(false));
-
-        let parsed_samples =
-            match panic::catch_unwind(AssertUnwindSafe(|| parser.process_packet(&packet))) {
-                Ok(samples) => samples,
-                Err(err) => {
-                    emitter.error(format!(
-                        "Twinleaf parser panic while reading log route {}: {}",
-                        route,
-                        panic_message(err)
-                    ));
-                    Vec::new()
-                }
-            };
-
-        samples += parsed_samples.len();
-        for sample in parsed_samples {
-            let sample_start = sample.timestamp_begin();
-            if sample_start.is_finite() {
-                recording_start = Some(
-                    recording_start
-                        .map(|start| start.min(sample_start))
-                        .unwrap_or(sample_start),
-                );
-            }
-            let sample_end = sample.timestamp_end();
-            if sample_end.is_finite() {
-                latest_stream_timestamp_by_route.insert(route.clone(), sample_end);
-            }
-            time_reference_start =
-                earliest_time(time_reference_start, sample_time_reference_start(&sample));
-            process_sample(
-                &sample,
-                &route,
+        routes_seen.insert(route);
+        if let Err(err) = parser.push_packet(&packet) {
+            emitter.debug(format!("rejected log packet on {route}: {err}"));
+        }
+        while let Some(batch) = parser.pop_batch() {
+            ingest_log_batch(
+                &batch,
                 &mut column_states,
                 &active_columns,
                 &plot_panes,
-                f64::INFINITY,
-                None,
+                &mut recording_start,
+                &mut time_reference_start,
+                &mut latest_stream_timestamp_by_route,
+                &mut samples,
             );
         }
+    }
+    parser.flush();
+    while let Some(batch) = parser.pop_batch() {
+        ingest_log_batch(
+            &batch,
+            &mut column_states,
+            &active_columns,
+            &plot_panes,
+            &mut recording_start,
+            &mut time_reference_start,
+            &mut latest_stream_timestamp_by_route,
+            &mut samples,
+        );
     }
 
     let mut devices = Vec::new();
     let url = format!("file://{path}");
-    for (route, parser) in parsers.iter_mut() {
-        match panic::catch_unwind(AssertUnwindSafe(|| parser.get_metadata())) {
-            Ok(Ok(metadata)) => {
+    for route in parser.routes() {
+        match parser.metadata(route) {
+            Some(metadata) => {
                 devices.push(metadata_to_device_dto(
                     url.clone(),
-                    route,
+                    &route,
                     &metadata,
                     Vec::new(),
                 ));
             }
-            Ok(Err(_)) => {
-                if routes_seen.contains(route) {
+            None => {
+                if routes_seen.contains(&route) {
                     emitter.debug(format!(
                         "log route {route} did not include complete metadata"
                     ));
                 }
             }
-            Err(err) => emitter.error(format!(
-                "Twinleaf parser panic while reading log metadata for route {}: {}",
-                route,
-                panic_message(err)
-            )),
         }
     }
     sort_devices_leaf_first(&mut devices, None);
@@ -5258,8 +5395,8 @@ fn export_log_csv(
     output_path: &Path,
     emitter: &Emitter,
 ) -> Result<ExportSummary, String> {
-    let file_data = std::fs::read(source_path).map_err(|err| err.to_string())?;
-    if file_data.is_empty() {
+    let log = LogFile::open(Path::new(source_path)).map_err(|err| err.to_string())?;
+    if log.is_empty() {
         return Err("Log file is empty".to_string());
     }
 
@@ -5285,53 +5422,25 @@ fn export_log_csv(
     )
     .map_err(|err| err.to_string())?;
 
-    let mut rest: &[u8] = &file_data;
-    let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
-    let mut packets = 0usize;
+    let index = log.scan(DeviceRoute::root(), false);
+    let packets = index.summary().packet_count();
     let mut samples = 0usize;
     let mut rows = 0usize;
 
-    while !rest.is_empty() {
-        let (packet, len) = match tio::Packet::deserialize(rest) {
-            Ok(result) => result,
+    for batch in index.batches(4096) {
+        let batch = match batch {
+            Ok(batch) => batch,
             Err(err) => {
                 emitter.debug(format!(
                     "stopped CSV export parsing at byte {} of {}: {err:?}",
-                    file_data.len() - rest.len(),
-                    file_data.len()
+                    err.offset(),
+                    log.len()
                 ));
                 break;
             }
         };
-
-        if len == 0 {
-            break;
-        }
-        rest = &rest[len..];
-        packets += 1;
-
-        let route = packet.routing.clone();
-        let parser = parsers
-            .entry(route.clone())
-            .or_insert_with(|| DeviceDataParser::new(false));
-        let parsed_samples =
-            match panic::catch_unwind(AssertUnwindSafe(|| parser.process_packet(&packet))) {
-                Ok(samples) => samples,
-                Err(err) => {
-                    emitter.error(format!(
-                        "Twinleaf parser panic while exporting CSV route {}: {}",
-                        route,
-                        panic_message(err)
-                    ));
-                    Vec::new()
-                }
-            };
-
-        samples += parsed_samples.len();
-        for sample in parsed_samples {
-            rows += write_sample_csv_records(&mut writer, &route, &sample)
-                .map_err(|err| err.to_string())?;
-        }
+        samples += batch.len();
+        rows += write_batch_csv_records(&mut writer, &batch).map_err(|err| err.to_string())?;
     }
 
     writer.flush().map_err(|err| err.to_string())?;
@@ -5345,37 +5454,38 @@ fn export_log_csv(
     Ok(ExportSummary { rows, bytes: 0 })
 }
 
-fn write_sample_csv_records<W: Write>(
-    writer: &mut W,
-    route: &DeviceRoute,
-    sample: &Sample,
-) -> io::Result<usize> {
-    let route = route.to_string();
-    let session_id = sample.device.session_id.to_string();
-    let stream_id = sample.stream.stream_id.to_string();
-    let segment_id = sample.segment.segment_id.to_string();
-    let sample_number = sample.n.to_string();
-    let timestamp = format!("{:.17}", sample.timestamp_end());
+fn write_batch_csv_records<W: Write>(writer: &mut W, batch: &SampleBatch) -> io::Result<usize> {
+    let route = batch.route().to_string();
+    let device = batch.device();
+    let stream = batch.stream();
+    let session_id = device.session_id.to_string();
+    let stream_id = batch.stream_key().stream_id.to_string();
+    let segment_id = batch.segment().segment_id.to_string();
     let mut rows = 0usize;
 
-    for column in &sample.columns {
-        let fields = vec![
-            route.clone(),
-            sample.device.name.clone(),
-            session_id.clone(),
-            stream_id.clone(),
-            sample.stream.name.clone(),
-            segment_id.clone(),
-            sample_number.clone(),
-            timestamp.clone(),
-            column.desc.index.to_string(),
-            column.desc.name.clone(),
-            column.desc.units.clone(),
-            format!("{:?}", column.desc.data_type),
-            column.value.to_string(),
-        ];
-        write_csv_record(writer, &fields)?;
-        rows += 1;
+    for row in batch.iter() {
+        let sample_number = row.n().to_string();
+        let timestamp = format!("{:.17}", row.timestamp_end());
+        for (series, value) in batch.schema().iter().zip(row.values()) {
+            let metadata = series.metadata();
+            let fields = vec![
+                route.clone(),
+                device.name.clone(),
+                session_id.clone(),
+                stream_id.clone(),
+                stream.name.clone(),
+                segment_id.clone(),
+                sample_number.clone(),
+                timestamp.clone(),
+                series.index().to_string(),
+                metadata.name.clone(),
+                metadata.units.clone(),
+                format!("{:?}", metadata.data_type),
+                value.to_string(),
+            ];
+            write_csv_record(writer, &fields)?;
+            rows += 1;
+        }
     }
 
     Ok(rows)
@@ -5388,72 +5498,45 @@ fn export_log_hdf5(
     emitter: &Emitter,
 ) -> Result<ExportSummary, String> {
     use twinleaf::data::export::{Hdf5Appender, RunSplitLevel, SplitPolicy};
-    use twinleaf::tio::proto::identifiers::StreamKey;
 
-    let file_data = std::fs::read(source_path).map_err(|err| err.to_string())?;
-    if file_data.is_empty() {
+    let log = LogFile::open(Path::new(source_path)).map_err(|err| err.to_string())?;
+    if log.is_empty() {
         return Err("Log file is empty".to_string());
     }
 
-    let mut writer = Hdf5Appender::with_options(
+    // The export flow writes into a file the save panel already created (the
+    // sandbox grants access to that exact path), so overwriting is confirmed
+    // by construction; `with_options` would refuse the existing file.
+    let mut writer = Hdf5Appender::with_overwrite_options(
         output_path,
         true,
         false,
         None,
-        65_536,
         SplitPolicy::default(),
         RunSplitLevel::default(),
     )
     .map_err(|err| format!("Failed to create HDF5 export: {err:?}"))?;
 
-    let mut rest: &[u8] = &file_data;
-    let mut parsers: HashMap<DeviceRoute, DeviceDataParser> = HashMap::new();
-    let mut packets = 0usize;
+    let index = log.scan(DeviceRoute::root(), false);
+    let packets = index.summary().packet_count();
     let mut samples = 0usize;
 
-    while !rest.is_empty() {
-        let (packet, len) = match tio::Packet::deserialize(rest) {
-            Ok(result) => result,
+    for batch in index.batches(65_536) {
+        let batch = match batch {
+            Ok(batch) => batch,
             Err(err) => {
                 emitter.debug(format!(
                     "stopped HDF5 export parsing at byte {} of {}: {err:?}",
-                    file_data.len() - rest.len(),
-                    file_data.len()
+                    err.offset(),
+                    log.len()
                 ));
                 break;
             }
         };
-
-        if len == 0 {
-            break;
-        }
-        rest = &rest[len..];
-        packets += 1;
-
-        let route = packet.routing.clone();
-        let parser = parsers
-            .entry(route.clone())
-            .or_insert_with(|| DeviceDataParser::new(false));
-        let parsed_samples =
-            match panic::catch_unwind(AssertUnwindSafe(|| parser.process_packet(&packet))) {
-                Ok(samples) => samples,
-                Err(err) => {
-                    emitter.error(format!(
-                        "Twinleaf parser panic while exporting HDF5 route {}: {}",
-                        route,
-                        panic_message(err)
-                    ));
-                    Vec::new()
-                }
-            };
-
-        samples += parsed_samples.len();
-        for sample in parsed_samples {
-            let key = StreamKey::new(route.clone(), sample.stream.stream_id);
-            writer
-                .write_sample(sample, key)
-                .map_err(|err| format!("HDF5 write failed: {err:?}"))?;
-        }
+        samples += batch.len();
+        writer
+            .write_batch(batch)
+            .map_err(|err| format!("HDF5 write failed: {err:?}"))?;
     }
 
     let stats = writer
@@ -5541,9 +5624,8 @@ fn build_rpc_index(devices: &[DeviceDto]) -> HashMap<(String, String), RpcDto> {
     index
 }
 
-fn process_sample(
-    sample: &Sample,
-    route: &DeviceRoute,
+fn process_batch(
+    batch: &SampleBatch,
     column_states: &mut HashMap<ColumnKeyDto, ColumnState>,
     active_columns: &HashSet<ColumnKeyDto>,
     plot_panes: &[PlotPaneConfig],
@@ -5555,21 +5637,16 @@ fn process_sample(
     let mut display_elapsed = Duration::ZERO;
     let mut processed_columns = 0usize;
     let mut active_hits = 0usize;
+    let route = batch.route();
     let route_string = route.to_string();
-    for column in &sample.columns {
-        let Some(value) = column.value.try_as_f64() else {
-            continue;
-        };
-        let key = ColumnKeyDto::raw(
-            route_string.clone(),
-            sample.stream.stream_id,
-            column.desc.index,
-        );
-
-        let point = Point {
-            x: sample.timestamp_end(),
-            y: value,
-        };
+    let stream_id = batch.stream_key().stream_id;
+    let segment = batch.segment();
+    let effective_rate = segment.sampling_rate as f64 / segment.decimation.max(1) as f64;
+    let timestamps = batch.timestamps();
+    // Per-column bookkeeping hoists out of the row loop: a batch covers one
+    // (route, stream), so key, pane filter, and rate are loop-invariant.
+    for series in batch.schema() {
+        let key = ColumnKeyDto::raw(route_string.clone(), stream_id, series.index());
 
         let active_fpcs_panes: Vec<_> = plot_panes
             .iter()
@@ -5586,18 +5663,14 @@ fn process_sample(
                 active_key.stream_id == key.stream_id && active_key.column_index == key.column_index
             });
         if is_active {
-            active_hits += 1;
+            active_hits += batch.len();
         }
 
-        let effective_rate =
-            sample.segment.sampling_rate as f64 / sample.segment.decimation.max(1) as f64;
+        let metadata = series.metadata();
         let state = column_states.entry(key.clone()).or_insert_with(|| {
             ColumnState::new(
-                format!(
-                    "{} stream {} column {}",
-                    route, sample.stream.stream_id, column.desc.index
-                ),
-                column.desc.units.clone(),
+                format!("{} stream {} column {}", route, stream_id, series.index()),
+                metadata.units.clone(),
                 effective_rate,
             )
         });
@@ -5612,10 +5685,39 @@ fn process_sample(
         {
             state.sample_rate = effective_rate;
         }
-        display_elapsed += state.push_raw_profiled(point, max_window_seconds, profile_enabled);
-        processed_columns += 1;
-        for (pane_id, view) in active_fpcs_panes {
-            state.process_fpcs_point(pane_id, &view, point);
+        let mut push_point = |state: &mut ColumnState, point: Point| {
+            display_elapsed += state.push_raw_profiled(point, max_window_seconds, profile_enabled);
+            processed_columns += 1;
+            for (pane_id, view) in &active_fpcs_panes {
+                state.process_fpcs_point(*pane_id, view, point);
+            }
+        };
+        match series.values() {
+            ColumnArray::F64(values) => {
+                for (i, &y) in values.iter().enumerate() {
+                    push_point(
+                        state,
+                        Point {
+                            x: timestamps[i],
+                            y,
+                        },
+                    );
+                }
+            }
+            values => {
+                for i in 0..values.len() {
+                    let Some(y) = values.get(i).try_as_f64() else {
+                        continue;
+                    };
+                    push_point(
+                        state,
+                        Point {
+                            x: timestamps[i],
+                            y,
+                        },
+                    );
+                }
+            }
         }
     }
     if let (Some(start), Some(profiler)) = (profile_start, profiler.as_deref_mut()) {
@@ -5980,7 +6082,9 @@ const MAX_RAW_POINTS_PER_STREAM: usize = 100_000;
 
 fn live_retention_seconds(view: &ViewConfig) -> f64 {
     let window = view.window_seconds.max(1.0);
-    (window * 1.5).max(window + 5.0).clamp(10.0, MAX_RETENTION_SECONDS)
+    (window * 1.5)
+        .max(window + 5.0)
+        .clamp(10.0, MAX_RETENTION_SECONDS)
 }
 
 /// Retention has to cover the longest derived window as well as the widest
@@ -6036,14 +6140,15 @@ fn earliest_time(current: Option<f64>, candidate: Option<f64>) -> Option<f64> {
     }
 }
 
-fn sample_time_reference_start(sample: &Sample) -> Option<f64> {
-    if sample.segment.time_ref_session_id == 0 {
+fn batch_time_reference_start(batch: &SampleBatch) -> Option<f64> {
+    let segment = batch.segment();
+    if segment.time_ref_session_id == 0 {
         return None;
     }
 
-    match &sample.segment.time_ref_epoch {
+    match &segment.time_ref_epoch {
         MetadataEpoch::Unix | MetadataEpoch::Systime => {
-            let start = sample.timestamp_begin();
+            let start = batch.row(0)?.timestamp_begin();
             if start.is_finite() && start > 0.0 {
                 Some(start)
             } else {
@@ -6387,13 +6492,8 @@ fn emit_live_timeseries_plot(
     view: &ViewConfig,
     shared_view_end: Option<f64>,
 ) -> PlotEmitStats {
-    let (view_end, series, point_count) = build_live_timeseries_series(
-        pane_id,
-        column_states,
-        pane_columns,
-        view,
-        shared_view_end,
-    );
+    let (view_end, series, point_count) =
+        build_live_timeseries_series(pane_id, column_states, pane_columns, view, shared_view_end);
 
     if let Err(err) = emitter.emit_plot_frame(pane_id, PlotMode::Timeseries, view_end, &series) {
         emitter.debug(format!("failed to emit binary timeseries plot: {err}"));
@@ -6881,167 +6981,24 @@ fn fft_points(points: &[Point], sample_rate: f64, detrend: DetrendMethod) -> Vec
 
     let y: Vec<f64> = points.iter().map(|point| point.y).collect();
     let y = detrended_values(&y, detrend);
+    let timestamps: Vec<f64> = points.iter().map(|point| point.x).collect();
 
-    let welch: SpectralDensity<f64> = SpectralDensity::builder(&y, sample_rate).build();
-    let psd = welch.periodogram();
-    let frequencies = bin_frequencies(psd.len(), welch.dft_size, sample_rate);
-    let asd: Vec<f64> = one_sided_amplitude_density(&psd);
-
-    frequencies
-        .into_iter()
-        .zip(asd)
-        .map(|(x, y)| Point { x, y })
-        .collect()
-}
-
-
-
-/// Centre frequencies of the bins `welch-sde` returns.
-///
-/// Its own `frequency()` spreads the `n` bins evenly over `0..=fs/2` as
-/// `i * fs / (2 * (n - 1))`, which puts the last bin exactly at Nyquist. But
-/// those bins are the first `n = dft_size / 2` DFT bins, spaced `fs / dft_size`
-/// apart, so the last one sits one spacing *below* Nyquist. The crate's mapping
-/// therefore stretches the whole axis by `n / (n - 1)` — about 0.05% for a
-/// 4096-point transform, and proportionally worse for the short transforms a
-/// brief window produces.
-fn bin_frequencies(bin_count: usize, dft_size: usize, sample_rate: f64) -> Vec<f64> {
-    if dft_size == 0 {
-        return Vec::new();
+    // Detrending stays app-side (`WelchOp` has none); the Welch estimate
+    // itself is the library's, shared with `tio monitor`.
+    let mut op = WelchOp::new(y.len(), sample_rate, 0.0);
+    op.update_batch(&timestamps, &ColumnArray::F64(y.into()));
+    match op.output() {
+        Ok(data) => data.points.iter().map(|&(x, y)| Point { x, y }).collect(),
+        Err(_) => Vec::new(),
     }
-    let spacing = sample_rate / dft_size as f64;
-    (0..bin_count).map(|index| index as f64 * spacing).collect()
-}
-
-/// Convert `welch-sde`'s spectral density to a one-sided amplitude density.
-///
-/// The crate windows a real signal into the real part of a complex buffer and
-/// transforms it, so the resulting spectrum is Hermitian: `X[N-k]` is the
-/// conjugate of `X[k]` and the two have identical magnitude. The negative
-/// frequencies are a mirror of the positive ones, not independent data — the
-/// in-phase and quadrature parts of each bin are already combined by
-/// `norm_sqr()`. The crate keeps the first `dft_size / 2` bins and scales them
-/// by `1 / (sum(w^2) * n_segment * fs)`, omitting the factor of two that folds
-/// the mirror back on. What it returns is therefore a *two-sided* density:
-/// integrating it over the frequencies it reports comes to half the signal
-/// variance.
-///
-/// A figure quoted in `units/sqrt(Hz)` is conventionally one-sided, so every
-/// bin that has a mirror partner carries twice the power. Only DC is exempt:
-/// the Nyquist bin would be too, but `dft_size / 2` bins spans indices
-/// `0..dft_size/2 - 1`, so Nyquist (index `dft_size / 2`) is never among them
-/// and the last kept bin is an ordinary mirrored one.
-fn one_sided_amplitude_density(psd: &[f64]) -> Vec<f64> {
-    psd.iter()
-        .enumerate()
-        .map(|(index, power)| {
-            if index == 0 {
-                power.sqrt()
-            } else {
-                (2.0 * power).sqrt()
-            }
-        })
-        .collect()
 }
 
 /// Estimate the flat, broadband ASD level while rejecting low-frequency 1/f
-/// content and narrow spectral peaks.
-///
-/// Equal-sized frequency bands make the band medians insensitive to narrow
-/// peaks. The quiet quartile of all but the lowest bands identifies the white
-/// plateau without assuming a fixed corner frequency. Only bands close to
-/// that plateau contribute samples, and a final one-sided MAD clip removes
-/// any peaks that survived their band's median.
+/// content and narrow spectral peaks. The estimator originated here and moved
+/// upstream into twinleaf-tools; this adapts it to the plot `Point` type.
 fn estimate_white_noise_floor(points: &[Point]) -> Option<f64> {
-    let log_values: Vec<f64> = points
-        .iter()
-        .filter(|point| point.x.is_finite() && point.x > 0.0 && point.y.is_finite() && point.y > 0.0)
-        .map(|point| point.y.ln())
-        .collect();
-    if log_values.len() < 16 {
-        return None;
-    }
-
-    let band_count = (log_values.len() / 16).clamp(8, 32).min(log_values.len());
-    let band_size = log_values.len().div_ceil(band_count);
-    let bands: Vec<&[f64]> = log_values.chunks(band_size).collect();
-    if bands.len() < 4 {
-        return None;
-    }
-
-    // Never seed the plateau from the lowest 1/8 of the frequency bands.
-    let low_band_count = (bands.len() / 8).max(1);
-    let mut usable_band_medians: Vec<f64> = bands[low_band_count..]
-        .iter()
-        .filter_map(|band| median(band))
-        .collect();
-    if usable_band_medians.len() < 3 {
-        return None;
-    }
-    usable_band_medians.sort_by(f64::total_cmp);
-
-    // A lower-quartile seed is resistant to both 1/f bands and broad peaks,
-    // while remaining representative of a noisy white plateau.
-    let plateau_seed = quantile_sorted(&usable_band_medians, 0.25)?;
-    let lower_half_end = usable_band_medians.len().div_ceil(2);
-    let lower_half = &usable_band_medians[..lower_half_end];
-    let band_mad = median_absolute_deviation(lower_half, plateau_seed).unwrap_or(0.0);
-    let plateau_tolerance = (3.0 * 1.4826 * band_mad).clamp((1.5_f64).ln(), (2.0_f64).ln());
-
-    let mut candidates = Vec::new();
-    for band in &bands[low_band_count..] {
-        let Some(band_median) = median(band) else {
-            continue;
-        };
-        if band_median <= plateau_seed + plateau_tolerance {
-            candidates.extend_from_slice(band);
-        }
-    }
-    if candidates.len() < 8 {
-        return None;
-    }
-
-    // Iterative, upper-only clipping preserves the center of the broadband
-    // distribution while removing spectral lines at any amplitude.
-    for _ in 0..4 {
-        let Some(center) = median(&candidates) else {
-            return None;
-        };
-        let mad = median_absolute_deviation(&candidates, center).unwrap_or(0.0);
-        let upper_limit = center + (3.5 * 1.4826 * mad).max((1.5_f64).ln());
-        let previous_len = candidates.len();
-        candidates.retain(|value| *value <= upper_limit);
-        if candidates.len() == previous_len || candidates.len() < 8 {
-            break;
-        }
-    }
-
-    median(&candidates).map(f64::exp).filter(|value| value.is_finite() && *value > 0.0)
-}
-
-fn median(values: &[f64]) -> Option<f64> {
-    let mut sorted: Vec<f64> = values.iter().copied().filter(|value| value.is_finite()).collect();
-    if sorted.is_empty() {
-        return None;
-    }
-    sorted.sort_by(f64::total_cmp);
-    quantile_sorted(&sorted, 0.5)
-}
-
-fn median_absolute_deviation(values: &[f64], center: f64) -> Option<f64> {
-    let deviations: Vec<f64> = values.iter().map(|value| (value - center).abs()).collect();
-    median(&deviations)
-}
-
-fn quantile_sorted(sorted: &[f64], quantile: f64) -> Option<f64> {
-    if sorted.is_empty() {
-        return None;
-    }
-    let position = quantile.clamp(0.0, 1.0) * (sorted.len() - 1) as f64;
-    let lower = position.floor() as usize;
-    let upper = position.ceil() as usize;
-    let fraction = position - lower as f64;
-    Some(sorted[lower] + (sorted[upper] - sorted[lower]) * fraction)
+    let pairs: Vec<(f64, f64)> = points.iter().map(|point| (point.x, point.y)).collect();
+    twinleaf_tools::tui::spectral::estimate_white_noise_floor(&pairs)
 }
 
 fn detrended_values(y: &[f64], detrend: DetrendMethod) -> Vec<f64> {
@@ -7202,7 +7159,17 @@ fn dispatch_rpc(
         let error_emitter = emitter.clone();
         if let Err(err) = thread::Builder::new()
             .name("twinleaf-capture-rpc".into())
-            .spawn(move || execute_rpc(&proxy, rpc_meta, request_id, route, name, arg, &worker_emitter))
+            .spawn(move || {
+                execute_rpc(
+                    &proxy,
+                    rpc_meta,
+                    request_id,
+                    route,
+                    name,
+                    arg,
+                    &worker_emitter,
+                )
+            })
         {
             error_emitter.emit(&json!({
                 "type": "rpcResult",
@@ -7434,7 +7401,7 @@ fn rpc_size(descriptor: &RpcDescriptor) -> usize {
     }
 
     match descriptor.meta.kind() {
-        RpcValueType::String { max_len } => max_len.map(usize::from).unwrap_or(0),
+        RpcValueType::String { max_len } => max_len.map(|len| usize::from(len.get())).unwrap_or(0),
         _ => descriptor.meta.size_bytes().unwrap_or(0),
     }
 }
@@ -7465,35 +7432,77 @@ fn is_capture_rpc_name(name: &str) -> bool {
     name.rsplit('.').next() == Some("capture")
 }
 
+/// Map the Swift-facing base-type vocabulary onto the library's value types.
+/// `bool` travels as a one-byte unsigned integer on the wire.
+fn rpc_value_type_for(base_type: &str) -> Option<RpcValueType> {
+    let value_type = match base_type {
+        "bool" | "u8" => RpcValueType::Int {
+            signed: false,
+            size: 1,
+        },
+        "u16" => RpcValueType::Int {
+            signed: false,
+            size: 2,
+        },
+        "u32" => RpcValueType::Int {
+            signed: false,
+            size: 4,
+        },
+        "u64" => RpcValueType::Int {
+            signed: false,
+            size: 8,
+        },
+        "i8" => RpcValueType::Int {
+            signed: true,
+            size: 1,
+        },
+        "i16" => RpcValueType::Int {
+            signed: true,
+            size: 2,
+        },
+        "i32" => RpcValueType::Int {
+            signed: true,
+            size: 4,
+        },
+        "i64" => RpcValueType::Int {
+            signed: true,
+            size: 8,
+        },
+        "f32" => RpcValueType::Float { size: 4 },
+        "f64" => RpcValueType::Float { size: 8 },
+        "string" => RpcValueType::String { max_len: None },
+        _ => return None,
+    };
+    Some(value_type)
+}
+
 fn bytes_to_json_value(reply_bytes: &[u8], rpc_type: &str) -> Option<Value> {
-    let base_type = rpc_type.split('<').next().unwrap_or(rpc_type);
+    let base_type = rpc_base_type(rpc_type);
     if reply_bytes.is_empty() {
         return match base_type {
             "string" => Some(json!("")),
             _ => Some(Value::Null),
         };
     }
+    if matches!(base_type, "unit" | "" | "missing") {
+        return Some(Value::Null);
+    }
 
-    match base_type {
-        "unit" | "" | "missing" => Some(Value::Null),
-        "bool" => u8::from_reply(reply_bytes)
-            .ok()
-            .map(|value| json!(value != 0)),
-        "u8" => u8::from_reply(reply_bytes).ok().map(|value| json!(value)),
-        "u16" => u16::from_reply(reply_bytes).ok().map(|value| json!(value)),
-        "u32" => u32::from_reply(reply_bytes).ok().map(|value| json!(value)),
-        "u64" => u64::from_reply(reply_bytes).ok().map(|value| json!(value)),
-        "i8" => i8::from_reply(reply_bytes).ok().map(|value| json!(value)),
-        "i16" => i16::from_reply(reply_bytes).ok().map(|value| json!(value)),
-        "i32" => i32::from_reply(reply_bytes).ok().map(|value| json!(value)),
-        "i64" => i64::from_reply(reply_bytes).ok().map(|value| json!(value)),
-        "f32" => f32::from_reply(reply_bytes).ok().map(|value| json!(value)),
-        "f64" => f64::from_reply(reply_bytes).ok().map(|value| json!(value)),
-        "string" => {
-            let string_bytes = reply_bytes
-                .split(|byte| *byte == 0)
-                .next()
-                .unwrap_or(reply_bytes);
+    let value = rpc_value_type_for(base_type)?.decode(reply_bytes).ok()?;
+    match (base_type, value) {
+        ("bool", RpcValue::U64(value)) => Some(json!(value != 0)),
+        // Serialize at the wire width so a float reads back as the short
+        // decimal the device stores, not its f64-widened expansion.
+        ("f32", RpcValue::F64(value)) => Some(json!(value as f32)),
+        (_, RpcValue::U64(value)) => Some(json!(value)),
+        (_, RpcValue::I64(value)) => Some(json!(value)),
+        (_, RpcValue::F64(value)) => Some(json!(value)),
+        // Device strings are NUL-padded; report only the leading run.
+        ("string", RpcValue::Str(value)) => {
+            Some(json!(value.split('\0').next().unwrap_or("").to_string()))
+        }
+        ("string", RpcValue::Bytes(bytes)) => {
+            let string_bytes = bytes.split(|byte| *byte == 0).next().unwrap_or(&bytes);
             Some(json!(String::from_utf8_lossy(string_bytes).to_string()))
         }
         _ => None,
@@ -7505,58 +7514,36 @@ fn json_to_bytes(arg: Option<Value>, rpc_type: &str) -> Result<Vec<u8>, String> 
         return Ok(Vec::new());
     };
 
-    match rpc_type.split('<').next().unwrap_or(rpc_type) {
-        "unit" | "" | "missing" => Ok(Vec::new()),
-        "bool" => arg
-            .as_bool()
-            .map(|value| vec![u8::from(value)])
-            .ok_or_else(|| "Expected a bool".to_string()),
-        "string" => arg
-            .as_str()
-            .map(|value| value.as_bytes().to_vec())
-            .ok_or_else(|| "Expected a string".to_string()),
-        "u8" => arg
-            .as_u64()
-            .map(|value| (value as u8).to_le_bytes().to_vec())
-            .ok_or_else(|| "Expected a u8".to_string()),
-        "u16" => arg
-            .as_u64()
-            .map(|value| (value as u16).to_le_bytes().to_vec())
-            .ok_or_else(|| "Expected a u16".to_string()),
-        "u32" => arg
-            .as_u64()
-            .map(|value| (value as u32).to_le_bytes().to_vec())
-            .ok_or_else(|| "Expected a u32".to_string()),
-        "u64" => arg
-            .as_u64()
-            .map(|value| value.to_le_bytes().to_vec())
-            .ok_or_else(|| "Expected a u64".to_string()),
-        "i8" => arg
-            .as_i64()
-            .map(|value| (value as i8).to_le_bytes().to_vec())
-            .ok_or_else(|| "Expected an i8".to_string()),
-        "i16" => arg
-            .as_i64()
-            .map(|value| (value as i16).to_le_bytes().to_vec())
-            .ok_or_else(|| "Expected an i16".to_string()),
-        "i32" => arg
-            .as_i64()
-            .map(|value| (value as i32).to_le_bytes().to_vec())
-            .ok_or_else(|| "Expected an i32".to_string()),
-        "i64" => arg
-            .as_i64()
-            .map(|value| value.to_le_bytes().to_vec())
-            .ok_or_else(|| "Expected an i64".to_string()),
-        "f32" => arg
-            .as_f64()
-            .map(|value| (value as f32).to_le_bytes().to_vec())
-            .ok_or_else(|| "Expected an f32".to_string()),
-        "f64" => arg
-            .as_f64()
-            .map(|value| value.to_le_bytes().to_vec())
-            .ok_or_else(|| "Expected an f64".to_string()),
-        other => Err(format!("Unsupported RPC argument type: {other}")),
+    let base_type = rpc_base_type(rpc_type);
+    if matches!(base_type, "unit" | "" | "missing") {
+        return Ok(Vec::new());
     }
+    let value_type = rpc_value_type_for(base_type)
+        .ok_or_else(|| format!("Unsupported RPC argument type: {base_type}"))?;
+    let value = match base_type {
+        "bool" => RpcValue::U64(u64::from(
+            arg.as_bool().ok_or_else(|| "Expected a bool".to_string())?,
+        )),
+        "string" => RpcValue::Str(
+            arg.as_str()
+                .ok_or_else(|| "Expected a string".to_string())?
+                .to_string(),
+        ),
+        "u8" | "u16" | "u32" | "u64" => RpcValue::U64(
+            arg.as_u64()
+                .ok_or_else(|| format!("Expected a {base_type}"))?,
+        ),
+        "i8" | "i16" | "i32" | "i64" => RpcValue::I64(
+            arg.as_i64()
+                .ok_or_else(|| format!("Expected an {base_type}"))?,
+        ),
+        "f32" | "f64" => RpcValue::F64(
+            arg.as_f64()
+                .ok_or_else(|| format!("Expected an {base_type}"))?,
+        ),
+        other => return Err(format!("Unsupported RPC argument type: {other}")),
+    };
+    value_type.encode(&value).map_err(|err| err.to_string())
 }
 
 #[cfg(test)]
@@ -7636,8 +7623,6 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
     }
-
-    use twinleaf::device::RpcMetaFlags;
 
     #[test]
     fn maps_rpc_descriptors_to_bridge_metadata() {
@@ -7831,11 +7816,9 @@ mod tests {
 
     #[test]
     fn spectrum_axis_is_spaced_by_fs_over_dft_size() {
-        // The discriminating axis test: bins are spaced `fs / dft_size`, and
-        // the last sits one spacing below Nyquist. `welch-sde`'s own
-        // `frequency()` instead spreads them to land exactly on Nyquist, which
-        // stretches every frequency by `n / (n - 1)`. The tolerances here are
-        // far tighter than that stretch, so the old mapping fails both.
+        // Bins are spaced `fs / dft_size`, start one spacing above DC, and
+        // stop one spacing below Nyquist (both DC and Nyquist excluded) —
+        // the library's `welch_asd_points` convention.
         let sample_rate: f64 = 1000.0;
         let points: Vec<Point> = (0..16_384)
             .map(|index| {
@@ -7848,9 +7831,9 @@ mod tests {
             .collect();
 
         let spectrum = fft_points(&points, sample_rate, DetrendMethod::None);
-        // `fft_points` keeps every bin, and the crate returns dft_size / 2 of
-        // them, so the transform length follows from the output length.
-        let dft_size = 2 * spectrum.len();
+        // The library keeps bins 1..dft_size/2, so the transform length
+        // follows from the output length.
+        let dft_size = 2 * (spectrum.len() + 1);
         let expected_spacing = sample_rate / dft_size as f64;
 
         let spacing = spectrum[1].x - spectrum[0].x;
@@ -7858,65 +7841,16 @@ mod tests {
             (spacing - expected_spacing).abs() < 1e-9,
             "bin spacing {spacing}, expected {expected_spacing}"
         );
-        assert_eq!(spectrum[0].x, 0.0, "first bin is DC");
+        assert!(
+            (spectrum[0].x - expected_spacing).abs() < 1e-9,
+            "first bin sits one spacing above DC, not at DC"
+        );
 
         let last = spectrum[spectrum.len() - 1].x;
         let expected_last = sample_rate / 2.0 - expected_spacing;
         assert!(
             (last - expected_last).abs() < 1e-9,
             "last bin {last}, expected {expected_last} (one spacing below Nyquist)"
-        );
-    }
-
-    #[test]
-    fn bin_frequencies_span_dc_to_just_below_nyquist() {
-        // n bins spaced fs/dft_size apart, starting at DC. The last is one
-        // spacing short of Nyquist — it is not Nyquist, and pretending it is
-        // stretches every frequency below it.
-        let sample_rate: f64 = 1000.0;
-        let dft_size = 4096;
-        let bins = bin_frequencies(dft_size / 2, dft_size, sample_rate);
-
-        assert_eq!(bins.len(), dft_size / 2);
-        assert_eq!(bins[0], 0.0);
-        let spacing = sample_rate / dft_size as f64;
-        assert!((bins[1] - spacing).abs() < 1e-12);
-        let last = bins[bins.len() - 1];
-        assert!(
-            (last - (sample_rate / 2.0 - spacing)).abs() < 1e-9,
-            "last bin {last} should sit one spacing below Nyquist"
-        );
-    }
-
-    #[test]
-    fn every_bin_but_dc_is_folded_and_nyquist_is_never_kept() {
-        // Only DC is exempt from the mirror fold. It is tempting to exempt the
-        // last bin too, since Nyquist has no mirror partner either — but
-        // `welch-sde` keeps `dft_size / 2` bins, which spans indices
-        // 0..dft_size/2 - 1, and Nyquist lives at index dft_size/2. The last
-        // kept bin is an ordinary mirrored bin and must be doubled like the
-        // rest; exempting it reads that bin a factor of sqrt(2) low.
-        let folded = one_sided_amplitude_density(&[4.0, 4.0, 4.0, 4.0]);
-        assert_eq!(folded[0], 2.0, "DC must not be doubled");
-        for (index, value) in folded.iter().enumerate().skip(1) {
-            assert!(
-                (value - 8.0_f64.sqrt()).abs() < 1e-12,
-                "bin {index} was not folded: {value}"
-            );
-        }
-
-        // Confirm the premise against the crate itself: the bins it hands back
-        // stop one short of Nyquist.
-        let sample_rate: f64 = 1000.0;
-        let mut gauss = gaussian_noise(0x1234_5678_9ABC_DEF0);
-        let signal: Vec<f64> = (0..16_384).map(|_| gauss()).collect();
-        let welch: SpectralDensity<f64> = SpectralDensity::builder(&signal, sample_rate).build();
-        let psd = welch.periodogram();
-        assert_eq!(psd.len(), welch.dft_size / 2);
-        let last_bin_hz = (psd.len() - 1) as f64 * sample_rate / welch.dft_size as f64;
-        assert!(
-            last_bin_hz < sample_rate / 2.0,
-            "last kept bin {last_bin_hz} Hz should sit below Nyquist"
         );
     }
 
@@ -8126,7 +8060,10 @@ mod tests {
         }
         states.insert(source.clone(), state.clone());
         update_derived_channels(&[channel.clone()], &mut states, &mut worker, 1e9);
-        assert!(states.contains_key(&channel.key), "state is created eagerly");
+        assert!(
+            states.contains_key(&channel.key),
+            "state is created eagerly"
+        );
         assert!(states[&channel.key].raw.is_empty(), "no estimate yet");
 
         // Past a full window, a point lands once the worker reports back.
@@ -8345,8 +8282,14 @@ mod tests {
         assert_eq!(request.window_seconds, 20.0);
         assert_eq!(request.inputs.len(), 1);
         assert_eq!(request.inputs[0].points.len(), 20);
-        assert_eq!(request.inputs[0].points.first().map(|point| point.x), Some(41.0));
-        assert_eq!(request.inputs[0].points.last().map(|point| point.x), Some(60.0));
+        assert_eq!(
+            request.inputs[0].points.first().map(|point| point.x),
+            Some(41.0)
+        );
+        assert_eq!(
+            request.inputs[0].points.last().map(|point| point.x),
+            Some(60.0)
+        );
 
         let live_request = build_fft_request(8, &column_states, &active_columns, &view, None);
         assert_eq!(live_request.window_seconds, 20.0);
@@ -8383,7 +8326,10 @@ mod tests {
         // Column selected: raw and FPCS ring fill together for x = 0..5.
         let mut state = ColumnState::new("signal".to_string(), "V".to_string(), 1.0);
         for index in 0..5 {
-            let point = Point { x: index as f64, y: index as f64 };
+            let point = Point {
+                x: index as f64,
+                y: index as f64,
+            };
             state.push_raw(point, retention);
             state.process_fpcs_point(0, &view, point);
         }
@@ -8392,7 +8338,13 @@ mod tests {
         // column), trimming the original x = 0..5 out of retention while the
         // ring stays frozen.
         for index in 5..60 {
-            state.push_raw(Point { x: index as f64, y: index as f64 }, retention);
+            state.push_raw(
+                Point {
+                    x: index as f64,
+                    y: index as f64,
+                },
+                retention,
+            );
         }
 
         // Reselect rebuilds the ring from the continuous raw buffer.
@@ -8551,7 +8503,14 @@ mod tests {
         // A NaN sample must not enter the state; the last good value stays.
         let mut value = Some(10.0);
         let mut value_x = Some(0.0);
-        update_smoothed_display_value(&mut value, &mut value_x, Point { x: 1.0, y: f64::NAN });
+        update_smoothed_display_value(
+            &mut value,
+            &mut value_x,
+            Point {
+                x: 1.0,
+                y: f64::NAN,
+            },
+        );
         assert_eq!(value, Some(10.0));
         assert_eq!(value_x, Some(0.0));
     }

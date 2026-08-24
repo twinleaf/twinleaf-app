@@ -33,6 +33,7 @@ mod direct {
         };
 
         let emitter = Emitter::callback(callback, context);
+        install_bridge_logger(&emitter);
         emitter.status("ready", "Twinleaf Rust core ready");
 
         let (command_tx, command_rx) = channel::unbounded::<ClientCommand>();
@@ -75,6 +76,24 @@ mod direct {
         send_runtime_command(
             runtime,
             ClientCommand::ListDevices {
+                include_all: Some(include_all != 0),
+            },
+        );
+    }
+
+    /// Start (`active != 0`) or stop live device discovery. While active, the
+    /// runtime pushes a `deviceList` event whenever the set of reachable
+    /// devices changes; `include_all` also surfaces unrecognized serial ports.
+    #[no_mangle]
+    pub unsafe extern "C" fn twinleaf_runtime_set_discovery(
+        runtime: *mut TwinleafRuntime,
+        active: u8,
+        include_all: u8,
+    ) {
+        send_runtime_command(
+            runtime,
+            ClientCommand::SetDiscovery {
+                active: active != 0,
                 include_all: Some(include_all != 0),
             },
         );
@@ -284,6 +303,7 @@ mod direct {
     fn run_direct_runtime(command_rx: Receiver<ClientCommand>, emitter: Emitter) {
         let mut session: Option<(Sender<SessionCommand>, thread::JoinHandle<()>)> = None;
         let mut playback: Option<PlaybackSession> = None;
+        let mut discovery_hub: Option<DiscoveryHubHandle> = None;
 
         while let Ok(command) = command_rx.recv() {
             match command {
@@ -293,6 +313,14 @@ mod direct {
                         "type": "deviceList",
                         "devices": devices
                     }));
+                }
+                ClientCommand::SetDiscovery {
+                    active,
+                    include_all,
+                } => {
+                    discovery_hub = active.then(|| {
+                        spawn_discovery_hub(include_all.unwrap_or(false), emitter.clone())
+                    });
                 }
                 ClientCommand::Connect {
                     url,
@@ -484,6 +512,7 @@ mod direct {
         }
 
         stop_direct_session(&mut session);
+        drop(discovery_hub);
     }
 
     fn stop_direct_session(session: &mut Option<(Sender<SessionCommand>, thread::JoinHandle<()>)>) {

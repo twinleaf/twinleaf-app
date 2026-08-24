@@ -261,7 +261,7 @@ struct DocumentWindow: View {
             }
             .onReceive(NotificationCenter.default.publisher(for: .showDevicePicker)) { _ in
                 guard !bridge.isInspectionMode else { return }
-                bridge.listDevices(includeAllSerial: showAllSerialPorts)
+                // The picker starts live discovery in its own onAppear.
                 showingDevicePicker = true
             }
             .onReceive(NotificationCenter.default.publisher(for: .showExportPanel)) { notification in
@@ -4827,7 +4827,6 @@ private struct DevicePicker: View {
     /// Re-scan for devices (serial probes + mDNS network discovery) on a slow
     /// cadence so freshly-powered or newly-advertised sensors appear without a
     /// manual refresh.
-    private let autoRefreshTicker = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -4990,16 +4989,8 @@ private struct DevicePicker: View {
             selection = bridge.availableDevices.first?.id
             refreshDevices()
         }
-        .onReceive(autoRefreshTicker) { _ in
-            // Skip while a connection attempt is underway (the list is hidden
-            // and a rescan would churn the bridge mid-connect) or while the
-            // user is typing a URL.
-            guard !bridge.connectionProgress.isVisible,
-                  !isAddingURL,
-                  editingRememberedURL == nil else {
-                return
-            }
-            refreshDevices()
+        .onDisappear {
+            bridge.setDiscovery(active: false)
         }
         .onChange(of: bridge.connectionProgress.isReadyToDismiss) { _, isReady in
             guard isReady else { return }
@@ -5108,7 +5099,7 @@ private struct DevicePicker: View {
 
     private func refreshDevices() {
         bridge.debugDevicePicker("refreshDevices showAllSerialPorts=\(showAllSerialPorts)")
-        bridge.listDevices(includeAllSerial: showAllSerialPorts)
+        bridge.setDiscovery(active: true, includeAllSerial: showAllSerialPorts)
     }
 
     private var loggingStatusText: String {
