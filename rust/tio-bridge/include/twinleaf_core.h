@@ -3,6 +3,7 @@
 #ifndef TWINLEAF_CORE_H
 #define TWINLEAF_CORE_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -12,12 +13,25 @@ extern "C" {
 
 typedef struct TwinleafRuntime TwinleafRuntime;
 
+/* kind: 0 = JSON event, 1 = binary plot frame, 2 = binary typed event. */
 typedef void (*TwinleafEventCallback)(
     uint32_t kind,
     const uint8_t *data,
     size_t len,
     uintptr_t context
 );
+
+/* tag: 1 = bool, 2 = string, 3 = double, 4 = int, 5 = uint;
+   any other value means no argument. Only the field matching the tag
+   is read. */
+typedef struct TwinleafRpcArg {
+    uint8_t tag;
+    uint8_t bool_value;
+    int64_t int_value;
+    uint64_t uint_value;
+    double double_value;
+    const char *string_value;
+} TwinleafRpcArg;
 
 TwinleafRuntime *twinleaf_runtime_create(TwinleafEventCallback callback, uintptr_t context);
 void twinleaf_runtime_destroy(TwinleafRuntime *runtime);
@@ -28,12 +42,8 @@ void twinleaf_runtime_connect(
     const char *route,
     const char *log_path
 );
-void twinleaf_runtime_set_logging(
-    TwinleafRuntime *runtime,
-    uint8_t enabled,
-    const char *log_path
-);
 void twinleaf_runtime_open_log(TwinleafRuntime *runtime, const char *path);
+/* format: 1 = HDF5, any other value = CSV. */
 void twinleaf_runtime_export_log(
     TwinleafRuntime *runtime,
     const char *request_id,
@@ -42,6 +52,13 @@ void twinleaf_runtime_export_log(
     uint8_t format
 );
 void twinleaf_runtime_disconnect(TwinleafRuntime *runtime);
+void twinleaf_runtime_check_upgrade(TwinleafRuntime *runtime);
+void twinleaf_runtime_perform_upgrade(TwinleafRuntime *runtime, const char *route);
+void twinleaf_runtime_set_logging(
+    TwinleafRuntime *runtime,
+    uint8_t enabled,
+    const char *log_path
+);
 void twinleaf_runtime_set_playback(TwinleafRuntime *runtime, double position);
 void twinleaf_runtime_copy_view_data(
     TwinleafRuntime *runtime,
@@ -50,41 +67,22 @@ void twinleaf_runtime_copy_view_data(
     uint8_t has_viewport_end,
     double viewport_end
 );
-void twinleaf_runtime_set_plot_panes(
-    TwinleafRuntime *runtime,
-    const size_t *pane_ids,
-    const uint8_t *modes,
-    const double *window_seconds,
-    const size_t *resolution_multipliers,
-    const size_t *plot_width_pixels,
-    const uint8_t *decimation_methods,
-    const uint8_t *detrends,
-    const uint8_t *fft_log_xs,
-    const uint8_t *fft_log_ys,
-    size_t pane_count,
-    const size_t *column_pane_ids,
-    const char *const *routes,
-    const uint8_t *stream_ids,
-    const size_t *column_indices,
-    size_t column_count
-);
-void twinleaf_runtime_set_view(
-    TwinleafRuntime *runtime,
-    uint8_t mode,
-    double window_seconds,
-    size_t resolution_multiplier,
-    size_t plot_width_pixels,
-    uint8_t decimation_method,
-    uint8_t detrend,
-    uint8_t fft_log_x,
-    uint8_t fft_log_y
-);
+/* json is a serialized ClientCommand (see tio-bridge). Returns false if the
+   pointer is null or the payload does not parse as a known command. */
+bool twinleaf_runtime_send_command_json(TwinleafRuntime *runtime, const char *json);
 void twinleaf_runtime_call_rpc(
     TwinleafRuntime *runtime,
     const char *request_id,
     const char *route,
     const char *name,
     const char *arg_json
+);
+void twinleaf_runtime_call_rpc_value(
+    TwinleafRuntime *runtime,
+    const char *request_id,
+    const char *route,
+    const char *name,
+    const TwinleafRpcArg *arg
 );
 
 #ifdef __cplusplus
