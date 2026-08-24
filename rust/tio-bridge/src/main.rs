@@ -3483,7 +3483,7 @@ fn finite_or_null(value: f64) -> Value {
 }
 
 enum BridgeTreeMsg {
-    Item(TreeItem),
+    Items(Vec<TreeItem>),
     /// The parser panicked inside `recv`; the worker backs off and keeps
     /// reading, so a malformed packet degrades one drain rather than the
     /// whole session.
@@ -3491,26 +3491,61 @@ enum BridgeTreeMsg {
     Disconnected,
 }
 
+/// How long the worker lingers after the first item to bundle the packets
+/// right behind it, and the most items one bundle may carry. The linger
+/// bounds the added delivery latency; it sits far under the 33 ms plot
+/// cadence.
+const TREE_BUNDLE_WINDOW: Duration = Duration::from_millis(2);
+const TREE_BUNDLE_CAP: usize = 256;
+
 /// Owns the `DeviceTree` on a dedicated thread and forwards its items over a
 /// channel, so the session loop can `select!` across data, commands, proxy
-/// status, and timers. The worker exits when the receiver is dropped.
+/// status, and timers. Items travel in bundles so a 1 kHz stream wakes the
+/// session loop per burst rather than per packet. The worker exits when the
+/// receiver is dropped.
 fn spawn_bridge_tree_worker(mut tree: DeviceTree) -> Receiver<BridgeTreeMsg> {
     let (tx, rx) = channel::unbounded();
     thread::Builder::new()
         .name("tree-worker".into())
         .spawn(move || loop {
+            let mut items = Vec::new();
+            let mut failure = None;
+
             match panic::catch_unwind(AssertUnwindSafe(|| tree.recv())) {
-                Ok(Ok(item)) => {
-                    if tx.send(BridgeTreeMsg::Item(item)).is_err() {
-                        return;
+                Ok(Ok(item)) => items.push(item),
+                Ok(Err(_)) => failure = Some(BridgeTreeMsg::Disconnected),
+                Err(panic) => failure = Some(BridgeTreeMsg::Panic(panic_message(panic))),
+            }
+
+            if failure.is_none() {
+                let deadline = Instant::now() + TREE_BUNDLE_WINDOW;
+                while items.len() < TREE_BUNDLE_CAP {
+                    match panic::catch_unwind(AssertUnwindSafe(|| tree.recv_deadline(deadline))) {
+                        Ok(Ok(item)) => items.push(item),
+                        Ok(Err(proxy::RecvTimeoutError::Timeout)) => break,
+                        Ok(Err(proxy::RecvTimeoutError::ProxyDisconnected)) => {
+                            failure = Some(BridgeTreeMsg::Disconnected);
+                            break;
+                        }
+                        Err(panic) => {
+                            failure = Some(BridgeTreeMsg::Panic(panic_message(panic)));
+                            break;
+                        }
                     }
                 }
-                Ok(Err(_)) => {
+            }
+
+            if !items.is_empty() && tx.send(BridgeTreeMsg::Items(items)).is_err() {
+                return;
+            }
+            match failure {
+                None => {}
+                Some(BridgeTreeMsg::Disconnected) => {
                     let _ = tx.send(BridgeTreeMsg::Disconnected);
                     return;
                 }
-                Err(panic) => {
-                    if tx.send(BridgeTreeMsg::Panic(panic_message(panic))).is_err() {
+                Some(message) => {
+                    if tx.send(message).is_err() {
                         return;
                     }
                     thread::sleep(Duration::from_millis(250));
@@ -3657,10 +3692,7 @@ fn run_session(
     // Accumulates across select iterations; recorded and reset on every tick,
     // so a profile window covers one tick interval like the old poll loop.
     let mut loop_profile = SessionLoopProfile::default();
-    let mut monitor_rx = packet_monitor_port
-        .as_ref()
-        .map(|port| port.receiver().clone())
-        .unwrap_or_else(channel::never);
+    let mut monitor_port_alive = packet_monitor_port.is_some();
     let tick = channel::tick(Duration::from_millis(10));
     // Plot frames get their own timer: gating the emit on the 10 ms tick
     // quantizes a 33 ms budget up to ~40 ms and drops the frame rate.
@@ -3674,7 +3706,9 @@ fn run_session(
             channel::select! {
                 recv(tree_rx) -> msg => {
                     match msg {
-                        Ok(BridgeTreeMsg::Item(TreeItem::Batch(batch))) => {
+                        Ok(BridgeTreeMsg::Items(items)) => for item in items {
+                            match item {
+                            TreeItem::Batch(batch) => {
                             let process_start = Instant::now();
                             let now = Instant::now();
                             health.observe_batch(&batch, now);
@@ -3766,7 +3800,7 @@ fn run_session(
                                 }
                             }
                         }
-                        Ok(BridgeTreeMsg::Item(TreeItem::Event(event))) => {
+                            TreeItem::Event(event) => {
                             let event_start = Instant::now();
                             loop_profile.device_events += 1;
                             match event {
@@ -3797,6 +3831,8 @@ fn run_session(
                             }
                             loop_profile.event_elapsed += event_start.elapsed();
                         }
+                            }
+                        },
                         Ok(BridgeTreeMsg::Panic(message)) => {
                             emitter.error(format!(
                                 "Twinleaf parser panic while draining stream data: {message}"
@@ -3822,36 +3858,6 @@ fn run_session(
                     }
                     continue;
                 },
-                recv(monitor_rx) -> packet => {
-                    match packet {
-                        Ok(packet) => {
-                            let raw_log_start = Instant::now();
-                            handle_monitor_packet(
-                                packet,
-                                &root_route,
-                                &mut logger,
-                                &latest_stream_timestamp_by_route,
-                                &emitter,
-                            );
-                            loop_profile.raw_packets += 1;
-                            if let Some(port) = &packet_monitor_port {
-                                loop_profile.raw_packets += drain_packet_monitor_port(
-                                    port,
-                                    &root_route,
-                                    &mut logger,
-                                    &latest_stream_timestamp_by_route,
-                                    &emitter,
-                                );
-                            }
-                            loop_profile.raw_log_elapsed += raw_log_start.elapsed();
-                        }
-                        Err(_) => {
-                            emitter.error("Raw logging port closed");
-                            monitor_rx = channel::never();
-                        }
-                    }
-                    continue;
-                },
                 recv(plot_tick) -> _ => {
                     let emit_start = Instant::now();
                     let stats = emit_live_plot(
@@ -3870,6 +3876,22 @@ fn run_session(
                 },
                 recv(tick) -> _ => {
                     let tick_start = Instant::now();
+                    if monitor_port_alive {
+                        if let Some(port) = &packet_monitor_port {
+                            let raw_log_start = Instant::now();
+                            let (raw_packets, alive) = drain_packet_monitor_port(
+                                port,
+                                &root_route,
+                                &mut logger,
+                                &latest_stream_timestamp_by_route,
+                                &emitter,
+                            );
+                            loop_profile.raw_packets += raw_packets;
+                            loop_profile.raw_log_elapsed += raw_log_start.elapsed();
+                            monitor_port_alive = alive;
+                        }
+                    }
+
                     if !discovery.incomplete_rpc_routes.is_empty()
                         && last_rpc_metadata_recovery.elapsed() >= RPC_METADATA_RECOVERY_INTERVAL
                     {
@@ -4500,13 +4522,16 @@ fn handle_monitor_packet(
     logger.write_packet(packet, emitter);
 }
 
+/// Drain everything queued on the raw monitor port. Returns the packet count
+/// and whether the port is still alive; a dead port must not be drained again
+/// or its error would repeat every tick.
 fn drain_packet_monitor_port(
     port: &proxy::Port,
     root_route: &DeviceRoute,
     logger: &mut PacketLogger,
     latest_stream_timestamp_by_route: &HashMap<DeviceRoute, f64>,
     emitter: &Emitter,
-) -> usize {
+) -> (usize, bool) {
     let mut packet_count = 0;
     loop {
         match port.try_recv() {
@@ -4520,14 +4545,13 @@ fn drain_packet_monitor_port(
                 );
                 packet_count += 1;
             }
-            Err(proxy::RecvError::WouldBlock) => break,
+            Err(proxy::RecvError::WouldBlock) => return (packet_count, true),
             Err(err) => {
                 emitter.error(format!("Raw logging port failed: {err:?}"));
-                break;
+                return (packet_count, false);
             }
         }
     }
-    packet_count
 }
 
 fn emit_tio_log_message(packet: &tio::Packet, timestamp_seconds: Option<f64>, emitter: &Emitter) {
@@ -4939,33 +4963,32 @@ fn fetch_device(
         }
     };
 
-    let (meta, streams, full_metadata) = match panic::catch_unwind(AssertUnwindSafe(|| {
-        fetch_stream_metadata(proxy, route)
-    })) {
-        Ok(Ok(metadata)) => {
-            let (meta, streams) = metadata_to_stream_dtos(route, &metadata);
-            (meta, streams, Some(metadata))
-        }
-        Ok(Err(err)) => {
-            emit_metadata_issue(
-                emitter,
-                report_errors,
-                format!("Failed to fetch stream metadata for route {route}: {err}"),
-            );
-            (fallback_device_meta(route, fallback_name), Vec::new(), None)
-        }
-        Err(err) => {
-            emit_metadata_issue(
-                emitter,
-                report_errors,
-                format!(
+    let (meta, streams, full_metadata) =
+        match panic::catch_unwind(AssertUnwindSafe(|| fetch_stream_metadata(proxy, route))) {
+            Ok(Ok(metadata)) => {
+                let (meta, streams) = metadata_to_stream_dtos(route, &metadata);
+                (meta, streams, Some(metadata))
+            }
+            Ok(Err(err)) => {
+                emit_metadata_issue(
+                    emitter,
+                    report_errors,
+                    format!("Failed to fetch stream metadata for route {route}: {err}"),
+                );
+                (fallback_device_meta(route, fallback_name), Vec::new(), None)
+            }
+            Err(err) => {
+                emit_metadata_issue(
+                    emitter,
+                    report_errors,
+                    format!(
                     "Twinleaf parser panic while fetching stream metadata for route {route}: {}",
                     panic_message(err)
                 ),
-            );
-            (fallback_device_meta(route, fallback_name), Vec::new(), None)
-        }
-    };
+                );
+                (fallback_device_meta(route, fallback_name), Vec::new(), None)
+            }
+        };
 
     if streams.is_empty() && rpc_fetch.rpcs.is_empty() {
         return Err("No stream metadata or RPC metadata returned".to_string());
