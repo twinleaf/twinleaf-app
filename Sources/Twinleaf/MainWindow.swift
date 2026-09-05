@@ -5194,11 +5194,19 @@ private struct DeviceHealthPopover: View {
     private static let rateWidth: CGFloat = 78
     private static let driftWidth: CGFloat = 86
     private static let droppedWidth: CGFloat = 64
+    private static let incomingWidth: CGFloat = 220
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Connection Health")
                 .font(.headline)
+
+            if let rate = bridge.incomingDataRate {
+                metric("Incoming", kbpsText(rate.kbps),
+                       unit: "kbps, \(windowText(rate.windowSeconds)) avg",
+                       width: Self.incomingWidth,
+                       color: .primary)
+            }
 
             if bridge.streamHealth.isEmpty {
                 Text("No live streams.")
@@ -5267,6 +5275,17 @@ private struct DeviceHealthPopover: View {
         if hz >= 100 { return String(format: "%.0f", hz) }
         if hz >= 1 { return String(format: "%.1f", hz) }
         return String(format: "%.3f", hz)
+    }
+
+    private func kbpsText(_ kbps: Double) -> String {
+        guard kbps.isFinite else { return "—" }
+        if kbps >= 100 { return String(format: "%.0f", kbps) }
+        if kbps >= 1 { return String(format: "%.1f", kbps) }
+        return String(format: "%.2f", kbps)
+    }
+
+    private func windowText(_ seconds: Double) -> String {
+        String(format: "%.0f s", seconds)
     }
 
     private func ppmText(_ ppm: Double?) -> String {

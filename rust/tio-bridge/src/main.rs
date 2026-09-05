@@ -72,6 +72,8 @@ const HEALTH_JITTER_WINDOW_SECONDS: u64 = 10;
 const HEALTH_MIN_DRIFT_SAMPLES: u64 = 50;
 const HEALTH_STALE_FLOOR: Duration = Duration::from_millis(2000);
 const HEALTH_EMIT_INTERVAL: Duration = Duration::from_millis(500);
+/// Span of the rolling average behind the aggregate incoming data rate.
+const HEALTH_INCOMING_RATE_WINDOW: Duration = Duration::from_secs(10);
 
 type EventCallback = extern "C" fn(kind: u32, data: *const u8, len: usize, context: usize);
 
@@ -3393,9 +3395,59 @@ impl StreamHealth {
     }
 }
 
+/// Rolling window of the TIO packet bytes (header, payload, and routing) that
+/// crossed the raw monitor port, aggregated over every route. Observations
+/// arrive once per session-loop tick while the port is alive, so a gap in them
+/// means the port died and the rate is unknown rather than zero.
+#[derive(Default)]
+struct IncomingRateWindow {
+    /// Non-empty drains as (observed at, bytes), oldest first.
+    buckets: VecDeque<(Instant, u64)>,
+    started: Option<Instant>,
+    last_observed: Option<Instant>,
+}
+
+impl IncomingRateWindow {
+    fn observe(&mut self, bytes: u64, now: Instant) {
+        self.started.get_or_insert(now);
+        self.last_observed = Some(now);
+        if bytes > 0 {
+            self.buckets.push_back((now, bytes));
+        }
+        while let Some(&(at, _)) = self.buckets.front() {
+            if now.duration_since(at) < HEALTH_INCOMING_RATE_WINDOW {
+                break;
+            }
+            self.buckets.pop_front();
+        }
+    }
+
+    /// Average incoming rate in kbps over the window, or over the time since
+    /// the first observation while the window is still filling. `None` before
+    /// the first emit interval has elapsed and once observations stop.
+    fn kbps(&self, now: Instant) -> Option<f64> {
+        let started = self.started?;
+        if now.duration_since(self.last_observed?) > HEALTH_STALE_FLOOR {
+            return None;
+        }
+        let span = now.duration_since(started).min(HEALTH_INCOMING_RATE_WINDOW);
+        if span < HEALTH_EMIT_INTERVAL {
+            return None;
+        }
+        let bytes: u64 = self
+            .buckets
+            .iter()
+            .filter(|(at, _)| now.duration_since(*at) < HEALTH_INCOMING_RATE_WINDOW)
+            .map(|(_, bytes)| bytes)
+            .sum();
+        Some(bytes as f64 * 8.0 / 1000.0 / span.as_secs_f64())
+    }
+}
+
 #[derive(Default)]
 struct HealthMonitor {
     streams: HashMap<(DeviceRoute, u8), StreamHealth>,
+    incoming: IncomingRateWindow,
 }
 
 impl HealthMonitor {
@@ -3431,6 +3483,11 @@ impl HealthMonitor {
         }
     }
 
+    /// Record the wire bytes of one raw monitor-port drain (zero when quiet).
+    fn observe_incoming_bytes(&mut self, bytes: u64, now: Instant) {
+        self.incoming.observe(bytes, now);
+    }
+
     /// Drop all streams for a route (device reset / disconnect).
     fn reset_route(&mut self, route: &DeviceRoute) {
         self.streams.retain(|(r, _), _| r != route);
@@ -3457,7 +3514,12 @@ impl HealthMonitor {
                 })
             })
             .collect();
-        json!({ "type": "health", "streams": streams })
+        json!({
+            "type": "health",
+            "streams": streams,
+            "incomingKbps": self.incoming.kbps(now).map_or(Value::Null, finite_or_null),
+            "incomingWindowSeconds": HEALTH_INCOMING_RATE_WINDOW.as_secs_f64(),
+        })
     }
 }
 
@@ -3837,6 +3899,7 @@ fn run_session(
                             loop_profile.raw_packets += drain.packets;
                             loop_profile.raw_log_elapsed += raw_log_start.elapsed();
                             monitor_port_alive = drain.alive;
+                            health.observe_incoming_bytes(drain.bytes, Instant::now());
                         }
                     }
 
@@ -4450,13 +4513,14 @@ fn rpc_lists_equivalent(lhs: &[RpcDto], rhs: &[RpcDto]) -> bool {
         })
 }
 
-/// Log one raw packet; its route is already absolute.
+/// Log one raw packet (its route is already absolute) and return its wire
+/// length.
 fn handle_monitor_packet(
     packet: tio::Packet,
     logger: &mut PacketLogger,
     latest_stream_timestamp_by_route: &HashMap<DeviceRoute, f64>,
     emitter: &Emitter,
-) {
+) -> usize {
     emit_tio_log_message(
         &packet,
         latest_stream_timestamp_by_route
@@ -4464,12 +4528,16 @@ fn handle_monitor_packet(
             .copied(),
         emitter,
     );
+    let wire_bytes = packet.as_bytes().len();
     logger.write_packet(&packet);
+    wire_bytes
 }
 
 /// One pass over the raw monitor port.
 struct MonitorDrain {
     packets: usize,
+    /// Wire bytes of the drained packets (header, payload, and routing).
+    bytes: u64,
     /// A dead port must not be drained again or its error would repeat every
     /// tick.
     alive: bool,
@@ -4485,12 +4553,18 @@ fn drain_packet_monitor_port(
 ) -> MonitorDrain {
     let mut drain = MonitorDrain {
         packets: 0,
+        bytes: 0,
         alive: true,
     };
     loop {
         match packets.try_recv() {
             Ok(Some(packet)) => {
-                handle_monitor_packet(packet, logger, latest_stream_timestamp_by_route, emitter);
+                drain.bytes += handle_monitor_packet(
+                    packet,
+                    logger,
+                    latest_stream_timestamp_by_route,
+                    emitter,
+                ) as u64;
                 drain.packets += 1;
             }
             Ok(None) => return drain,
@@ -7495,6 +7569,46 @@ fn json_to_bytes(arg: Option<Value>, rpc_type: &str) -> Result<Vec<u8>, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incoming_rate_window_averages_wire_bytes() {
+        let mut window = IncomingRateWindow::default();
+        let start = Instant::now();
+        let tick = Duration::from_millis(10);
+
+        // Nothing to report until the first emit interval has elapsed.
+        window.observe(125, start);
+        assert_eq!(window.kbps(start), None);
+
+        // 125 bytes every 10 ms is 12.5 kB/s = 100 kbps. While the window is
+        // filling, the average spans the time since the first observation.
+        let mut now = start;
+        for _ in 1..=200 {
+            now += tick;
+            window.observe(125, now);
+        }
+        let kbps = window.kbps(now).unwrap();
+        assert!((kbps - 100.0).abs() < 1.0, "filling window: {kbps}");
+
+        // Past the window, older drains drop out and the rate holds steady.
+        for _ in 201..=2000 {
+            now += tick;
+            window.observe(125, now);
+        }
+        let kbps = window.kbps(now).unwrap();
+        assert!((kbps - 100.0).abs() < 0.5, "steady state: {kbps}");
+        assert!(window.buckets.len() <= 1000);
+
+        // Quiet ticks bring the average down to zero within one window.
+        for _ in 0..1000 {
+            now += tick;
+            window.observe(0, now);
+        }
+        assert_eq!(window.kbps(now), Some(0.0));
+
+        // Once observations stop (the monitor port died), the rate is unknown.
+        assert_eq!(window.kbps(now + HEALTH_STALE_FLOOR + tick), None);
+    }
 
     #[test]
     fn decodes_camel_case_rpc_command_fields() {

@@ -169,6 +169,8 @@ final class BridgeClient: ObservableObject {
     /// Per-stream timing/rate diagnostics (mirrors `tio health`), refreshed
     /// continuously while connected.
     @Published private(set) var streamHealth: [StreamHealthInfo] = []
+    /// Rolling average of the incoming TIO packet bytes across every device.
+    @Published private(set) var incomingDataRate: IncomingDataRate?
     @Published private(set) var logMessages: [LogMessage] = []
     @Published private(set) var logRevision: UInt64 = 0
     @Published private(set) var isInspectionMode = false
@@ -333,6 +335,7 @@ final class BridgeClient: ObservableObject {
         availableUpgrades = []
         upgradeProgress = nil
         streamHealth = []
+        incomingDataRate = nil
         isInspectionMode = false
         rpcCacheNeedsReload = false
         clearLogMessages()
@@ -361,6 +364,7 @@ final class BridgeClient: ObservableObject {
         isPlotPaused = true
         rpcCacheNeedsReload = false
         streamHealth = []
+        incomingDataRate = nil
         clearLogMessages()
         clearRPCReadbackState()
         clearStreamDisplayValues()
@@ -399,6 +403,7 @@ final class BridgeClient: ObservableObject {
         availableUpgrades = []
         upgradeProgress = nil
         streamHealth = []
+        incomingDataRate = nil
     }
 
     /// Re-run the lazy firmware-availability check for the active session.
@@ -1553,7 +1558,11 @@ final class BridgeClient: ObservableObject {
             case "upgradeProgress":
                 handleUpgradeProgressEvent(try decoder.decode(FirmwareUpgradeProgress.self, from: data))
             case "health":
-                streamHealth = try decoder.decode(StreamHealthEvent.self, from: data).streams
+                let event = try decoder.decode(StreamHealthEvent.self, from: data)
+                streamHealth = event.streams
+                incomingDataRate = event.incomingKbps.map {
+                    IncomingDataRate(kbps: $0, windowSeconds: event.incomingWindowSeconds)
+                }
             default:
                 break
             }
@@ -2617,8 +2626,20 @@ struct StreamHealthInfo: Decodable, Hashable, Identifiable {
     var id: String { "\(route)#\(streamId)" }
 }
 
+/// Aggregate incoming data rate across every connected device, averaged over
+/// the trailing `windowSeconds`.
+struct IncomingDataRate: Hashable {
+    /// Kilobits per second of TIO packet bytes (header, payload, and routing).
+    let kbps: Double
+    let windowSeconds: Double
+}
+
 private struct StreamHealthEvent: Decodable {
     let streams: [StreamHealthInfo]
+    /// `nil` until the bridge has a full emit interval of data, or when the
+    /// raw packet feed is gone.
+    let incomingKbps: Double?
+    let incomingWindowSeconds: Double
 }
 
 // MARK: - Firmware upgrade models (module-internal: used by the UI layer)
