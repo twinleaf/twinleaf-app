@@ -82,7 +82,8 @@ The project currently vendors `twinleaf-rust` as a Git submodule at:
 vendor/twinleaf-rust
 ```
 
-After cloning, initialize it with:
+The submodule follows the upstream `firmware-proto` branch (recorded in
+`.gitmodules`). After cloning, initialize it with:
 
 ```sh
 git submodule update --init --recursive

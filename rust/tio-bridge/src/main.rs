@@ -15,20 +15,24 @@ use std::thread;
 use std::time::{Duration, Instant};
 use twinleaf::data::ColumnOp;
 use twinleaf::data::{
-    BoundaryReason, ColumnArray, DeviceMetadataSnapshot, LogFile, PacketParser, SampleBatch,
+    BoundaryReason, ColumnArray, DataType, DeviceMetadataSnapshot, LogFile, PacketParser,
+    SampleBatch,
 };
-use twinleaf::device::capture::{read_capture, CaptureReadout, CaptureRpc};
+use twinleaf::device::capture::{read_capture, CaptureReadout};
 use twinleaf::device::discovery::{Discovery, DiscoveryConfig, DiscoveryEvent, PortInterface};
-use twinleaf::device::{
-    DeviceEvent, DeviceTree, NamedRoute, RpcClient, RpcDescriptor, RpcRegistryError, TreeEvent,
-    TreeItem,
+use twinleaf::device::rpc::{
+    CallError, RpcDescriptor, RpcMetaExt, RpcMetaFlags, RpcRegistryError, RpcValue, RpcValueType,
+    RpcValueTypeExt,
 };
+use twinleaf::device::{Connection, Device, DeviceEvent, Event, NamedRoute, RecvError, TreeEvent};
 #[cfg(feature = "firmware")]
 use twinleaf::firmware::{self, FirmwareCatalog, FlashEvent, StopOutcome, UpdateStatus};
-use twinleaf::tio::proto::meta::MetadataEpoch;
-use twinleaf::tio::proto::{DeviceRoute, Payload, RpcMetaFlags, RpcMethod, RpcValue, RpcValueType};
+use twinleaf::proto::rpc::RpcError;
+use twinleaf::proto::sync::Epoch;
+use twinleaf::proto::DeviceRoute;
+use twinleaf::tio;
+use twinleaf::tio::packet::{Payload, RpcMethod};
 use twinleaf::tio::proxy;
-use twinleaf::{tio, Device};
 use twinleaf_tools::tui::spectral::WelchOp;
 
 const EVENT_JSON: u32 = 0;
@@ -2242,28 +2246,16 @@ impl PacketLogger {
         self.writer.is_some()
     }
 
-    fn write_packet(&mut self, packet: tio::Packet, emitter: &Emitter) {
+    /// Append one packet's wire bytes to the log, if logging is on.
+    fn write_packet(&mut self, packet: &tio::Packet) {
         let Some(writer) = self.writer.as_mut() else {
             return;
         };
-        match packet.serialize() {
-            Ok(raw) => {
-                if writer.write_all(&raw).is_ok() {
-                    let _ = writer.flush();
-                    self.packets_written += 1;
-                    self.bytes_written += raw.len() as u64;
-                }
-            }
-            Err(err) => {
-                self.serialize_errors += 1;
-                if self.serialize_errors <= 3 {
-                    emitter.error(format!(
-                        "Failed to serialize packet for log: route={}, payload={}: {err:?}",
-                        packet.routing,
-                        payload_name(&packet.payload)
-                    ));
-                }
-            }
+        let raw = packet.as_bytes();
+        if writer.write_all(raw).is_ok() {
+            let _ = writer.flush();
+            self.packets_written += 1;
+            self.bytes_written += raw.len() as u64;
         }
     }
 
@@ -2310,27 +2302,19 @@ impl PacketLogger {
         emitter: &Emitter,
     ) -> usize {
         let before = self.packets_written;
-        self.write_packet(
-            metadata.device.make_update_with_route(route.clone()),
-            emitter,
-        );
-
-        let mut stream_ids: Vec<u8> = metadata.streams.keys().copied().collect();
-        stream_ids.sort_unstable();
-        for stream_id in stream_ids {
-            let Some(stream) = metadata.streams.get(&stream_id) else {
-                continue;
-            };
-            self.write_packet(stream.stream.make_update_with_route(route.clone()), emitter);
-            self.write_packet(
-                stream.segment.make_update_with_route(route.clone()),
-                emitter,
-            );
-
-            let mut columns = stream.columns.clone();
-            columns.sort_by_key(|column| column.index);
-            for column in columns {
-                self.write_packet(column.make_update_with_route(route.clone()), emitter);
+        match metadata.metadata_packets() {
+            Ok(packets) => {
+                for packet in &packets {
+                    self.write_packet(packet);
+                }
+            }
+            Err(err) => {
+                self.serialize_errors += 1;
+                if self.serialize_errors <= 3 {
+                    emitter.error(format!(
+                        "Failed to encode startup metadata for route {route}: {err:?}"
+                    ));
+                }
             }
         }
 
@@ -3073,7 +3057,7 @@ fn start_multi_sensor_mount(urls: Vec<String>, emitter: Emitter) -> Result<Strin
 fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, emitter: Emitter) {
     struct MountLink {
         prefix: DeviceRoute,
-        interface: proxy::Interface,
+        interface: proxy::Connection,
         status_rx: Receiver<proxy::Event>,
     }
 
@@ -3085,7 +3069,7 @@ fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, em
         };
         emitter.debug(format!("multi-mount: {sensor_url} at {prefix}"));
         let (status_tx, status_rx) = channel::bounded(100);
-        let interface = proxy::Interface::new_proxy(
+        let interface = proxy::Connection::open_with(
             sensor_url,
             Some(CONNECTION_STARTUP_TIMEOUT),
             Some(status_tx),
@@ -3098,11 +3082,12 @@ fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, em
     }
 
     // Open each mount's port right away (before blocking on accept): a proxy
-    // interface with no ports can shut down on an early connection failure,
-    // after which `new_port` is refused.
+    // connection with no ports can shut down on an early connection failure,
+    // after which opening one is refused.
     let mut ports = Vec::with_capacity(links.len());
     for link in &links {
-        match link.interface.new_port(
+        match proxy::open_port(
+            &link.interface,
             Some(Duration::from_millis(2000)),
             DeviceRoute::root(),
             usize::MAX,
@@ -3128,11 +3113,11 @@ fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, em
     drop(listener);
 
     let (rx_send, client_rx) =
-        tio::transport::Port::rx_channel_custom(proxy::Interface::get_client_tx_channel_size());
+        tio::transport::Port::rx_channel_custom(proxy::client_tx_channel_size());
     let client = match tio::transport::Port::from_tcp_stream_custom(
         stream,
         tio::transport::Port::rx_to_channel(rx_send),
-        proxy::Interface::get_client_rx_channel_size(),
+        proxy::client_rx_channel_size(),
     ) {
         Ok(client) => client,
         Err(err) => {
@@ -3157,13 +3142,13 @@ fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, em
         let oper = sel.select();
         let slot = oper.index();
         if slot == 0 {
-            let Ok(Ok(mut pkt)) = oper.recv(&client_rx) else {
+            let Ok(Ok(pkt)) = oper.recv(&client_rx) else {
                 emitter.debug("multi-mount: session disconnected; shutting down");
                 break;
             };
             let mut destination = None;
             for (link, port) in links.iter().zip(&ports) {
-                if let Ok(relative) = link.prefix.relative_route(&pkt.routing) {
+                if let Ok(relative) = link.prefix.relative_route(&pkt.route()) {
                     destination = Some((relative, port));
                     break;
                 }
@@ -3174,8 +3159,8 @@ fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, em
                 // every mount, exactly as each sensor would receive over a
                 // direct connection. Other root-addressed packets have no
                 // single destination and are dropped.
-                if pkt.routing.len() == 0 {
-                    if let Payload::Heartbeat(_) = pkt.payload {
+                if pkt.route().is_empty() {
+                    if let Payload::Heartbeat(_) = pkt.payload() {
                         for port in &ports {
                             let _ = port.try_send(pkt.clone());
                         }
@@ -3183,8 +3168,7 @@ fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, em
                 }
                 continue;
             };
-            pkt.routing = relative;
-            if port.try_send(pkt).is_err() {
+            if port.try_send(pkt.with_route(relative)).is_err() {
                 emitter.debug("multi-mount: forwarding to a sensor failed");
                 break;
             }
@@ -3192,18 +3176,17 @@ fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, em
             let link_index = (slot - 1) / 2;
             let link = &links[link_index];
             if (slot - 1) % 2 == 0 {
-                let Ok(mut pkt) = oper.recv(ports[link_index].receiver()) else {
+                let Ok(pkt) = oper.recv(ports[link_index].receiver()) else {
                     emitter.debug(format!("multi-mount: lost the sensor at {}", link.prefix));
                     break;
                 };
-                let Ok(absolute) = link.prefix.absolute_route(&pkt.routing) else {
+                let Ok(absolute) = link.prefix.absolute_route(&pkt.route()) else {
                     continue;
                 };
-                pkt.routing = absolute;
-                if pkt.routing.len() > tio::proto::TIO_PACKET_MAX_ROUTING_SIZE {
+                if absolute.len() > twinleaf::proto::MAX_ROUTING_SIZE {
                     continue;
                 }
-                match client.try_send(pkt) {
+                match client.try_send(pkt.with_route(absolute)) {
                     Ok(()) => {}
                     Err(tio::transport::SendError::Full) => {
                         dropped_packets += 1;
@@ -3417,26 +3400,30 @@ struct HealthMonitor {
 
 impl HealthMonitor {
     fn observe_batch(&mut self, batch: &SampleBatch, now: Instant) {
-        let key = (batch.route(), batch.stream_key().stream_id);
+        let key = (batch.route(), batch.stream_key().stream_id.value());
         let stats = self.streams.entry(key).or_insert_with(|| StreamHealth {
-            name: batch.stream().name.clone(),
-            session_id: Some(batch.device().session_id),
+            name: batch.stream().name.to_string(),
+            session_id: Some(batch.device().session.value()),
             ..Default::default()
         });
-        stats.name = batch.stream().name.clone();
+        stats.name = batch.stream().name.to_string();
 
         // A batch carries at most one boundary, anchored at its first row.
         if let Some(boundary) = batch.boundary() {
-            match boundary.reason {
-                BoundaryReason::SessionChanged { new, .. } => stats.reset_for_new_session(new),
+            match *boundary {
+                BoundaryReason::SessionChanged { new, .. } => {
+                    stats.reset_for_new_session(new.value())
+                }
                 BoundaryReason::SamplesLost { expected, received } => {
-                    stats.samples_dropped += u64::from(received.wrapping_sub(expected));
+                    stats.samples_dropped +=
+                        u64::from(received.value().wrapping_sub(expected.value()));
                 }
                 _ => {}
             }
         }
 
         for (&n, &t) in batch.sample_numbers().iter().zip(batch.timestamps()) {
+            let n = n.value();
             if stats.last_n.map(|last| n != last).unwrap_or(true) {
                 stats.last_seen = Some(now);
             }
@@ -3482,78 +3469,38 @@ fn finite_or_null(value: f64) -> Value {
     }
 }
 
-enum BridgeTreeMsg {
-    Items(Vec<TreeItem>),
-    /// The parser panicked inside `recv`; the worker backs off and keeps
-    /// reading, so a malformed packet degrades one drain rather than the
-    /// whole session.
-    Panic(String),
-    Disconnected,
+/// The most batches one session-loop wakeup processes: the first one received
+/// plus whatever is already queued behind it, so a 1 kHz stream costs one
+/// wakeup per burst rather than per packet.
+const BATCH_BUNDLE_CAP: usize = 256;
+
+/// Gather the batches queued behind `first` without blocking. A lag gap is
+/// noted and skipped; a disconnect surfaces on the next blocking receive.
+fn bundle_batches(
+    first: SampleBatch,
+    batches: &twinleaf::device::Receiver<SampleBatch>,
+    emitter: &Emitter,
+) -> Vec<SampleBatch> {
+    let mut bundle = vec![first];
+    while bundle.len() < BATCH_BUNDLE_CAP {
+        match batches.try_recv() {
+            Ok(Some(batch)) => bundle.push(batch),
+            Ok(None) | Err(RecvError::Disconnected) | Err(RecvError::Timeout) => break,
+            Err(RecvError::Lagged(skipped)) => emitter.debug(format!(
+                "session loop fell behind; {skipped} sample batch(es) dropped"
+            )),
+        }
+    }
+    bundle
 }
 
-/// How long the worker lingers after the first item to bundle the packets
-/// right behind it, and the most items one bundle may carry. The linger
-/// bounds the added delivery latency; it sits far under the 33 ms plot
-/// cadence.
-const TREE_BUNDLE_WINDOW: Duration = Duration::from_millis(2);
-const TREE_BUNDLE_CAP: usize = 256;
-
-/// Owns the `DeviceTree` on a dedicated thread and forwards its items over a
-/// channel, so the session loop can `select!` across data, commands, proxy
-/// status, and timers. Items travel in bundles so a 1 kHz stream wakes the
-/// session loop per burst rather than per packet. The worker exits when the
-/// receiver is dropped.
-fn spawn_bridge_tree_worker(mut tree: DeviceTree) -> Receiver<BridgeTreeMsg> {
-    let (tx, rx) = channel::unbounded();
-    thread::Builder::new()
-        .name("tree-worker".into())
-        .spawn(move || loop {
-            let mut items = Vec::new();
-            let mut failure = None;
-
-            match panic::catch_unwind(AssertUnwindSafe(|| tree.recv())) {
-                Ok(Ok(item)) => items.push(item),
-                Ok(Err(_)) => failure = Some(BridgeTreeMsg::Disconnected),
-                Err(panic) => failure = Some(BridgeTreeMsg::Panic(panic_message(panic))),
-            }
-
-            if failure.is_none() {
-                let deadline = Instant::now() + TREE_BUNDLE_WINDOW;
-                while items.len() < TREE_BUNDLE_CAP {
-                    match panic::catch_unwind(AssertUnwindSafe(|| tree.recv_deadline(deadline))) {
-                        Ok(Ok(item)) => items.push(item),
-                        Ok(Err(proxy::RecvTimeoutError::Timeout)) => break,
-                        Ok(Err(proxy::RecvTimeoutError::ProxyDisconnected)) => {
-                            failure = Some(BridgeTreeMsg::Disconnected);
-                            break;
-                        }
-                        Err(panic) => {
-                            failure = Some(BridgeTreeMsg::Panic(panic_message(panic)));
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if !items.is_empty() && tx.send(BridgeTreeMsg::Items(items)).is_err() {
-                return;
-            }
-            match failure {
-                None => {}
-                Some(BridgeTreeMsg::Disconnected) => {
-                    let _ = tx.send(BridgeTreeMsg::Disconnected);
-                    return;
-                }
-                Some(message) => {
-                    if tx.send(message).is_err() {
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(250));
-                }
-            }
-        })
-        .expect("failed to spawn tree worker");
-    rx
+/// The `deviceEvent` text the app parses: `RpcInvalidated(Name("x"))` keeps
+/// its Debug form, while a metadata snapshot is named rather than dumped.
+fn device_event_summary(event: &DeviceEvent) -> String {
+    match event {
+        DeviceEvent::Metadata(_) => "Metadata".to_string(),
+        other => format!("{other:?}"),
+    }
 }
 
 fn run_session(
@@ -3599,11 +3546,11 @@ fn run_session(
     let (proxy_status_tx, proxy_status_rx) = channel::unbounded();
     let (status_tx, mut status_rx) = channel::unbounded();
     spawn_proxy_status_forwarder(url.clone(), proxy_status_rx, status_tx, emitter.clone());
-    let proxy = Arc::new(proxy::Interface::new_proxy(
+    let connection = Connection::open_with(
         &connect_url,
         Some(CONNECTION_STARTUP_TIMEOUT),
         Some(proxy_status_tx),
-    ));
+    );
 
     let mut pending_startup_commands = VecDeque::new();
     let retry_transient_connect_failures = is_retryable_connect_url(&connect_url);
@@ -3619,7 +3566,7 @@ fn run_session(
     }
 
     let mut discovery = match discover_devices_until_available(
-        &proxy,
+        &connection,
         &url,
         &root_route,
         &command_rx,
@@ -3651,28 +3598,22 @@ fn run_session(
     let mut ingest_profiler = StreamIngestProfiler::new();
     let mut stream_value_profiler = StreamValueEmitProfiler::new();
     let mut loop_profiler = SessionLoopProfiler::new();
-    let packet_monitor_port = match proxy.subtree_full(root_route.clone()) {
-        Ok(port) => Some(port),
-        Err(err) => {
-            emitter.error(format!("Failed to open packet monitor port: {err:?}"));
-            None
-        }
-    };
-    let device_tree = match DeviceTree::open(&proxy, root_route) {
-        Ok(tree) => tree,
-        Err(err) => {
-            emitter.error(format!("Failed to open device tree: {err:?}"));
-            return;
-        }
-    };
-    let mut tree_rx = spawn_bridge_tree_worker(device_tree);
+    let tree = connection.tree(root_route);
+    // Raw packets feed the .tio log and the wire byte counter. Sample batches
+    // and events arrive on their own receivers, already filtered to the
+    // subtree and pumped by the library on its own thread.
+    let packet_monitor_port = Some(tree.packets());
+    let batches = tree.samples();
+    let mut batch_rx = batches.receiver().clone();
+    let events = tree.events();
+    let mut event_rx = events.receiver().clone();
 
     emitter.status("streaming", format!("Streaming from {url}"));
     // Lazily check for available firmware upgrades on a background thread so
     // neither the network round-trip nor the per-device dev.desc RPC blocks the
     // streaming loop.
     spawn_upgrade_check(
-        Arc::clone(&proxy),
+        connection.clone(),
         discovery.devices.clone(),
         emitter.clone(),
     );
@@ -3704,29 +3645,27 @@ fn run_session(
             Ok(queued)
         } else {
             channel::select! {
-                recv(tree_rx) -> msg => {
-                    match msg {
-                        Ok(BridgeTreeMsg::Items(items)) => for item in items {
-                            match item {
-                            TreeItem::Batch(batch) => {
+                recv(batch_rx) -> msg => {
+                    match batches.resolve(msg) {
+                        Ok(first) => for batch in bundle_batches(first, &batches, &emitter) {
                             let process_start = Instant::now();
                             let now = Instant::now();
                             health.observe_batch(&batch, now);
                             let route = batch.route();
-                            let stream_key = (route, batch.stream_key().stream_id);
+                            let stream_key = (route, batch.stream_key().stream_id.value());
                             // A sample counter that goes backward means the
                             // device rebooted (its counter restarted).
                             let mut device_reset = false;
-                            if let (Some(&first_n), Some(&last_n)) = (
-                                batch.sample_numbers().first(),
+                            if let (Some(first_n), Some(&last_n)) = (
+                                batch.sample_numbers().first().map(|n| n.value()),
                                 last_sample_number_by_stream.get(&stream_key),
                             ) {
                                 if first_n < last_n {
                                     device_reset = true;
                                 }
                             }
-                            if let Some(&n) = batch.sample_numbers().last() {
-                                last_sample_number_by_stream.insert(stream_key, n);
+                            if let Some(n) = batch.sample_numbers().last() {
+                                last_sample_number_by_stream.insert(stream_key, n.value());
                             }
 
                             if let Some(first_row) = batch.row(0) {
@@ -3785,7 +3724,7 @@ fn run_session(
                                         format!("Device on {route} restarted; reloading settings"),
                                     );
                                     if refresh_route_metadata(
-                                        &proxy,
+                                        &connection,
                                         &url,
                                         &route,
                                         &root_route,
@@ -3799,24 +3738,40 @@ fn run_session(
                                     emitter.status("streaming", format!("Streaming from {url}"));
                                 }
                             }
+                        },
+                        Err(RecvError::Lagged(skipped)) => emitter.debug(format!(
+                            "session loop fell behind; {skipped} sample batch(es) dropped"
+                        )),
+                        Err(RecvError::Timeout) => {}
+                        Err(RecvError::Disconnected) => {
+                            emitter.error("Twinleaf stream ended: proxy disconnected");
+                            batch_rx = channel::never();
                         }
-                            TreeItem::Event(event) => {
+                    }
+                    continue;
+                },
+                recv(event_rx) -> msg => {
+                    match events.resolve(msg) {
+                        Ok(event) => {
                             let event_start = Instant::now();
                             loop_profile.device_events += 1;
                             match event {
-                                TreeEvent::Device { route, event } => {
+                                Event::Device { route, event } => {
                                     if let DeviceEvent::RpcInvalidated(method) = &event {
                                         emit_rpc_invalidated(&emitter, &route, method);
                                     }
                                     emitter.emit(&json!({
                                         "type": "deviceEvent",
                                         "route": route.to_string(),
-                                        "event": format!("{event:?}")
+                                        "event": device_event_summary(&event)
                                     }));
                                 }
-                                TreeEvent::RouteDiscovered(route) => {
+                                Event::Link { subtree, event } => {
+                                    emitter.debug(format!("link event on {subtree}: {event:?}"));
+                                }
+                                Event::Tree { route, event: TreeEvent::RouteDiscovered } => {
                                     if add_late_discovered_route(
-                                        &proxy,
+                                        &connection,
                                         &url,
                                         &route,
                                         &root_route,
@@ -3831,17 +3786,11 @@ fn run_session(
                             }
                             loop_profile.event_elapsed += event_start.elapsed();
                         }
-                            }
-                        },
-                        Ok(BridgeTreeMsg::Panic(message)) => {
-                            emitter.error(format!(
-                                "Twinleaf parser panic while draining stream data: {message}"
-                            ));
-                        }
-                        Ok(BridgeTreeMsg::Disconnected) | Err(_) => {
-                            emitter.error("Twinleaf stream ended: proxy disconnected");
-                            tree_rx = channel::never();
-                        }
+                        Err(RecvError::Lagged(skipped)) => emitter.debug(format!(
+                            "session loop fell behind; {skipped} device event(s) dropped"
+                        )),
+                        Err(RecvError::Timeout) => {}
+                        Err(RecvError::Disconnected) => event_rx = channel::never(),
                     }
                     continue;
                 },
@@ -3879,23 +3828,22 @@ fn run_session(
                     if monitor_port_alive {
                         if let Some(port) = &packet_monitor_port {
                             let raw_log_start = Instant::now();
-                            let (raw_packets, alive) = drain_packet_monitor_port(
+                            let drain = drain_packet_monitor_port(
                                 port,
-                                &root_route,
                                 &mut logger,
                                 &latest_stream_timestamp_by_route,
                                 &emitter,
                             );
-                            loop_profile.raw_packets += raw_packets;
+                            loop_profile.raw_packets += drain.packets;
                             loop_profile.raw_log_elapsed += raw_log_start.elapsed();
-                            monitor_port_alive = alive;
+                            monitor_port_alive = drain.alive;
                         }
                     }
 
                     if !discovery.incomplete_rpc_routes.is_empty()
                         && last_rpc_metadata_recovery.elapsed() >= RPC_METADATA_RECOVERY_INTERVAL
                     {
-                        if recover_incomplete_rpc_metadata(&proxy, &mut discovery, &emitter) {
+                        if recover_incomplete_rpc_metadata(&connection, &mut discovery, &emitter) {
                             rpc_index = build_rpc_index(&discovery.devices);
                             emit_metadata_devices(&emitter, &discovery.devices);
                         }
@@ -4045,7 +3993,7 @@ fn run_session(
                     route,
                     name,
                     arg,
-                } => dispatch_rpc(&proxy, &rpc_index, request_id, route, name, arg, &emitter),
+                } => dispatch_rpc(&connection, &rpc_index, request_id, route, name, arg, &emitter),
                 SessionCommand::CopyViewData {
                     request_id,
                     pane_id,
@@ -4063,13 +4011,13 @@ fn run_session(
                 }
                 SessionCommand::CheckUpgrade => {
                     spawn_upgrade_check(
-                        Arc::clone(&proxy),
+                        connection.clone(),
                         discovery.devices.clone(),
                         emitter.clone(),
                     );
                 }
                 SessionCommand::PerformUpgrade { route } => {
-                    spawn_upgrade_flash(Arc::clone(&proxy), route, emitter.clone());
+                    spawn_upgrade_flash(connection.clone(), route, emitter.clone());
                 }
             }
         }
@@ -4119,7 +4067,7 @@ fn flush_route_history(route: &str, column_states: &mut HashMap<ColumnKeyDto, Co
 /// when the refreshed device was applied (the caller then re-emits `metadata`,
 /// which also prompts the app to reload all readable RPC values).
 fn refresh_route_metadata(
-    proxy: &Arc<proxy::Interface>,
+    connection: &Connection,
     url: &str,
     route: &DeviceRoute,
     root_route: &DeviceRoute,
@@ -4129,7 +4077,7 @@ fn refresh_route_metadata(
     rpc_index: &mut HashMap<(String, String), RpcDto>,
 ) -> bool {
     let fetched = match panic::catch_unwind(AssertUnwindSafe(|| {
-        fetch_device(proxy, url, route, None, emitter, false)
+        fetch_device(connection, url, route, None, emitter, false)
     })) {
         Ok(Ok(fetched)) => fetched,
         Ok(Err(err)) => {
@@ -4186,12 +4134,12 @@ fn refresh_route_metadata(
 }
 
 #[cfg(not(feature = "firmware"))]
-fn spawn_upgrade_check(_proxy: Arc<proxy::Interface>, _devices: Vec<DeviceDto>, emitter: Emitter) {
+fn spawn_upgrade_check(_connection: Connection, _devices: Vec<DeviceDto>, emitter: Emitter) {
     emitter.debug("firmware upgrade support not compiled in");
 }
 
 #[cfg(not(feature = "firmware"))]
-fn spawn_upgrade_flash(_proxy: Arc<proxy::Interface>, _route: String, emitter: Emitter) {
+fn spawn_upgrade_flash(_connection: Connection, _route: String, emitter: Emitter) {
     emitter.debug("firmware upgrade support not compiled in");
 }
 
@@ -4211,7 +4159,7 @@ fn installed_version_text(installed: &firmware::InstalledFirmware) -> String {
 /// devices that have a strictly-newer release available. Runs on its own thread
 /// (network + RPC) so the streaming loop is never blocked.
 #[cfg(feature = "firmware")]
-fn spawn_upgrade_check(proxy: Arc<proxy::Interface>, devices: Vec<DeviceDto>, emitter: Emitter) {
+fn spawn_upgrade_check(connection: Connection, devices: Vec<DeviceDto>, emitter: Emitter) {
     let spawn_error_emitter = emitter.clone();
     let spawned = thread::Builder::new()
         .name("twinleaf-upgrade-check".into())
@@ -4223,10 +4171,8 @@ fn spawn_upgrade_check(proxy: Arc<proxy::Interface>, devices: Vec<DeviceDto>, em
                 let Ok(route) = DeviceRoute::from_str(&device.route) else {
                     continue;
                 };
-                let Ok(port) = proxy.device_rpc(route) else {
-                    continue;
-                };
-                let installed = match firmware::query_installed(&port) {
+                let target = connection.device(route);
+                let installed = match firmware::query_installed(&target) {
                     Ok(installed) => installed,
                     Err(err) => {
                         emitter.debug(format!(
@@ -4276,7 +4222,7 @@ fn spawn_upgrade_check(proxy: Arc<proxy::Interface>, devices: Vec<DeviceDto>, em
 /// events for every phase so the UI can show detailed progress. Runs on its own
 /// thread because `firmware::flash` blocks for the full upload + settle period.
 #[cfg(feature = "firmware")]
-fn spawn_upgrade_flash(proxy: Arc<proxy::Interface>, route: String, emitter: Emitter) {
+fn spawn_upgrade_flash(connection: Connection, route: String, emitter: Emitter) {
     let spawn_error_emitter = emitter.clone();
     let spawned = thread::Builder::new()
         .name("twinleaf-upgrade-flash".into())
@@ -4293,7 +4239,7 @@ fn spawn_upgrade_flash(proxy: Arc<proxy::Interface>, route: String, emitter: Emi
                 emitter.emit(&event);
             };
 
-            if let Err(message) = run_upgrade_flash(&proxy, &route, &progress) {
+            if let Err(message) = run_upgrade_flash(&connection, &route, &progress) {
                 progress("error", json!({ "message": message }));
             }
         });
@@ -4304,17 +4250,15 @@ fn spawn_upgrade_flash(proxy: Arc<proxy::Interface>, route: String, emitter: Emi
 
 #[cfg(feature = "firmware")]
 fn run_upgrade_flash(
-    proxy: &Arc<proxy::Interface>,
+    connection: &Connection,
     route: &str,
     progress: &dyn Fn(&str, Value),
 ) -> Result<(), String> {
     let device_route =
         DeviceRoute::from_str(route).map_err(|_| format!("invalid device route: {route}"))?;
-    let port = proxy
-        .device_rpc(device_route)
-        .map_err(|err| format!("could not open device: {err:?}"))?;
+    let device = connection.device(device_route);
 
-    let installed = firmware::query_installed(&port)
+    let installed = firmware::query_installed(&device)
         .map_err(|err| format!("could not read firmware: {err}"))?;
     let catalog = firmware::github::GithubCatalog::twinleaf();
     let report = firmware::check_for_update(installed, &catalog)
@@ -4333,7 +4277,7 @@ fn run_upgrade_flash(
     }
     .map_err(|err| format!("download failed: {err}"))?;
 
-    firmware::flash(&port, &firmware_data, |event| match event {
+    firmware::flash(&device, &firmware_data, |event| match event {
         FlashEvent::Stopping => progress("stopping", json!({ "message": "Stopping device" })),
         FlashEvent::Stopped(outcome) => {
             let message = match outcome {
@@ -4350,6 +4294,19 @@ fn run_upgrade_flash(
                 "total": total,
                 "fraction": if total > 0 { chunk as f64 / total as f64 } else { 0.0 },
                 "message": format!("Uploading firmware {chunk}/{total}"),
+            }),
+        ),
+        FlashEvent::Resuming {
+            chunk,
+            total,
+            error,
+        } => progress(
+            "uploading",
+            json!({
+                "chunk": chunk,
+                "total": total,
+                "fraction": if total > 0 { chunk as f64 / total as f64 } else { 0.0 },
+                "message": format!("Upload interrupted ({error}); resuming at {chunk}/{total}"),
             }),
         ),
         FlashEvent::Committing => {
@@ -4380,7 +4337,7 @@ fn run_upgrade_flash(
 /// to fetch metadata are logged at debug only — a late-arriving device that
 /// can't be reached shouldn't spam the user with errors.
 fn add_late_discovered_route(
-    proxy: &Arc<proxy::Interface>,
+    connection: &Connection,
     url: &str,
     route: &DeviceRoute,
     root_route: &DeviceRoute,
@@ -4402,7 +4359,7 @@ fn add_late_discovered_route(
         format!("Discovering new device on route {route}"),
     );
     let fetched = match panic::catch_unwind(AssertUnwindSafe(|| {
-        fetch_device(proxy, url, route, None, emitter, false)
+        fetch_device(connection, url, route, None, emitter, false)
     })) {
         Ok(Ok(fetched)) => fetched,
         Ok(Err(err)) => {
@@ -4445,7 +4402,7 @@ fn add_late_discovered_route(
 }
 
 fn recover_incomplete_rpc_metadata(
-    proxy: &Arc<proxy::Interface>,
+    connection: &Connection,
     discovery: &mut DeviceDiscoveryResult,
     emitter: &Emitter,
 ) -> bool {
@@ -4463,14 +4420,8 @@ fn recover_incomplete_rpc_metadata(
             continue;
         };
 
-        let Ok(port) = proxy.device_rpc(route.clone()) else {
-            emitter.debug(format!(
-                "RPC metadata recovery could not open RPC port for route {route}"
-            ));
-            continue;
-        };
-
-        let RpcFetchResult { rpcs, complete } = fetch_rpcs(port, &route, emitter);
+        let RpcFetchResult { rpcs, complete } =
+            fetch_rpcs(&connection.device(route), &route, emitter);
         if !rpc_lists_equivalent(&discovery.devices[device_index].rpcs, &rpcs) {
             discovery.devices[device_index].rpcs = rpcs;
             metadata_changed = true;
@@ -4499,66 +4450,70 @@ fn rpc_lists_equivalent(lhs: &[RpcDto], rhs: &[RpcDto]) -> bool {
         })
 }
 
+/// Log one raw packet; its route is already absolute.
 fn handle_monitor_packet(
-    mut packet: tio::Packet,
-    root_route: &DeviceRoute,
+    packet: tio::Packet,
     logger: &mut PacketLogger,
     latest_stream_timestamp_by_route: &HashMap<DeviceRoute, f64>,
     emitter: &Emitter,
 ) {
-    // The port's scope guarantees the route resolves; a failure would mean a
-    // packet from outside the subtree, which is safe to drop.
-    let Ok(absolute) = root_route.absolute_route(&packet.routing) else {
-        return;
-    };
-    packet.routing = absolute;
     emit_tio_log_message(
         &packet,
         latest_stream_timestamp_by_route
-            .get(&packet.routing)
+            .get(&packet.route())
             .copied(),
         emitter,
     );
-    logger.write_packet(packet, emitter);
+    logger.write_packet(&packet);
 }
 
-/// Drain everything queued on the raw monitor port. Returns the packet count
-/// and whether the port is still alive; a dead port must not be drained again
-/// or its error would repeat every tick.
+/// One pass over the raw monitor port.
+struct MonitorDrain {
+    packets: usize,
+    /// A dead port must not be drained again or its error would repeat every
+    /// tick.
+    alive: bool,
+}
+
+/// Drain everything queued on the raw packet subscription. A lag gap means the
+/// log missed packets, which is noted; only a disconnect ends the drain.
 fn drain_packet_monitor_port(
-    port: &proxy::Port,
-    root_route: &DeviceRoute,
+    packets: &twinleaf::device::Receiver<tio::Packet>,
     logger: &mut PacketLogger,
     latest_stream_timestamp_by_route: &HashMap<DeviceRoute, f64>,
     emitter: &Emitter,
-) -> (usize, bool) {
-    let mut packet_count = 0;
+) -> MonitorDrain {
+    let mut drain = MonitorDrain {
+        packets: 0,
+        alive: true,
+    };
     loop {
-        match port.try_recv() {
-            Ok(packet) => {
-                handle_monitor_packet(
-                    packet,
-                    root_route,
-                    logger,
-                    latest_stream_timestamp_by_route,
-                    emitter,
-                );
-                packet_count += 1;
+        match packets.try_recv() {
+            Ok(Some(packet)) => {
+                handle_monitor_packet(packet, logger, latest_stream_timestamp_by_route, emitter);
+                drain.packets += 1;
             }
-            Err(proxy::RecvError::WouldBlock) => return (packet_count, true),
+            Ok(None) => return drain,
+            Err(RecvError::Lagged(skipped)) => emitter.debug(format!(
+                "raw packet log fell behind; {skipped} packet(s) missed"
+            )),
             Err(err) => {
-                emitter.error(format!("Raw logging port failed: {err:?}"));
-                return (packet_count, false);
+                emitter.error(format!("Raw logging port failed: {err}"));
+                drain.alive = false;
+                return drain;
             }
         }
     }
 }
 
 fn emit_tio_log_message(packet: &tio::Packet, timestamp_seconds: Option<f64>, emitter: &Emitter) {
-    let Payload::LogMessage(log) = &packet.payload else {
+    let Payload::Log(log) = packet.payload() else {
         return;
     };
-    let message = log.message.trim_matches(char::from(0)).trim().to_string();
+    let message = String::from_utf8_lossy(log.message)
+        .trim_matches(char::from(0))
+        .trim()
+        .to_string();
     if message.is_empty() {
         return;
     }
@@ -4567,7 +4522,7 @@ fn emit_tio_log_message(packet: &tio::Packet, timestamp_seconds: Option<f64>, em
         .unwrap_or_else(|| f64::from(log.data) / 1_000.0);
     emitter.emit(&json!({
         "type": "logMessage",
-        "route": packet.routing.to_string(),
+        "route": packet.route().to_string(),
         "timestampSeconds": timestamp_seconds,
         "message": message
     }));
@@ -4728,7 +4683,7 @@ struct RpcFetchResult {
 }
 
 fn discover_devices_until_available(
-    proxy: &Arc<proxy::Interface>,
+    connection: &Connection,
     url: &str,
     root_route: &DeviceRoute,
     command_rx: &Receiver<SessionCommand>,
@@ -4748,7 +4703,7 @@ fn discover_devices_until_available(
             "discovering",
             format!("Discovering devices on {url} (attempt {attempt})"),
         );
-        let discovery = discover_devices(proxy, url, root_route, emitter, false);
+        let discovery = discover_devices(connection, url, root_route, emitter, false);
         if !discovery.devices.is_empty() {
             return Some(discovery);
         }
@@ -4772,31 +4727,24 @@ fn discover_devices_until_available(
 }
 
 fn discover_devices(
-    proxy: &Arc<proxy::Interface>,
+    connection: &Connection,
     url: &str,
     root_route: &DeviceRoute,
     emitter: &Emitter,
     report_errors: bool,
 ) -> DeviceDiscoveryResult {
-    // A short-lived tree over the whole topology; `named_routes` observes
-    // heartbeats passively and pairs each route with its dev.name over the
-    // same port. It is a client port on the in-process proxy Interface, not
-    // a second connection to the hardware.
-    let mut named_routes = Vec::new();
-    match proxy.tree_full() {
-        Ok(discovery_port) => {
-            emitter.debug("opened tree_full discovery port");
-            let mut scan = DeviceTree::new(discovery_port, DeviceRoute::root());
-            named_routes = scan.named_routes(Duration::from_secs(2));
-            for named in &named_routes {
-                emitter.debug(format!(
-                    "discovered route {} ({})",
-                    named.route,
-                    named.name.as_deref().unwrap_or("unnamed")
-                ));
-            }
-        }
-        Err(_) => emitter.debug("failed to open tree_full discovery port"),
+    // A view over the whole topology; `named_routes` observes heartbeats
+    // passively (the pump replays routes it already knows) and pairs each
+    // route with its dev.name over the same connection.
+    let mut named_routes = connection
+        .tree(DeviceRoute::root())
+        .named_routes(Duration::from_secs(2));
+    for named in &named_routes {
+        emitter.debug(format!(
+            "discovered route {} ({})",
+            named.route,
+            named.name.as_deref().unwrap_or("unnamed")
+        ));
     }
 
     if named_routes.is_empty() {
@@ -4817,7 +4765,7 @@ fn discover_devices(
         emitter.debug(format!("fetching device metadata/RPCs for route {route}"));
         match panic::catch_unwind(AssertUnwindSafe(|| {
             fetch_device(
-                proxy,
+                connection,
                 url,
                 &route,
                 named.name.as_deref(),
@@ -4910,26 +4858,6 @@ fn route_depth(route: &str) -> usize {
         .count()
 }
 
-fn payload_name(payload: &Payload) -> &'static str {
-    match payload {
-        Payload::LogMessage(_) => "LogMessage",
-        Payload::RpcRequest(_) => "RpcRequest",
-        Payload::RpcReply(_) => "RpcReply",
-        Payload::RpcError(_) => "RpcError",
-        Payload::LegacyTimebaseUpdate(_) => "LegacyTimebaseUpdate",
-        Payload::LegacySourceUpdate(_) => "LegacySourceUpdate",
-        Payload::LegacyStreamUpdate(_) => "LegacyStreamUpdate",
-        Payload::Heartbeat(_) => "Heartbeat",
-        Payload::Metadata(_) => "Metadata",
-        Payload::Settings(_) => "Settings",
-        Payload::LegacyStreamData(_) => "LegacyStreamData",
-        Payload::StreamData(_) => "StreamData",
-        Payload::ProxyStatus(_) => "ProxyStatus",
-        Payload::RpcUpdate(_) => "RpcUpdate",
-        Payload::Unknown(_) => "Unknown",
-    }
-}
-
 fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = err.downcast_ref::<String>() {
         message.clone()
@@ -4941,30 +4869,17 @@ fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
 }
 
 fn fetch_device(
-    proxy: &Arc<proxy::Interface>,
+    connection: &Connection,
     url: &str,
     route: &DeviceRoute,
     fallback_name: Option<&str>,
     emitter: &Emitter,
     report_errors: bool,
 ) -> Result<FetchedDevice, String> {
-    let rpc_fetch = match proxy.device_rpc(route.clone()) {
-        Ok(port) => fetch_rpcs(port, route, emitter),
-        Err(err) => {
-            emit_metadata_issue(
-                emitter,
-                report_errors,
-                format!("Failed to open RPC port for route {route}: {err:?}"),
-            );
-            RpcFetchResult {
-                rpcs: Vec::new(),
-                complete: false,
-            }
-        }
-    };
+    let rpc_fetch = fetch_rpcs(&connection.device(*route), route, emitter);
 
     let (meta, streams, full_metadata) =
-        match panic::catch_unwind(AssertUnwindSafe(|| fetch_stream_metadata(proxy, route))) {
+        match panic::catch_unwind(AssertUnwindSafe(|| fetch_stream_metadata(connection, route))) {
             Ok(Ok(metadata)) => {
                 let (meta, streams) = metadata_to_stream_dtos(route, &metadata);
                 (meta, streams, Some(metadata))
@@ -5021,11 +4936,13 @@ fn fallback_device_meta(route: &DeviceRoute, fallback_name: Option<&str>) -> Dev
 }
 
 fn fetch_stream_metadata(
-    proxy: &Arc<proxy::Interface>,
+    connection: &Connection,
     route: &DeviceRoute,
 ) -> Result<DeviceMetadataSnapshot, String> {
-    let mut data_device = Device::open(proxy, route.clone()).map_err(|err| format!("{err:?}"))?;
-    data_device.get_metadata().map_err(|err| format!("{err:?}"))
+    connection
+        .device(*route)
+        .metadata()
+        .map_err(|err| err.to_string())
 }
 
 fn metadata_to_device_dto(
@@ -5049,46 +4966,51 @@ fn metadata_to_stream_dtos(
     route: &DeviceRoute,
     metadata: &DeviceMetadataSnapshot,
 ) -> (DeviceMetaDto, Vec<StreamDto>) {
+    let device = metadata.device();
     let meta = DeviceMetaDto {
-        serial_number: metadata.device.serial_number.clone(),
-        firmware_hash: metadata.device.firmware_hash.clone(),
-        n_streams: metadata.device.n_streams,
-        session_id: metadata.device.session_id,
-        name: metadata.device.name.clone(),
+        serial_number: device.serial.to_string(),
+        firmware_hash: device.firmware.to_string(),
+        n_streams: usize::from(device.n_streams),
+        session_id: device.session.value(),
+        name: device.name.to_string(),
     };
 
     let mut streams = Vec::new();
-    let mut stream_ids: Vec<u8> = metadata.streams.keys().copied().collect();
-    stream_ids.sort_unstable();
+    let mut stream_snapshots: Vec<_> = metadata.streams().collect();
+    stream_snapshots.sort_by_key(|(stream_id, _)| *stream_id);
 
-    for stream_id in stream_ids {
-        let stream = metadata.streams.get(&stream_id).unwrap();
-        let decimation = if stream.segment.decimation == 0 {
+    for (stream_id, stream) in stream_snapshots {
+        let segment = stream.segment();
+        let decimation = if segment.decimation == 0 {
             1.0
         } else {
-            stream.segment.decimation as f64
+            f64::from(segment.decimation)
         };
-        let effective_sampling_rate = stream.segment.sampling_rate as f64 / decimation;
+        let effective_sampling_rate = f64::from(segment.sampling_rate) / decimation;
 
         let mut columns: Vec<ColumnDto> = stream
-            .columns
-            .iter()
+            .columns()
             .map(|column| ColumnDto {
-                key: ColumnKeyDto::raw(route.to_string(), stream.stream.stream_id, column.index),
-                name: column.name.clone(),
-                units: column.units.clone(),
-                data_type: format!("{:?}", column.data_type),
-                description: column.description.clone(),
+                key: ColumnKeyDto::raw(
+                    route.to_string(),
+                    stream_id.value(),
+                    usize::from(column.index.value()),
+                ),
+                name: column.name.to_string(),
+                units: column.units.to_string(),
+                data_type: data_type_name(column.data_type).to_string(),
+                description: column.description.to_string(),
                 display_value: None,
             })
             .collect();
         columns.sort_by_key(|column| column.key.column_index);
 
+        let wire_stream = stream.stream();
         streams.push(StreamDto {
-            stream_id: stream.stream.stream_id,
-            name: stream.stream.name.clone(),
-            n_columns: stream.stream.n_columns,
-            sample_size: stream.stream.sample_size,
+            stream_id: stream_id.value(),
+            name: wire_stream.name.to_string(),
+            n_columns: usize::from(wire_stream.n_columns),
+            sample_size: usize::from(wire_stream.sample_size),
             effective_sampling_rate,
             columns,
         });
@@ -5097,12 +5019,11 @@ fn metadata_to_stream_dtos(
     (meta, streams)
 }
 
-fn fetch_rpcs(port: proxy::Port, route: &DeviceRoute, emitter: &Emitter) -> RpcFetchResult {
+fn fetch_rpcs(device: &Device, route: &DeviceRoute, emitter: &Emitter) -> RpcFetchResult {
     emitter.debug(format!("fetching RPC list for route {route}"));
-    let client = RpcClient::new(port);
     let registry = match retry_rpc_metadata_request(route, "rpc registry", emitter, || {
-        client
-            .registry(route)
+        device
+            .rpc_registry()
             .map_err(RpcMetadataRequestError::Registry)
     }) {
         Ok(registry) => registry,
@@ -5166,10 +5087,8 @@ impl RpcMetadataRequestError {
     fn is_retryable(&self) -> bool {
         match self {
             Self::Registry(RpcRegistryError::DeviceRpcError(err)) => match err {
-                proxy::RpcError::ResponseLost | proxy::RpcError::Timeout => true,
-                proxy::RpcError::DeviceError(payload) => {
-                    matches!(payload.error, tio::proto::RpcErrorCode::Timeout)
-                }
+                CallError::ResponseLost | CallError::Timeout => true,
+                CallError::DeviceError(payload) => matches!(payload.error, RpcError::Timeout),
                 _ => false,
             },
             Self::Registry(_) | Self::Panic(_) => false,
@@ -5287,7 +5206,7 @@ fn load_log_file(path: &str, emitter: &Emitter) -> Result<PlaybackSession, Strin
         };
         packets += 1;
 
-        let route = packet.routing;
+        let route = packet.route();
         emit_tio_log_message(
             &packet,
             latest_stream_timestamp_by_route.get(&route).copied(),
@@ -5481,7 +5400,7 @@ fn write_batch_csv_records<W: Write>(writer: &mut W, batch: &SampleBatch) -> io:
     let route = batch.route().to_string();
     let device = batch.device();
     let stream = batch.stream();
-    let session_id = device.session_id.to_string();
+    let session_id = device.session.to_string();
     let stream_id = batch.stream_key().stream_id.to_string();
     let segment_id = batch.segment().segment_id.to_string();
     let mut rows = 0usize;
@@ -5493,17 +5412,17 @@ fn write_batch_csv_records<W: Write>(writer: &mut W, batch: &SampleBatch) -> io:
             let metadata = series.metadata();
             let fields = vec![
                 route.clone(),
-                device.name.clone(),
+                device.name.to_string(),
                 session_id.clone(),
                 stream_id.clone(),
-                stream.name.clone(),
+                stream.name.to_string(),
                 segment_id.clone(),
                 sample_number.clone(),
                 timestamp.clone(),
                 series.index().to_string(),
-                metadata.name.clone(),
-                metadata.units.clone(),
-                format!("{:?}", metadata.data_type),
+                metadata.name.to_string(),
+                metadata.units.to_string(),
+                data_type_name(metadata.data_type).to_string(),
                 value.to_string(),
             ];
             write_csv_record(writer, &fields)?;
@@ -5530,7 +5449,13 @@ fn export_log_hdf5(
     // The export flow writes into a file the save panel already created (the
     // sandbox grants access to that exact path), so overwriting is confirmed
     // by construction; `with_options` would refuse the existing file.
-    let mut writer = Hdf5Appender::with_overwrite_options(
+    // The app's save panel already confirmed replacing an existing file, and
+    // the appender itself refuses to overwrite, so clear the path first.
+    if output_path.exists() {
+        std::fs::remove_file(output_path)
+            .map_err(|err| format!("Failed to replace {}: {err}", output_path.display()))?;
+    }
+    let mut writer = Hdf5Appender::with_options(
         output_path,
         true,
         false,
@@ -5662,14 +5587,18 @@ fn process_batch(
     let mut active_hits = 0usize;
     let route = batch.route();
     let route_string = route.to_string();
-    let stream_id = batch.stream_key().stream_id;
+    let stream_id = batch.stream_key().stream_id.value();
     let segment = batch.segment();
-    let effective_rate = segment.sampling_rate as f64 / segment.decimation.max(1) as f64;
+    let effective_rate = f64::from(segment.sampling_rate) / f64::from(segment.decimation.max(1));
     let timestamps = batch.timestamps();
     // Per-column bookkeeping hoists out of the row loop: a batch covers one
     // (route, stream), so key, pane filter, and rate are loop-invariant.
     for series in batch.schema() {
-        let key = ColumnKeyDto::raw(route_string.clone(), stream_id, series.index());
+        let key = ColumnKeyDto::raw(
+            route_string.clone(),
+            stream_id,
+            usize::from(series.index().value()),
+        );
 
         let active_fpcs_panes: Vec<_> = plot_panes
             .iter()
@@ -5693,7 +5622,7 @@ fn process_batch(
         let state = column_states.entry(key.clone()).or_insert_with(|| {
             ColumnState::new(
                 format!("{} stream {} column {}", route, stream_id, series.index()),
-                metadata.units.clone(),
+                metadata.units.to_string(),
                 effective_rate,
             )
         });
@@ -6165,20 +6094,19 @@ fn earliest_time(current: Option<f64>, candidate: Option<f64>) -> Option<f64> {
 
 fn batch_time_reference_start(batch: &SampleBatch) -> Option<f64> {
     let segment = batch.segment();
-    if segment.time_ref_session_id == 0 {
+    if segment.timeref_session.value() == 0 {
         return None;
     }
 
-    match &segment.time_ref_epoch {
-        MetadataEpoch::Unix | MetadataEpoch::Systime => {
-            let start = batch.row(0)?.timestamp_begin();
-            if start.is_finite() && start > 0.0 {
-                Some(start)
-            } else {
-                None
-            }
+    if segment.epoch == Epoch::UNIX || segment.epoch == Epoch::SYSTIME {
+        let start = batch.row(0)?.timestamp_begin();
+        if start.is_finite() && start > 0.0 {
+            Some(start)
+        } else {
+            None
         }
-        _ => None,
+    } else {
+        None
     }
 }
 
@@ -7157,7 +7085,7 @@ fn solve_3x3(mut matrix: [[f64; 4]; 3]) -> Option<[f64; 3]> {
 }
 
 fn dispatch_rpc(
-    proxy: &Arc<proxy::Interface>,
+    connection: &Connection,
     rpc_index: &HashMap<(String, String), RpcDto>,
     request_id: String,
     route: String,
@@ -7177,14 +7105,14 @@ fn dispatch_rpc(
 
     if rpc_base_type(&rpc_meta.arg_type) == "capture" {
         let request_id_for_error = request_id.clone();
-        let proxy = Arc::clone(proxy);
+        let connection = connection.clone();
         let worker_emitter = emitter.clone();
         let error_emitter = emitter.clone();
         if let Err(err) = thread::Builder::new()
             .name("twinleaf-capture-rpc".into())
             .spawn(move || {
                 execute_rpc(
-                    &proxy,
+                    &connection,
                     rpc_meta,
                     request_id,
                     route,
@@ -7204,11 +7132,11 @@ fn dispatch_rpc(
         return;
     }
 
-    execute_rpc(proxy, rpc_meta, request_id, route, name, arg, emitter);
+    execute_rpc(connection, rpc_meta, request_id, route, name, arg, emitter);
 }
 
 fn execute_rpc(
-    proxy: &Arc<proxy::Interface>,
+    connection: &Connection,
     rpc_meta: RpcDto,
     request_id: String,
     route: String,
@@ -7229,21 +7157,10 @@ fn execute_rpc(
         }
     };
 
-    let port = match proxy.device_rpc(route_value) {
-        Ok(port) => port,
-        Err(err) => {
-            emitter.emit(&json!({
-                "type": "rpcResult",
-                "requestId": request_id,
-                "ok": false,
-                "error": format!("{err:?}")
-            }));
-            return;
-        }
-    };
+    let device = connection.device(route_value);
 
     if rpc_base_type(&rpc_meta.arg_type) == "capture" {
-        execute_capture_rpc(port, request_id, route, name, emitter);
+        execute_capture_rpc(&device, request_id, route, name, emitter);
         return;
     }
 
@@ -7260,7 +7177,7 @@ fn execute_rpc(
         }
     };
 
-    match panic::catch_unwind(AssertUnwindSafe(|| port.raw_rpc(&name, &arg_bytes))) {
+    match panic::catch_unwind(AssertUnwindSafe(|| device.raw_rpc(&name, &arg_bytes))) {
         Ok(Ok(reply)) => emitter.emit(&json!({
             "type": "rpcResult",
             "requestId": request_id,
@@ -7289,17 +7206,14 @@ fn execute_rpc(
 }
 
 fn execute_capture_rpc(
-    port: proxy::Port,
+    device: &Device,
     request_id: String,
     route: String,
     name: String,
     emitter: &Emitter,
 ) {
     const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
-    match panic::catch_unwind(AssertUnwindSafe(|| {
-        let capture_rpc = PortCaptureRpc { port: &port };
-        read_capture(&capture_rpc, &name, CAPTURE_TIMEOUT)
-    })) {
+    match panic::catch_unwind(AssertUnwindSafe(|| read_capture(device, &name, CAPTURE_TIMEOUT))) {
         Ok(Ok(readout)) => emitter.emit(&json!({
             "type": "rpcResult",
             "requestId": request_id,
@@ -7324,16 +7238,6 @@ fn execute_capture_rpc(
             "name": name,
             "error": format!("Twinleaf parser panic while calling RPC: {}", panic_message(err))
         })),
-    }
-}
-
-struct PortCaptureRpc<'a> {
-    port: &'a proxy::Port,
-}
-
-impl CaptureRpc for PortCaptureRpc<'_> {
-    fn capture_raw_rpc(&self, name: &str, arg: &[u8]) -> Result<Vec<u8>, proxy::RpcError> {
-        self.port.raw_rpc(name, arg)
     }
 }
 
@@ -7388,6 +7292,25 @@ fn capture_readout_to_json_value(readout: &CaptureReadout) -> Value {
             "xStride": metadata.x_stride
         }
     })
+}
+
+/// Column type names as the app has always displayed them.
+fn data_type_name(data_type: DataType) -> &'static str {
+    match data_type {
+        DataType::U8 => "UInt8",
+        DataType::I8 => "Int8",
+        DataType::U16 => "UInt16",
+        DataType::I16 => "Int16",
+        DataType::U24 => "UInt24",
+        DataType::I24 => "Int24",
+        DataType::U32 => "UInt32",
+        DataType::I32 => "Int32",
+        DataType::U64 => "UInt64",
+        DataType::I64 => "Int64",
+        DataType::F32 => "Float32",
+        DataType::F64 => "Float64",
+        _ => "Unknown",
+    }
 }
 
 fn rpc_base_type(rpc_type: &str) -> &str {
@@ -8209,7 +8132,7 @@ mod tests {
             metadata: twinleaf::device::capture::CaptureMetadata {
                 size: data.len() as u32,
                 blocksize: 8,
-                data_type: twinleaf::tio::proto::DataType::Float32,
+                data_type: DataType::F32,
                 length: 2,
                 y_calibration: 1.0,
                 x_offset: 10.0,

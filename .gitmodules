@@ -1,3 +1,4 @@
 [submodule "vendor/twinleaf-rust"]
 	path = vendor/twinleaf-rust
 	url = https://github.com/twinleaf/twinleaf-rust.git
+	branch = firmware-proto
