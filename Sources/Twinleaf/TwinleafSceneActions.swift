@@ -5,6 +5,7 @@ import Foundation
 extension Notification.Name {
     static let showDevicePicker = Notification.Name("TwinleafShowDevicePicker")
     static let showExportPanel = Notification.Name("TwinleafShowExportPanel")
+    static let printDocument = Notification.Name("TwinleafPrintDocument")
     static let showPlotSettings = Notification.Name("TwinleafShowPlotSettings")
     static let togglePlotPause = Notification.Name("TwinleafTogglePlotPause")
     static let toggleDataLogging = Notification.Name("TwinleafToggleDataLogging")

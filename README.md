@@ -24,6 +24,7 @@ This keeps the app native while keeping the hardware boundary in Rust, without a
 - Live logging writes Twinleaf packets to a temporary `.tio` backing file. Save or Save As snapshots that backing file into the document path, so an Untitled document can begin logging immediately and keep logging through the save transition.
 - Opening an existing `.tio` file starts in inspection mode: Rust parses the saved packets, stream ID 1 is selected by default, plotting is paused-only, and the toolbar scrubber moves the displayed time window through the log.
 - File > Export writes the raw `.tio` log to CSV or HDF5 through Rust. CSV is available in the default Rust build; HDF5 is available when the Rust core is built with `--features hdf5`.
+- File > Print (⌘P) prints the graphs the window is showing, laid out on one page in the chosen paper size and orientation. The page is always light on white, whatever theme the window uses; a popped-out graph window prints just its own graph.
 - After connecting, the app lazily checks whether newer published firmware exists for each connected device. When an update is available, a green update button appears in the toolbar; its popover shows the installed and new versions and flashes the device with live progress. See the Notes section for the network access this involves.
 
 ## Build

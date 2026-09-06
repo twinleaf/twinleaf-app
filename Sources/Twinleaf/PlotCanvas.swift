@@ -272,6 +272,10 @@ struct PlotCanvas: View {
     /// Context-menu content for one legend entry. Supplied by the host so the
     /// canvas stays free of bridge and menu-building concerns.
     var legendMenu: (PlotSeries) -> AnyView = { _ in AnyView(EmptyView()) }
+    /// True when the canvas is being rendered for paper (File > Print). Draws
+    /// on plain white with an opaque legend, and skips the interaction
+    /// monitor that only makes sense inside a window.
+    var rendersForPrint = false
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(ViewPreferenceKeys.traceColorPaletteLight) private var traceColorPaletteLightRaw = PlotTracePalette.defaultLightRawValue
     @AppStorage(ViewPreferenceKeys.traceColorPaletteDark) private var traceColorPaletteDarkRaw = PlotTracePalette.defaultDarkRawValue
@@ -302,7 +306,7 @@ struct PlotCanvas: View {
     }
 
     private var plotBackgroundColor: Color {
-        TwinleafSurfaceColors.canvasBackgroundColor(for: colorScheme)
+        rendersForPrint ? .white : TwinleafSurfaceColors.canvasBackgroundColor(for: colorScheme)
     }
 
     var body: some View {
@@ -388,13 +392,15 @@ struct PlotCanvas: View {
                     onCursorSelectionChange(activeCursorSelection)
                 }
                 .overlay {
-                    PlotInteractionEventMonitor(
-                        isEnabled: mode == .timeseries,
-                        plotRect: rect,
-                        windowSeconds: windowSeconds,
-                        onPan: onTimeseriesPan,
-                        onZoom: onTimeseriesZoom
-                    )
+                    if !rendersForPrint {
+                        PlotInteractionEventMonitor(
+                            isEnabled: mode == .timeseries,
+                            plotRect: rect,
+                            windowSeconds: windowSeconds,
+                            onPan: onTimeseriesPan,
+                            onZoom: onTimeseriesZoom
+                        )
+                    }
                 }
             }
         }
@@ -694,8 +700,19 @@ struct PlotCanvas: View {
         }
         .padding(8)
         .background {
-            PlotSidebarMaterialBackground(cornerRadius: Self.legendCornerRadius)
-                .allowsHitTesting(false)
+            if rendersForPrint {
+                // Glass needs something behind it to blur; on paper it would
+                // print as nothing and leave the labels sitting on the traces.
+                RoundedRectangle(cornerRadius: Self.legendCornerRadius, style: .continuous)
+                    .fill(Color.white.opacity(0.92))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Self.legendCornerRadius, style: .continuous)
+                            .strokeBorder(Color.secondary.opacity(0.35), lineWidth: 1)
+                    }
+            } else {
+                PlotSidebarMaterialBackground(cornerRadius: Self.legendCornerRadius)
+                    .allowsHitTesting(false)
+            }
         }
         .clipShape(RoundedRectangle(cornerRadius: Self.legendCornerRadius, style: .continuous))
         .overlay {

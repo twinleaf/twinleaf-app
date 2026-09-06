@@ -14,6 +14,18 @@ struct TwinleafCommands: Commands {
             .keyboardShortcut("e", modifiers: [.command])
         }
 
+#if os(macOS)
+        // Replaces the stock Page Setup/Print pair: the print panel already
+        // exposes paper size and orientation, and the document window picks
+        // the initial orientation from the shape of its plot area.
+        CommandGroup(replacing: .printItem) {
+            Button("Print...") {
+                postCommand(.printDocument)
+            }
+            .keyboardShortcut("p", modifiers: [.command])
+        }
+#endif
+
         CommandMenu("Device") {
             Button("Connect to Device...") {
                 NotificationCenter.default.post(name: .showDevicePicker, object: nil)

@@ -94,6 +94,7 @@ struct DocumentWindow: View {
     @State private var isDataLoggingEnabled = true
     @State private var clearDocumentEditedRequest = 0
     @State private var windowObjectID: ObjectIdentifier?
+    @State private var plotAreaSize: CGSize = .zero
     @State private var isApplyingBoardViewLayout = false
     @State private var restoredBoardViewLayoutDeviceSignature = ""
 #if os(macOS)
@@ -268,6 +269,11 @@ struct DocumentWindow: View {
                 guard receivesWindowCommand(notification) else { return }
                 presentExportPanel()
             }
+            #if os(macOS)
+            .onReceive(NotificationCenter.default.publisher(for: .printDocument)) { notification in
+                handlePrintCommand(notification)
+            }
+            #endif
             .onReceive(NotificationCenter.default.publisher(for: .showPlotSettings)) { _ in
                 showingPlotSettings = true
             }
@@ -514,6 +520,11 @@ struct DocumentWindow: View {
             ZStack(alignment: .trailing) {
                 plotArea
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .onGeometryChange(for: CGSize.self) { proxy in
+                        proxy.size
+                    } action: { size in
+                        plotAreaSize = size
+                    }
 
                 if effectiveShowLogPanel {
                     logSlideOverPane
@@ -1943,6 +1954,258 @@ struct DocumentWindow: View {
         .background(.bar)
     }
 }
+
+// MARK: - Printing
+
+#if os(macOS)
+extension DocumentWindow {
+    /// Routes File > Print to the window that was frontmost when the command
+    /// fired: the document window prints its plot area, and a popped-out
+    /// graph window prints just its own graph.
+    private func handlePrintCommand(_ notification: Notification) {
+        let targetWindowID = notification.object as? ObjectIdentifier
+        if targetWindowID == nil || targetWindowID == windowObjectID {
+            printPlotArea()
+            return
+        }
+        guard let popout = plotPopoutControllers.first(where: { _, controller in
+            controller.window.map(ObjectIdentifier.init) == targetWindowID
+        }) else {
+            return
+        }
+        printPopoutPlot(paneID: popout.key, window: popout.value.window)
+    }
+
+    /// Prints the graphs the window is showing right now. The data is
+    /// snapshotted here, so what comes out matches what was on screen when
+    /// the user asked, not whatever streamed in while the panel was open.
+    private func printPlotArea() {
+        let panes = visiblePlotPanes.filter { !$0.columns.isEmpty }
+        let capture = activeCaptureRPC.flatMap { rpc in
+            CapturePlotData(value: rpc.value, fallbackTitle: "\(rpc.route) \(rpc.name)")
+        }
+        guard !panes.isEmpty || capture != nil else {
+            NSSound.beep()
+            return
+        }
+
+        let snapshot = PlotPrintSnapshot(
+            title: exportBaseName,
+            deviceSummary: printDeviceSummary,
+            printedAt: Date(),
+            recordingStartSeconds: bridge.plotTimeOriginSeconds,
+            showsKey: showPlotKey,
+            rightAxisReservationCount: sharedRightAxisReservationCount(for: panes),
+            panes: panes.enumerated().map { index, pane in
+                printPaneSnapshot(
+                    pane,
+                    showsXAxisLabels: showsXAxisLabels(for: pane, index: index, paneCount: panes.count),
+                    topPlotInset: topPlotInset(for: pane, index: index)
+                )
+            },
+            capture: capture
+        )
+        runPrintJob(for: snapshot, contentSize: plotAreaSize, window: hostWindow)
+    }
+
+    private func printPopoutPlot(paneID: Int, window: NSWindow?) {
+        guard let pane = bridge.plotPanes.first(where: { $0.id == paneID }) else { return }
+        let snapshot = PlotPrintSnapshot(
+            title: exportBaseName,
+            deviceSummary: printDeviceSummary,
+            printedAt: Date(),
+            recordingStartSeconds: bridge.plotTimeOriginSeconds,
+            showsKey: showPlotKey,
+            rightAxisReservationCount: sharedRightAxisReservationCount(for: [pane]),
+            panes: [printPaneSnapshot(pane, showsXAxisLabels: true, topPlotInset: 0)],
+            capture: nil
+        )
+        let contentSize = window?.contentView?.bounds.size ?? .zero
+        runPrintJob(for: snapshot, contentSize: contentSize, window: window)
+    }
+
+    private func runPrintJob(for snapshot: PlotPrintSnapshot, contentSize: CGSize, window: NSWindow?) {
+        let job = PlotPrintJob(
+            jobTitle: snapshot.title,
+            prefersLandscape: contentSize.width >= contentSize.height,
+            makeContent: { size in
+                AnyView(PlotPrintPage(snapshot: snapshot, size: size))
+            }
+        )
+        PlotPrinter.run(job, attachedTo: window)
+    }
+
+    private func printPaneSnapshot(
+        _ pane: PlotPaneSelection,
+        showsXAxisLabels: Bool,
+        topPlotInset: CGFloat
+    ) -> PlotPrintPaneSnapshot {
+        PlotPrintPaneSnapshot(
+            pane: pane,
+            series: bridge.plotSeries(for: pane),
+            mode: bridge.plotMode(for: pane),
+            viewportEnd: bridge.viewportEnd(for: pane),
+            revision: bridge.plotRevision(for: pane),
+            verticalAxisMode: canvasVerticalAxisMode(for: pane),
+            showsIndependentAxisLabels: canvasShowsIndependentAxisLabels(for: pane),
+            windowSeconds: bridge.displayedWindowSeconds(for: pane),
+            showsXAxisLabels: showsXAxisLabels,
+            topPlotInset: topPlotInset
+        )
+    }
+
+    /// "VMR 0142, SYNC 0031": one entry per connected device, in sidebar order.
+    private var printDeviceSummary: String {
+        var seen = Set<String>()
+        let labels = bridge.devices.compactMap { device -> String? in
+            let name = device.meta.name.trimmingCharacters(in: .whitespaces)
+            let serial = device.meta.serialNumber.trimmingCharacters(in: .whitespaces)
+            let label = [name, serial].filter { !$0.isEmpty }.joined(separator: " ")
+            guard !label.isEmpty, seen.insert(label).inserted else { return nil }
+            return label
+        }
+        return labels.joined(separator: ", ")
+    }
+
+    private var hostWindow: NSWindow? {
+        guard let windowObjectID else { return nil }
+        return NSApp.windows.first { ObjectIdentifier($0) == windowObjectID }
+    }
+}
+
+private struct PlotPrintPaneSnapshot: Identifiable {
+    let pane: PlotPaneSelection
+    let series: [PlotSeries]
+    let mode: PlotMode
+    let viewportEnd: Double?
+    let revision: UInt64
+    let verticalAxisMode: VerticalAxisMode
+    let showsIndependentAxisLabels: Bool
+    let windowSeconds: Double
+    let showsXAxisLabels: Bool
+    let topPlotInset: CGFloat
+
+    var id: Int { pane.id }
+}
+
+private struct PlotPrintSnapshot {
+    let title: String
+    let deviceSummary: String
+    let printedAt: Date
+    let recordingStartSeconds: Double?
+    let showsKey: Bool
+    let rightAxisReservationCount: Int
+    let panes: [PlotPrintPaneSnapshot]
+    let capture: CapturePlotData?
+}
+
+/// One printed page: a title line, then the graphs stacked the way the
+/// window stacks them, filling the printable area. Always light on white,
+/// whatever theme the window uses.
+private struct PlotPrintPage: View {
+    let snapshot: PlotPrintSnapshot
+    let size: CGSize
+
+    private static let headerSpacing: CGFloat = 10
+    private static let captureMinimumHeight: CGFloat = 180
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+                .padding(.bottom, Self.headerSpacing)
+
+            GeometryReader { geometry in
+                graphs(in: geometry.size)
+            }
+        }
+        .frame(width: size.width, height: size.height, alignment: .top)
+        .background(Color.white)
+        .environment(\.colorScheme, .light)
+    }
+
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(snapshot.title)
+                .font(.headline)
+                .lineLimit(1)
+
+            if !snapshot.deviceSummary.isEmpty {
+                Text(snapshot.deviceSummary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer(minLength: 12)
+
+            Text(snapshot.printedAt.formatted(date: .abbreviated, time: .shortened))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    private func graphs(in size: CGSize) -> some View {
+        let panes = snapshot.panes
+        // Same split as the window: the capture plot takes one graph-sized
+        // slot, or the whole area when no graph is showing.
+        let captureHeight: CGFloat
+        if snapshot.capture == nil {
+            captureHeight = 0
+        } else if panes.isEmpty {
+            captureHeight = size.height
+        } else {
+            captureHeight = max(Self.captureMinimumHeight, size.height / CGFloat(panes.count + 1))
+        }
+        let dividerHeight: CGFloat = snapshot.capture != nil && !panes.isEmpty ? 1 : 0
+        let stackHeight = max(0, size.height - captureHeight - dividerHeight)
+        let axisInsets = panes.map { pane in
+            PlotCanvas.bottomAxisInset(
+                showsXAxisLabels: pane.showsXAxisLabels,
+                mode: pane.mode,
+                recordingStartSeconds: snapshot.recordingStartSeconds
+            )
+        }
+        let totalAxisInset = axisInsets.reduce(0, +)
+        let graphFrameHeight = max(1, (stackHeight - totalAxisInset) / CGFloat(max(1, panes.count)))
+
+        return VStack(spacing: 0) {
+            ForEach(Array(panes.enumerated()), id: \.element.id) { index, pane in
+                PlotCanvas(
+                    paneID: pane.id,
+                    series: pane.series,
+                    mode: pane.mode,
+                    verticalAxisMode: pane.verticalAxisMode,
+                    showsIndependentAxisLabels: pane.showsIndependentAxisLabels,
+                    windowSeconds: pane.windowSeconds,
+                    viewportEnd: pane.viewportEnd,
+                    plotRevision: pane.revision,
+                    recordingStartSeconds: snapshot.recordingStartSeconds,
+                    fftLogX: pane.pane.viewConfig.fftLogX,
+                    fftLogY: pane.pane.viewConfig.fftLogY,
+                    logY: pane.pane.viewConfig.logY,
+                    showKey: snapshot.showsKey,
+                    showsXAxisLabels: pane.showsXAxisLabels,
+                    topPlotInset: pane.topPlotInset,
+                    rightAxisReservationCount: snapshot.rightAxisReservationCount,
+                    rendersForPrint: true
+                )
+                .frame(height: graphFrameHeight + axisInsets[index])
+            }
+
+            if let capture = snapshot.capture {
+                if !panes.isEmpty {
+                    Divider()
+                }
+                CapturePlotView(data: capture)
+                    .frame(height: captureHeight)
+            }
+        }
+        .frame(width: size.width, height: size.height, alignment: .top)
+    }
+}
+#endif
 
 #if os(macOS)
 private final class PlotPopoutWindowController: NSWindowController, NSWindowDelegate {

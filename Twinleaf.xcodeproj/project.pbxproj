@@ -12,6 +12,7 @@
 		A00000000000000000000513 /* Sources/Twinleaf/TioLogDocument.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000413 /* Sources/Twinleaf/TioLogDocument.swift */; };
 		A00000000000000000000514 /* Sources/Twinleaf/Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000414 /* Sources/Twinleaf/Models.swift */; };
 		A00000000000000000000515 /* Sources/Twinleaf/PlotCanvas.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000415 /* Sources/Twinleaf/PlotCanvas.swift */; };
+		A00000000000000000000522 /* Sources/Twinleaf/PlotPrinting.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000423 /* Sources/Twinleaf/PlotPrinting.swift */; };
 		A00000000000000000000516 /* Sources/Twinleaf/NumericDisplayPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000416 /* Sources/Twinleaf/NumericDisplayPolicy.swift */; };
 		A00000000000000000000517 /* Sources/Twinleaf/TwinleafCommands.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000417 /* Sources/Twinleaf/TwinleafCommands.swift */; };
 		A00000000000000000000518 /* Sources/Twinleaf/BridgeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000418 /* Sources/Twinleaf/BridgeClient.swift */; };
@@ -58,6 +59,7 @@
 		A00000000000000000000413 /* Sources/Twinleaf/TioLogDocument.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/TioLogDocument.swift; sourceTree = "<group>"; };
 		A00000000000000000000414 /* Sources/Twinleaf/Models.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/Models.swift; sourceTree = "<group>"; };
 		A00000000000000000000415 /* Sources/Twinleaf/PlotCanvas.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/PlotCanvas.swift; sourceTree = "<group>"; };
+		A00000000000000000000423 /* Sources/Twinleaf/PlotPrinting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/PlotPrinting.swift; sourceTree = "<group>"; };
 		A00000000000000000000416 /* Sources/Twinleaf/NumericDisplayPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/NumericDisplayPolicy.swift; sourceTree = "<group>"; };
 		A00000000000000000000417 /* Sources/Twinleaf/TwinleafCommands.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/TwinleafCommands.swift; sourceTree = "<group>"; };
 		A00000000000000000000418 /* Sources/Twinleaf/BridgeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/BridgeClient.swift; sourceTree = "<group>"; };
@@ -138,6 +140,7 @@
 				A00000000000000000000413 /* Sources/Twinleaf/TioLogDocument.swift */,
 				A00000000000000000000414 /* Sources/Twinleaf/Models.swift */,
 				A00000000000000000000415 /* Sources/Twinleaf/PlotCanvas.swift */,
+				A00000000000000000000423 /* Sources/Twinleaf/PlotPrinting.swift */,
 				A00000000000000000000416 /* Sources/Twinleaf/NumericDisplayPolicy.swift */,
 				A00000000000000000000417 /* Sources/Twinleaf/TwinleafCommands.swift */,
 				A00000000000000000000420 /* Sources/Twinleaf/TwinleafSceneActions.swift */,
@@ -345,6 +348,7 @@
 				A00000000000000000000513 /* Sources/Twinleaf/TioLogDocument.swift in Sources */,
 				A00000000000000000000514 /* Sources/Twinleaf/Models.swift in Sources */,
 				A00000000000000000000515 /* Sources/Twinleaf/PlotCanvas.swift in Sources */,
+				A00000000000000000000522 /* Sources/Twinleaf/PlotPrinting.swift in Sources */,
 				A00000000000000000000516 /* Sources/Twinleaf/NumericDisplayPolicy.swift in Sources */,
 				A00000000000000000000517 /* Sources/Twinleaf/TwinleafCommands.swift in Sources */,
 				A00000000000000000000520 /* Sources/Twinleaf/TwinleafSceneActions.swift in Sources */,
