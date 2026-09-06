@@ -108,6 +108,7 @@ struct DocumentWindow: View {
     @AppStorage(ViewPreferenceKeys.showStreamSidebar) private var showStreamSidebar = true
     @AppStorage(ViewPreferenceKeys.showRPCPanel) private var legacyShowRPCPanel = false
     @AppStorage(ViewPreferenceKeys.showLogPanel) private var showLogPanel = false
+    @AppStorage(ViewPreferenceKeys.showTerminalPanel) private var showTerminalPanel = false
     @AppStorage(ViewPreferenceKeys.showStatusBar) private var showStatusBar = false
     @AppStorage(ViewPreferenceKeys.showToolbar) private var showToolbar = true
     @AppStorage(ViewPreferenceKeys.showPlotKey) private var showPlotKey = true
@@ -530,9 +531,14 @@ struct DocumentWindow: View {
                     logSlideOverPane
                         .transition(.move(edge: .trailing).combined(with: .opacity))
                         .zIndex(1)
+                } else if effectiveShowTerminalPanel {
+                    terminalSlideOverPane
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                        .zIndex(1)
                 }
             }
             .animation(.easeInOut(duration: 0.16), value: effectiveShowLogPanel)
+            .animation(.easeInOut(duration: 0.16), value: effectiveShowTerminalPanel)
 
             if effectiveShowStatusBar {
                 Divider()
@@ -656,6 +662,10 @@ struct DocumentWindow: View {
         !distractionFree && showLogPanel
     }
 
+    private var effectiveShowTerminalPanel: Bool {
+        !distractionFree && showTerminalPanel
+    }
+
     private var effectiveShowStatusBar: Bool {
         !distractionFree && showStatusBar
     }
@@ -721,6 +731,31 @@ struct DocumentWindow: View {
         .ignoresSafeArea(.container, edges: .top)
     }
 
+    /// The RPC terminal takes the log pane's slot on the trailing edge; the
+    /// two are alternates, so showing one hides the other.
+    private var terminalSlideOverPane: some View {
+        HStack(spacing: 0) {
+            SidebarResizeHandle(
+                width: $rpcPanelWidth,
+                range: SidebarLayout.rpcWidthRange,
+                dragDirection: .leftEdge,
+                accessibilityLabel: "Resize terminal pane"
+            )
+
+            RpcTerminalPane(bridge: bridge, terminal: bridge.terminal)
+                .padding(.top, effectiveRightSidebarContentTopInset)
+                .frame(width: clampedRPCPanelWidth)
+        }
+        .frame(width: CGFloat(clampedRPCPanelWidth) + SidebarLayout.resizeHandleWidth)
+        .frame(maxHeight: .infinity)
+        .background(TwinleafSurfaceColors.slideOverBackgroundColor(for: effectiveWindowColorScheme))
+        .background {
+            WindowContentTopInsetReporter(topInset: $measuredRightSidebarTopInset)
+        }
+        .shadow(color: .black.opacity(effectiveWindowColorScheme == .dark ? 0.34 : 0.16), radius: 18, x: -8, y: 0)
+        .ignoresSafeArea(.container, edges: .top)
+    }
+
     private var effectiveRightSidebarContentTopInset: CGFloat {
         guard effectiveShowToolbar else { return 0 }
         if measuredRightSidebarTopInset > 1 {
@@ -737,6 +772,25 @@ struct DocumentWindow: View {
             set: { isSelected in
                 distractionFree = false
                 showLogPanel = isSelected
+                if isSelected {
+                    showTerminalPanel = false
+                }
+            }
+        )
+    }
+
+    private var terminalInspectorSelectionBinding: Binding<Bool> {
+        Binding(
+            get: {
+                effectiveShowTerminalPanel
+            },
+            set: { isSelected in
+                distractionFree = false
+                showTerminalPanel = isSelected
+                if isSelected {
+                    showLogPanel = false
+                    bridge.terminal.requestFocus()
+                }
             }
         )
     }
@@ -1842,6 +1896,14 @@ struct DocumentWindow: View {
             .labelStyle(.iconOnly)
             .help(effectiveShowLogPanel ? "Hide log slide-over" : "Show log slide-over")
             .accessibilityValue(effectiveShowLogPanel ? "Selected" : "Not selected")
+
+            Toggle(isOn: terminalInspectorSelectionBinding) {
+                Label("Terminal", systemImage: "terminal")
+            }
+            .toggleStyle(.button)
+            .labelStyle(.iconOnly)
+            .help(effectiveShowTerminalPanel ? "Hide RPC terminal" : "Show RPC terminal")
+            .accessibilityValue(effectiveShowTerminalPanel ? "Selected" : "Not selected")
         }
     }
 
@@ -4089,6 +4151,7 @@ struct TwinleafInterfaceVisibilityControls: View {
     @AppStorage(ViewPreferenceKeys.distractionFree) private var distractionFree = false
     @AppStorage(ViewPreferenceKeys.showStreamSidebar) private var showStreamSidebar = true
     @AppStorage(ViewPreferenceKeys.showLogPanel) private var showLogPanel = false
+    @AppStorage(ViewPreferenceKeys.showTerminalPanel) private var showTerminalPanel = false
     @AppStorage(ViewPreferenceKeys.showStatusBar) private var showStatusBar = false
     @AppStorage(ViewPreferenceKeys.showToolbar) private var showToolbar = true
 
@@ -4110,6 +4173,7 @@ struct TwinleafInterfaceVisibilityControls: View {
                 modifiers: [.command, .option]
             )
             Toggle("Show Log Pane", isOn: logPanelVisibility)
+            Toggle("Show Terminal Pane", isOn: terminalPanelVisibility)
         }
     }
 
@@ -4125,8 +4189,32 @@ struct TwinleafInterfaceVisibilityControls: View {
         twinleafInterfaceVisibilityBinding(distractionFree: $distractionFree, storage: $showStreamSidebar)
     }
 
+    // The log and terminal panes share the trailing slot, so turning one on
+    // turns the other off.
     private var logPanelVisibility: Binding<Bool> {
-        twinleafInterfaceVisibilityBinding(distractionFree: $distractionFree, storage: $showLogPanel)
+        let binding = twinleafInterfaceVisibilityBinding(distractionFree: $distractionFree, storage: $showLogPanel)
+        return Binding(
+            get: { binding.wrappedValue },
+            set: { isVisible in
+                binding.wrappedValue = isVisible
+                if isVisible {
+                    showTerminalPanel = false
+                }
+            }
+        )
+    }
+
+    private var terminalPanelVisibility: Binding<Bool> {
+        let binding = twinleafInterfaceVisibilityBinding(distractionFree: $distractionFree, storage: $showTerminalPanel)
+        return Binding(
+            get: { binding.wrappedValue },
+            set: { isVisible in
+                binding.wrappedValue = isVisible
+                if isVisible {
+                    showLogPanel = false
+                }
+            }
+        )
     }
 
     @ViewBuilder
@@ -4397,6 +4485,13 @@ private struct PlotSettingsWindow: View {
                             ))
                         }
                         .twinleafCheckboxToggleStyle()
+
+                        Toggle("Decimate for display", isOn: Binding(
+                            get: { bridge.viewConfig.fftDisplayDecimation },
+                            set: { bridge.setFFTDisplayDecimation($0) }
+                        ))
+                        .twinleafCheckboxToggleStyle()
+                        .help("Reduce the spectrum to about one point per pixel, keeping each bucket's extremes at fixed frequencies. Off plots every frequency bin.")
 
                         HStack(spacing: 12) {
                             Text("Axis hysteresis")
@@ -5457,18 +5552,14 @@ private struct DeviceHealthPopover: View {
     private static let rateWidth: CGFloat = 78
     private static let driftWidth: CGFloat = 86
     private static let droppedWidth: CGFloat = 64
-    private static let incomingWidth: CGFloat = 220
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Connection Health")
                 .font(.headline)
 
-            if let rate = bridge.incomingDataRate {
-                metric("Incoming", kbpsText(rate.kbps),
-                       unit: "kbps, \(windowText(rate.windowSeconds)) avg",
-                       width: Self.incomingWidth,
-                       color: .primary)
+            if let stats = bridge.incomingLinkStats {
+                linkStatsList(stats)
             }
 
             if bridge.streamHealth.isEmpty {
@@ -5484,6 +5575,18 @@ private struct DeviceHealthPopover: View {
                     }
                 }
                 .frame(maxHeight: 420)
+            }
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Reset Drop Counts") {
+                    bridge.resetHealthCounters()
+                }
+                .controlSize(.small)
+                .disabled(bridge.streamHealth.isEmpty)
+                .help("Zero the dropped-sample counter of every stream")
             }
         }
         .padding(16)
@@ -5521,6 +5624,36 @@ private struct DeviceHealthPopover: View {
         }
     }
 
+    /// The link as a whole: what arrives on the wire, how it is packetized,
+    /// and how many samples the device aggregates into each data packet.
+    private func linkStatsList(_ stats: IncomingLinkStats) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 3) {
+                linkRow("RX data rate", kbpsText(stats.kbps), unit: "kbps")
+                linkRow("Packet rate", rateText(stats.packetsPerSecond), unit: "packets/s")
+                linkRow("Aggregated samples", samplesText(stats.samplesPerPacket), unit: "per packet")
+            }
+            Text("\(windowText(stats.windowSeconds)) average")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func linkRow(_ label: String, _ value: String, unit: String) -> some View {
+        GridRow {
+            Text(label)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(value)
+                    .font(.callout.monospacedDigit())
+                Text(unit)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private func metric(_ label: String, _ value: String, unit: String?, width: CGFloat, color: Color) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(unit.map { "\(label) (\($0))" } ?? label)
@@ -5540,11 +5673,16 @@ private struct DeviceHealthPopover: View {
         return String(format: "%.3f", hz)
     }
 
-    private func kbpsText(_ kbps: Double) -> String {
-        guard kbps.isFinite else { return "—" }
+    private func kbpsText(_ kbps: Double?) -> String {
+        guard let kbps, kbps.isFinite else { return "—" }
         if kbps >= 100 { return String(format: "%.0f", kbps) }
         if kbps >= 1 { return String(format: "%.1f", kbps) }
         return String(format: "%.2f", kbps)
+    }
+
+    private func samplesText(_ samples: Double?) -> String {
+        guard let samples, samples.isFinite else { return "—" }
+        return String(format: "%.1f", samples)
     }
 
     private func windowText(_ seconds: Double) -> String {

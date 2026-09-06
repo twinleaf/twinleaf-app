@@ -17,10 +17,11 @@ This keeps the app native while keeping the hardware boundary in Rust, without a
 - New windows open a device picker.
 - The device picker can remember arbitrary Twinleaf URLs for quick reconnects, with the saved list editable in Settings.
 - The left sidebar lists devices, streams, and columns that can be plotted.
-- The right sidebar lists device RPCs and allows readable RPC refreshes plus simple writable calls.
+- The left sidebar also lists device settings (RPCs) with readable value refreshes and simple writable calls.
+- The trailing slide-over pane shows either the TIO log or an RPC terminal. The terminal follows the console on the Ethel status page: `name` reads an RPC and `name value` writes it, each command asks the device for the RPC's type through `rpc.info` before encoding the argument and decoding the reply, Tab completes names through `rpc.match` (falling back to the loaded RPC list on older firmware), and ↑/↓ recall history. Because it works from the device's own answers, hidden RPCs and RPCs missing from the sidebar list still work.
 - Plotting supports one or more columns.
 - Timeseries display uses the same FPCS-style min/max decimation strategy as Trendline.
-- FFT display uses Welch spectral density through the Rust `welch-sde` crate on a Rust worker thread.
+- FFT display uses Welch spectral density through the Rust `welch-sde` crate on a Rust worker thread. The live spectrum is reduced to about one point per pixel using buckets with fixed frequency edges, so plotted frequencies never depend on the data; Plot Settings can turn this off to plot every bin.
 - Live logging writes Twinleaf packets to a temporary `.tio` backing file. Save or Save As snapshots that backing file into the document path, so an Untitled document can begin logging immediately and keep logging through the save transition.
 - Opening an existing `.tio` file starts in inspection mode: Rust parses the saved packets, stream ID 1 is selected by default, plotting is paused-only, and the toolbar scrubber moves the displayed time window through the log.
 - File > Export writes the raw `.tio` log to CSV or HDF5 through Rust. CSV is available in the default Rust build; HDF5 is available when the Rust core is built with `--features hdf5`.

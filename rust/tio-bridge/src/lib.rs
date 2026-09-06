@@ -492,9 +492,36 @@ mod direct {
                         });
                     }
                 }
+                ClientCommand::CallRawRpc {
+                    request_id,
+                    route,
+                    name,
+                    arg_hex,
+                } => {
+                    let answer_id = request_id.clone();
+                    let sent = session.as_ref().is_some_and(|(tx, _)| {
+                        tx.send(SessionCommand::CallRawRpc {
+                            request_id,
+                            route,
+                            name,
+                            arg_hex,
+                        })
+                        .is_ok()
+                    });
+                    // No session, or one whose thread has already exited
+                    // (its connection failed or closed): answer here.
+                    if !sent {
+                        emit_raw_rpc_error(&emitter, &answer_id, "Not connected to a device", None);
+                    }
+                }
                 ClientCommand::CheckUpgrade => {
                     if let Some((tx, _)) = &session {
                         let _ = tx.send(SessionCommand::CheckUpgrade);
+                    }
+                }
+                ClientCommand::ResetHealthCounters => {
+                    if let Some((tx, _)) = &session {
+                        let _ = tx.send(SessionCommand::ResetHealthCounters);
                     }
                 }
                 ClientCommand::PerformUpgrade { route } => {

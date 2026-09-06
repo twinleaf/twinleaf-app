@@ -500,6 +500,41 @@ struct ViewConfig: Codable, Hashable {
     /// Log vertical axis in timeseries mode. Separate from `fftLogY` so a pane
     /// toggling between modes keeps each axis choice.
     var logY: Bool = false
+    /// Reduce the live spectrum to about one point per pixel; off plots every
+    /// frequency bin.
+    var fftDisplayDecimation: Bool = true
+
+    enum CodingKeys: String, CodingKey {
+        case mode
+        case windowSeconds
+        case resolutionMultiplier
+        case plotWidthPixels
+        case decimationMethod
+        case detrend
+        case fftLogX
+        case fftLogY
+        case logY
+        case fftDisplayDecimation
+    }
+}
+
+extension ViewConfig {
+    /// Saved board layouts predate keys added since; a missing key keeps its
+    /// default instead of discarding the whole layout. Lives in an extension
+    /// so the memberwise and empty initializers stay synthesized.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try container.decodeIfPresent(PlotMode.self, forKey: .mode) ?? mode
+        windowSeconds = try container.decodeIfPresent(Double.self, forKey: .windowSeconds) ?? windowSeconds
+        resolutionMultiplier = try container.decodeIfPresent(Int.self, forKey: .resolutionMultiplier) ?? resolutionMultiplier
+        plotWidthPixels = try container.decodeIfPresent(Int.self, forKey: .plotWidthPixels) ?? plotWidthPixels
+        decimationMethod = try container.decodeIfPresent(DecimationMethod.self, forKey: .decimationMethod) ?? decimationMethod
+        detrend = try container.decodeIfPresent(DetrendMethod.self, forKey: .detrend) ?? detrend
+        fftLogX = try container.decodeIfPresent(Bool.self, forKey: .fftLogX) ?? fftLogX
+        fftLogY = try container.decodeIfPresent(Bool.self, forKey: .fftLogY) ?? fftLogY
+        logY = try container.decodeIfPresent(Bool.self, forKey: .logY) ?? logY
+        fftDisplayDecimation = try container.decodeIfPresent(Bool.self, forKey: .fftDisplayDecimation) ?? fftDisplayDecimation
+    }
 }
 
 enum ViewPreferenceKeys {
@@ -508,6 +543,7 @@ enum ViewPreferenceKeys {
     static let showStreamSidebar = "view.showStreamSidebar"
     static let showRPCPanel = "view.showRPCPanel"
     static let showLogPanel = "view.showLogPanel"
+    static let showTerminalPanel = "view.showTerminalPanel"
     static let showStatusBar = "view.showStatusBar"
     static let showToolbar = "view.showToolbar"
     static let showStreamDetails = "view.showStreamDetails"
@@ -633,6 +669,27 @@ enum LogMessageScrollback {
 
     static func clamped(_ value: Int) -> Int {
         min(max(value, range.lowerBound), range.upperBound)
+    }
+}
+
+/// Why a raw (terminal) RPC call produced no reply bytes.
+enum RawRpcError: LocalizedError, Equatable {
+    case notConnected
+    /// The bridge never answered; the device's own timeout is much shorter
+    /// and arrives as `failed`.
+    case timedOut
+    /// The bridge's message, plus the device's error code when it refused.
+    case failed(message: String, code: UInt16?)
+
+    var errorDescription: String? {
+        switch self {
+        case .notConnected:
+            "Not connected to a device"
+        case .timedOut:
+            "No reply from the device bridge"
+        case .failed(let message, _):
+            message
+        }
     }
 }
 

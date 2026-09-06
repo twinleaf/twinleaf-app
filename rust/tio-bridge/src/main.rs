@@ -736,10 +736,23 @@ enum ClientCommand {
         name: String,
         arg: Option<Value>,
     },
+    /// Call an RPC by name with already-encoded argument bytes and return the
+    /// raw reply bytes, both as hex. Unlike `CallRpc` this needs no entry in
+    /// the RPC registry, so hidden RPCs and the `rpc.*` introspection calls
+    /// work; the terminal learns each RPC's type from `rpc.info` itself.
+    CallRawRpc {
+        request_id: String,
+        route: String,
+        name: String,
+        #[serde(default)]
+        arg_hex: Option<String>,
+    },
     CheckUpgrade,
     PerformUpgrade {
         route: String,
     },
+    /// Zero every stream's dropped-sample counter in the health monitor.
+    ResetHealthCounters,
     Shutdown,
 }
 
@@ -760,6 +773,12 @@ enum SessionCommand {
         name: String,
         arg: Option<Value>,
     },
+    CallRawRpc {
+        request_id: String,
+        route: String,
+        name: String,
+        arg_hex: Option<String>,
+    },
     CopyViewData {
         request_id: String,
         pane_id: Option<usize>,
@@ -769,6 +788,7 @@ enum SessionCommand {
     PerformUpgrade {
         route: String,
     },
+    ResetHealthCounters,
 }
 
 /// A channel computed from another column rather than received from a device.
@@ -833,6 +853,9 @@ struct ViewConfig {
     /// Log vertical axis in timeseries mode. Separate from `fft_log_y` so a
     /// pane toggling between modes keeps each axis choice.
     log_y: bool,
+    /// Reduce the live spectrum to about one point per pixel before sending
+    /// it; off plots every frequency bin.
+    fft_display_decimation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -855,6 +878,7 @@ impl Default for ViewConfig {
             fft_log_x: true,
             fft_log_y: true,
             log_y: false,
+            fft_display_decimation: true,
         }
     }
 }
@@ -1504,6 +1528,10 @@ struct FftRequest {
     window_seconds: f64,
     detrend: DetrendMethod,
     target_points: usize,
+    /// Whether the pane draws frequency on a log axis; display buckets
+    /// follow the axis so every pixel gets its share of bins.
+    log_x: bool,
+    display_decimation: bool,
     inputs: Vec<FftSeriesInput>,
 }
 
@@ -1864,9 +1892,19 @@ impl ColumnState {
             return 0;
         }
 
-        (window_seconds.max(1e-6) * self.sample_rate)
-            .ceil()
-            .max(1.0) as usize
+        // A window and rate meant to multiply to a whole number of samples
+        // can land a few ulps above it (8.3 s × 100 Hz is 830.0000000000001),
+        // and a plain ceil would then take one sample too many. Snap to the
+        // nearest integer when within relative 1e-9; otherwise round up so
+        // the window never falls short.
+        let samples = window_seconds.max(1e-6) * self.sample_rate;
+        let nearest = samples.round();
+        let count = if (samples - nearest).abs() <= samples.abs() * 1e-9 {
+            nearest
+        } else {
+            samples.ceil()
+        };
+        count.max(1.0) as usize
     }
 
     fn sample_window_ending_at_index(&self, end_index: usize, sample_count: usize) -> Vec<Point> {
@@ -2691,9 +2729,36 @@ fn main() {
                     });
                 }
             }
+            ClientCommand::CallRawRpc {
+                request_id,
+                route,
+                name,
+                arg_hex,
+            } => {
+                let answer_id = request_id.clone();
+                let sent = session_tx.as_ref().is_some_and(|tx| {
+                    tx.send(SessionCommand::CallRawRpc {
+                        request_id,
+                        route,
+                        name,
+                        arg_hex,
+                    })
+                    .is_ok()
+                });
+                // No session, or one whose thread has already exited (its
+                // connection failed or closed): answer here.
+                if !sent {
+                    emit_raw_rpc_error(&emitter, &answer_id, "Not connected to a device", None);
+                }
+            }
             ClientCommand::CheckUpgrade => {
                 if let Some(tx) = &session_tx {
                     let _ = tx.send(SessionCommand::CheckUpgrade);
+                }
+            }
+            ClientCommand::ResetHealthCounters => {
+                if let Some(tx) = &session_tx {
+                    let _ = tx.send(SessionCommand::ResetHealthCounters);
                 }
             }
             ClientCommand::PerformUpgrade { route } => {
@@ -3399,20 +3464,46 @@ impl StreamHealth {
 /// crossed the raw monitor port, aggregated over every route. Observations
 /// arrive once per session-loop tick while the port is alive, so a gap in them
 /// means the port died and the rate is unknown rather than zero.
+/// What one raw monitor-port drain (or one packet) adds to the link totals.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct IncomingCounts {
+    /// Wire bytes of every packet (header, payload, and routing).
+    bytes: u64,
+    /// Every packet, whatever its type.
+    packets: u64,
+    /// Stream data packets whose sample size is known, and the samples they
+    /// carried; the ratio is the device's aggregation.
+    data_packets: u64,
+    samples: u64,
+}
+
+impl IncomingCounts {
+    fn add(&mut self, other: IncomingCounts) {
+        self.bytes += other.bytes;
+        self.packets += other.packets;
+        self.data_packets += other.data_packets;
+        self.samples += other.samples;
+    }
+
+    fn is_empty(self) -> bool {
+        self.packets == 0 && self.bytes == 0
+    }
+}
+
 #[derive(Default)]
 struct IncomingRateWindow {
-    /// Non-empty drains as (observed at, bytes), oldest first.
-    buckets: VecDeque<(Instant, u64)>,
+    /// Non-empty drains as (observed at, counts), oldest first.
+    buckets: VecDeque<(Instant, IncomingCounts)>,
     started: Option<Instant>,
     last_observed: Option<Instant>,
 }
 
 impl IncomingRateWindow {
-    fn observe(&mut self, bytes: u64, now: Instant) {
+    fn observe(&mut self, counts: IncomingCounts, now: Instant) {
         self.started.get_or_insert(now);
         self.last_observed = Some(now);
-        if bytes > 0 {
-            self.buckets.push_back((now, bytes));
+        if !counts.is_empty() {
+            self.buckets.push_back((now, counts));
         }
         while let Some(&(at, _)) = self.buckets.front() {
             if now.duration_since(at) < HEALTH_INCOMING_RATE_WINDOW {
@@ -3422,25 +3513,46 @@ impl IncomingRateWindow {
         }
     }
 
-    /// Average incoming rate in kbps over the window, or over the time since
-    /// the first observation while the window is still filling. `None` before
-    /// the first emit interval has elapsed and once observations stop.
-    fn kbps(&self, now: Instant) -> Option<f64> {
+    /// The averaging span: the window, or the time since the first
+    /// observation while the window is still filling. `None` before the first
+    /// emit interval has elapsed and once observations stop.
+    fn span(&self, now: Instant) -> Option<Duration> {
         let started = self.started?;
         if now.duration_since(self.last_observed?) > HEALTH_STALE_FLOOR {
             return None;
         }
         let span = now.duration_since(started).min(HEALTH_INCOMING_RATE_WINDOW);
-        if span < HEALTH_EMIT_INTERVAL {
-            return None;
+        (span >= HEALTH_EMIT_INTERVAL).then_some(span)
+    }
+
+    fn totals(&self, now: Instant) -> IncomingCounts {
+        let mut totals = IncomingCounts::default();
+        for (at, counts) in &self.buckets {
+            if now.duration_since(*at) < HEALTH_INCOMING_RATE_WINDOW {
+                totals.add(*counts);
+            }
         }
-        let bytes: u64 = self
-            .buckets
-            .iter()
-            .filter(|(at, _)| now.duration_since(*at) < HEALTH_INCOMING_RATE_WINDOW)
-            .map(|(_, bytes)| bytes)
-            .sum();
-        Some(bytes as f64 * 8.0 / 1000.0 / span.as_secs_f64())
+        totals
+    }
+
+    /// Average incoming rate in kbps over the span.
+    fn kbps(&self, now: Instant) -> Option<f64> {
+        let span = self.span(now)?;
+        Some(self.totals(now).bytes as f64 * 8.0 / 1000.0 / span.as_secs_f64())
+    }
+
+    /// Packets of every type per second over the span.
+    fn packets_per_second(&self, now: Instant) -> Option<f64> {
+        let span = self.span(now)?;
+        Some(self.totals(now).packets as f64 / span.as_secs_f64())
+    }
+
+    /// Mean samples per stream data packet over the span; `None` until a
+    /// data packet with known sample size has arrived.
+    fn samples_per_packet(&self, now: Instant) -> Option<f64> {
+        self.span(now)?;
+        let totals = self.totals(now);
+        (totals.data_packets > 0).then(|| totals.samples as f64 / totals.data_packets as f64)
     }
 }
 
@@ -3448,6 +3560,9 @@ impl IncomingRateWindow {
 struct HealthMonitor {
     streams: HashMap<(DeviceRoute, u8), StreamHealth>,
     incoming: IncomingRateWindow,
+    /// Bytes per sample of each stream, from metadata, so a raw data packet's
+    /// sample count can be read off its payload length.
+    stream_sample_sizes: HashMap<(DeviceRoute, u8), usize>,
 }
 
 impl HealthMonitor {
@@ -3483,9 +3598,38 @@ impl HealthMonitor {
         }
     }
 
-    /// Record the wire bytes of one raw monitor-port drain (zero when quiet).
-    fn observe_incoming_bytes(&mut self, bytes: u64, now: Instant) {
-        self.incoming.observe(bytes, now);
+    /// Record one raw monitor-port drain (empty when quiet).
+    fn observe_incoming(&mut self, counts: IncomingCounts, now: Instant) {
+        self.incoming.observe(counts, now);
+    }
+
+    /// Relearn each stream's sample size after the device metadata changes.
+    fn update_stream_sample_sizes(&mut self, devices: &[DeviceDto]) {
+        self.stream_sample_sizes = devices
+            .iter()
+            .filter_map(|device| {
+                DeviceRoute::from_str(&device.route)
+                    .ok()
+                    .map(|route| (route, &device.streams))
+            })
+            .flat_map(|(route, streams)| {
+                streams
+                    .iter()
+                    .map(move |stream| ((route.clone(), stream.stream_id), stream.sample_size))
+            })
+            .collect();
+    }
+
+    fn stream_sample_sizes(&self) -> &HashMap<(DeviceRoute, u8), usize> {
+        &self.stream_sample_sizes
+    }
+
+    /// Zero every stream's dropped-sample counter; timing, rate, and the
+    /// received totals carry on.
+    fn reset_drop_counts(&mut self) {
+        for stats in self.streams.values_mut() {
+            stats.samples_dropped = 0;
+        }
     }
 
     /// Drop all streams for a route (device reset / disconnect).
@@ -3518,6 +3662,14 @@ impl HealthMonitor {
             "type": "health",
             "streams": streams,
             "incomingKbps": self.incoming.kbps(now).map_or(Value::Null, finite_or_null),
+            "incomingPacketsPerSecond": self
+                .incoming
+                .packets_per_second(now)
+                .map_or(Value::Null, finite_or_null),
+            "incomingSamplesPerPacket": self
+                .incoming
+                .samples_per_packet(now)
+                .map_or(Value::Null, finite_or_null),
             "incomingWindowSeconds": HEALTH_INCOMING_RATE_WINDOW.as_secs_f64(),
         })
     }
@@ -3572,6 +3724,13 @@ fn run_session(
     command_rx: Receiver<SessionCommand>,
     emitter: Emitter,
 ) {
+    // Whatever way this session ends, raw RPCs still queued behind it get an
+    // answer instead of vanishing with the channel.
+    let _command_drain = SessionCommandDrain {
+        command_rx: command_rx.clone(),
+        emitter: emitter.clone(),
+    };
+
     let root_route = match route
         .as_deref()
         .unwrap_or("/")
@@ -3624,10 +3783,11 @@ fn run_session(
         CONNECTION_STARTUP_TIMEOUT,
         retry_transient_connect_failures,
     ) {
+        fail_unanswered_raw_rpcs(pending_startup_commands.drain(..), &emitter);
         return;
     }
 
-    let mut discovery = match discover_devices_until_available(
+    let discovery = discover_devices_until_available(
         &connection,
         &url,
         &root_route,
@@ -3635,9 +3795,10 @@ fn run_session(
         &mut pending_startup_commands,
         &emitter,
         CONNECTION_STARTUP_TIMEOUT,
-    ) {
-        Some(discovery) => discovery,
-        None => return,
+    );
+    let Some(mut discovery) = discovery else {
+        fail_unanswered_raw_rpcs(pending_startup_commands.drain(..), &emitter);
+        return;
     };
 
     emitter.status(
@@ -3681,6 +3842,7 @@ fn run_session(
     );
     let mut last_stream_value_emit = Instant::now();
     let mut health = HealthMonitor::default();
+    health.update_stream_sample_sizes(&discovery.devices);
     let mut last_health_emit = Instant::now();
     let mut last_log_flush = Instant::now();
     let mut last_log_progress_packets = 0;
@@ -3796,6 +3958,7 @@ fn run_session(
                                         &mut rpc_index,
                                     ) {
                                         emit_metadata_devices(&emitter, &discovery.devices);
+                                        health.update_stream_sample_sizes(&discovery.devices);
                                     }
                                     emitter.status("streaming", format!("Streaming from {url}"));
                                 }
@@ -3843,6 +4006,7 @@ fn run_session(
                                         &mut rpc_index,
                                     ) {
                                         emit_metadata_devices(&emitter, &discovery.devices);
+                                        health.update_stream_sample_sizes(&discovery.devices);
                                     }
                                 }
                             }
@@ -3894,12 +4058,13 @@ fn run_session(
                                 port,
                                 &mut logger,
                                 &latest_stream_timestamp_by_route,
+                                health.stream_sample_sizes(),
                                 &emitter,
                             );
-                            loop_profile.raw_packets += drain.packets;
+                            loop_profile.raw_packets += drain.counts.packets as usize;
                             loop_profile.raw_log_elapsed += raw_log_start.elapsed();
                             monitor_port_alive = drain.alive;
-                            health.observe_incoming_bytes(drain.bytes, Instant::now());
+                            health.observe_incoming(drain.counts, Instant::now());
                         }
                     }
 
@@ -3909,6 +4074,7 @@ fn run_session(
                         if recover_incomplete_rpc_metadata(&connection, &mut discovery, &emitter) {
                             rpc_index = build_rpc_index(&discovery.devices);
                             emit_metadata_devices(&emitter, &discovery.devices);
+                            health.update_stream_sample_sizes(&discovery.devices);
                         }
                         last_rpc_metadata_recovery = Instant::now();
                     }
@@ -4057,6 +4223,12 @@ fn run_session(
                     name,
                     arg,
                 } => dispatch_rpc(&connection, &rpc_index, request_id, route, name, arg, &emitter),
+                SessionCommand::CallRawRpc {
+                    request_id,
+                    route,
+                    name,
+                    arg_hex,
+                } => dispatch_raw_rpc(&connection, request_id, route, name, arg_hex, &emitter),
                 SessionCommand::CopyViewData {
                     request_id,
                     pane_id,
@@ -4071,6 +4243,13 @@ fn run_session(
                         .unwrap_or_else(|| (active_columns.clone(), view.clone()));
                     let text = build_view_data_tsv(&column_states, &columns, &view, viewport_end);
                     emit_view_data(&emitter, request_id, Ok(text));
+                }
+                SessionCommand::ResetHealthCounters => {
+                    health.reset_drop_counts();
+                    // Show the zeroed counters right away rather than at the
+                    // next half-second emit.
+                    emitter.emit(&health.snapshot(Instant::now()));
+                    last_health_emit = Instant::now();
                 }
                 SessionCommand::CheckUpgrade => {
                     spawn_upgrade_check(
@@ -4519,8 +4698,9 @@ fn handle_monitor_packet(
     packet: tio::Packet,
     logger: &mut PacketLogger,
     latest_stream_timestamp_by_route: &HashMap<DeviceRoute, f64>,
+    stream_sample_sizes: &HashMap<(DeviceRoute, u8), usize>,
     emitter: &Emitter,
-) -> usize {
+) -> IncomingCounts {
     emit_tio_log_message(
         &packet,
         latest_stream_timestamp_by_route
@@ -4528,16 +4708,39 @@ fn handle_monitor_packet(
             .copied(),
         emitter,
     );
-    let wire_bytes = packet.as_bytes().len();
+    let counts = incoming_counts_for_packet(&packet, stream_sample_sizes);
     logger.write_packet(&packet);
-    wire_bytes
+    counts
+}
+
+/// What one raw packet adds to the link statistics. A data packet's sample
+/// count is its payload length over the stream's sample size; a data packet
+/// for a stream whose metadata has not arrived counts as a packet only, so
+/// the samples-per-packet ratio never mixes in unknown sizes.
+fn incoming_counts_for_packet(
+    packet: &tio::Packet,
+    stream_sample_sizes: &HashMap<(DeviceRoute, u8), usize>,
+) -> IncomingCounts {
+    let mut counts = IncomingCounts {
+        bytes: packet.as_bytes().len() as u64,
+        packets: 1,
+        ..IncomingCounts::default()
+    };
+    if let Payload::Samples(samples) = packet.payload() {
+        if let Some(&sample_size) = stream_sample_sizes
+            .get(&(packet.route(), samples.stream_id.value()))
+            .filter(|&&size| size > 0)
+        {
+            counts.data_packets = 1;
+            counts.samples = (samples.data.len() / sample_size) as u64;
+        }
+    }
+    counts
 }
 
 /// One pass over the raw monitor port.
 struct MonitorDrain {
-    packets: usize,
-    /// Wire bytes of the drained packets (header, payload, and routing).
-    bytes: u64,
+    counts: IncomingCounts,
     /// A dead port must not be drained again or its error would repeat every
     /// tick.
     alive: bool,
@@ -4549,23 +4752,23 @@ fn drain_packet_monitor_port(
     packets: &twinleaf::device::Receiver<tio::Packet>,
     logger: &mut PacketLogger,
     latest_stream_timestamp_by_route: &HashMap<DeviceRoute, f64>,
+    stream_sample_sizes: &HashMap<(DeviceRoute, u8), usize>,
     emitter: &Emitter,
 ) -> MonitorDrain {
     let mut drain = MonitorDrain {
-        packets: 0,
-        bytes: 0,
+        counts: IncomingCounts::default(),
         alive: true,
     };
     loop {
         match packets.try_recv() {
             Ok(Some(packet)) => {
-                drain.bytes += handle_monitor_packet(
+                drain.counts.add(handle_monitor_packet(
                     packet,
                     logger,
                     latest_stream_timestamp_by_route,
+                    stream_sample_sizes,
                     emitter,
-                ) as u64;
-                drain.packets += 1;
+                ));
             }
             Ok(None) => return drain,
             Err(RecvError::Lagged(skipped)) => emitter.debug(format!(
@@ -6764,6 +6967,8 @@ fn build_fft_request(
         window_seconds,
         detrend: view.detrend,
         target_points: target_plot_points(view),
+        log_x: view.fft_log_x,
+        display_decimation: view.fft_display_decimation,
         inputs,
     }
 }
@@ -6937,7 +7142,11 @@ fn calculate_fft_request(request: FftRequest) -> FftResult {
         .filter_map(|input| {
             let points = fft_points(&input.points, input.sample_rate, request.detrend);
             let noise_floor = estimate_white_noise_floor(&points);
-            let points = decimate_min_max_by_x(&points, request.target_points);
+            let points = if request.display_decimation {
+                decimate_spectrum_for_display(&points, request.target_points, request.log_x)
+            } else {
+                points
+            };
             if points.is_empty() {
                 return None;
             }
@@ -6960,42 +7169,56 @@ fn calculate_fft_request(request: FftRequest) -> FftResult {
     }
 }
 
-fn decimate_min_max_by_x(points: &[Point], target_points: usize) -> Vec<Point> {
-    if points.len() <= target_points || target_points < 4 {
+/// Display decimation for a spectrum. Buckets have fixed edges in the axis
+/// domain (log or linear frequency), so a bin always lands in the same bucket
+/// and the plotted frequencies never depend on the data; the old min/max
+/// pass placed each extreme at whichever bin held it, which made the points
+/// hop between neighboring bins every frame. Each bucket keeps its extremes,
+/// placed at the bucket's first and last bin so the polyline traces a stable
+/// band, and a bucket holding a single bin passes it through unchanged, which
+/// on a log axis keeps every low-frequency bin.
+fn decimate_spectrum_for_display(points: &[Point], target_points: usize, log_x: bool) -> Vec<Point> {
+    let bucket_count = target_points / 2;
+    if points.len() <= target_points || bucket_count < 2 {
         return points.to_vec();
     }
-
-    let bucket_count = (target_points / 2).max(1);
-    let bucket_size = (points.len() as f64 / bucket_count as f64).ceil() as usize;
-    let mut output = Vec::with_capacity(target_points);
-
-    for bucket in points.chunks(bucket_size.max(1)) {
-        let Some((min_index, min_point)) = bucket
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
-        else {
-            continue;
-        };
-        let Some((max_index, max_point)) = bucket
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
-        else {
-            continue;
-        };
-
-        if min_index == max_index {
-            output.push(*min_point);
-        } else if min_point.x <= max_point.x {
-            output.push(*min_point);
-            output.push(*max_point);
-        } else {
-            output.push(*max_point);
-            output.push(*min_point);
-        }
+    let axis = |x: f64| if log_x { x.max(f64::MIN_POSITIVE).ln() } else { x };
+    let low = axis(points[0].x);
+    let span = axis(points[points.len() - 1].x) - low;
+    if !span.is_finite() || span <= 0.0 {
+        return points.to_vec();
     }
+    let bucket_of = |x: f64| {
+        (((axis(x) - low) / span) * bucket_count as f64)
+            .floor()
+            .clamp(0.0, (bucket_count - 1) as f64) as usize
+    };
 
+    let mut output = Vec::with_capacity(target_points);
+    let mut start = 0;
+    let mut rising = true;
+    while start < points.len() {
+        let bucket = bucket_of(points[start].x);
+        let mut end = start + 1;
+        while end < points.len() && bucket_of(points[end].x) == bucket {
+            end += 1;
+        }
+        let group = &points[start..end];
+        if let [single] = group {
+            output.push(*single);
+        } else {
+            let (min, max) = group.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), point| {
+                (min.min(point.y), max.max(point.y))
+            });
+            // Alternate the direction so consecutive buckets join like
+            // extreme to like extreme and the band has no systematic slant.
+            let (first, last) = if rising { (min, max) } else { (max, min) };
+            output.push(Point { x: group[0].x, y: first });
+            output.push(Point { x: group[group.len() - 1].x, y: last });
+            rising = !rising;
+        }
+        start = end;
+    }
     output
 }
 
@@ -7277,6 +7500,137 @@ fn execute_rpc(
             "error": format!("Twinleaf parser panic while calling RPC: {}", panic_message(err))
         })),
     }
+}
+
+/// Raw RPC for the terminal: the argument arrives already encoded, the reply
+/// goes back undecoded, and the call runs on its own thread so a slow RPC
+/// (a save, a reboot) never stalls the plot loop. Every path emits exactly one
+/// `rawRpcResult`, which is what lets the app await it.
+fn dispatch_raw_rpc(
+    connection: &Connection,
+    request_id: String,
+    route: String,
+    name: String,
+    arg_hex: Option<String>,
+    emitter: &Emitter,
+) {
+    let route_value = match DeviceRoute::from_str(&route) {
+        Ok(route) => route,
+        Err(_) => {
+            emit_raw_rpc_error(emitter, &request_id, "Invalid route", None);
+            return;
+        }
+    };
+    let arg_bytes = match arg_hex.as_deref().map(hex_decode).transpose() {
+        Ok(bytes) => bytes.unwrap_or_default(),
+        Err(err) => {
+            emit_raw_rpc_error(emitter, &request_id, &err, None);
+            return;
+        }
+    };
+
+    let device = connection.device(route_value);
+    let worker_emitter = emitter.clone();
+    let worker_request_id = request_id.clone();
+    if let Err(err) = thread::Builder::new()
+        .name("twinleaf-raw-rpc".into())
+        .spawn(move || {
+            match panic::catch_unwind(AssertUnwindSafe(|| device.raw_rpc(&name, &arg_bytes))) {
+                Ok(Ok(reply)) => worker_emitter.emit(&json!({
+                    "type": "rawRpcResult",
+                    "requestId": worker_request_id,
+                    "ok": true,
+                    "valueHex": hex_encode(&reply)
+                })),
+                Ok(Err(err)) => {
+                    let (message, code) = raw_rpc_error_text(&err);
+                    emit_raw_rpc_error(&worker_emitter, &worker_request_id, &message, code);
+                }
+                Err(err) => emit_raw_rpc_error(
+                    &worker_emitter,
+                    &worker_request_id,
+                    &format!("Twinleaf parser panic while calling RPC: {}", panic_message(err)),
+                    None,
+                ),
+            }
+        })
+    {
+        emit_raw_rpc_error(
+            emitter,
+            &request_id,
+            &format!("Failed to start RPC worker: {err}"),
+            None,
+        );
+    }
+}
+
+/// Answers every raw RPC in `commands` with a not-connected error; used for
+/// commands a session ends without seeing. Other commands need no reply.
+fn fail_unanswered_raw_rpcs<I: IntoIterator<Item = SessionCommand>>(commands: I, emitter: &Emitter) {
+    for command in commands {
+        if let SessionCommand::CallRawRpc { request_id, .. } = command {
+            emit_raw_rpc_error(emitter, &request_id, "Not connected to a device", None);
+        }
+    }
+}
+
+/// Drains the session command channel when dropped, answering the raw RPCs
+/// found there. Created first thing in `run_session` so it covers every
+/// exit path.
+struct SessionCommandDrain {
+    command_rx: Receiver<SessionCommand>,
+    emitter: Emitter,
+}
+
+impl Drop for SessionCommandDrain {
+    fn drop(&mut self) {
+        fail_unanswered_raw_rpcs(self.command_rx.try_iter(), &self.emitter);
+    }
+}
+
+fn emit_raw_rpc_error(emitter: &Emitter, request_id: &str, message: &str, code: Option<u16>) {
+    emitter.emit(&json!({
+        "type": "rawRpcResult",
+        "requestId": request_id,
+        "ok": false,
+        "error": message,
+        "code": code
+    }));
+}
+
+/// A device refusal reads as its wire error name plus the numeric code, so a
+/// firmware-defined code the crate cannot name is still identifiable.
+fn raw_rpc_error_text(err: &CallError) -> (String, Option<u16>) {
+    match err {
+        CallError::DeviceError(payload) => {
+            let code = payload.error.value();
+            (format!("{} (error {code})", payload.error), Some(code))
+        }
+        other => (other.to_string(), None),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+fn hex_decode(text: &str) -> Result<Vec<u8>, String> {
+    let text = text.trim();
+    if text.len() % 2 != 0 {
+        return Err("Argument hex has an odd number of digits".to_string());
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&text[index..index + 2], 16)
+                .map_err(|_| format!("Argument hex is not valid: {text}"))
+        })
+        .collect()
 }
 
 fn execute_capture_rpc(
@@ -7569,6 +7923,7 @@ fn json_to_bytes(arg: Option<Value>, rpc_type: &str) -> Result<Vec<u8>, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use twinleaf::device::rpc::RpcErrorPayload;
 
     #[test]
     fn incoming_rate_window_averages_wire_bytes() {
@@ -7576,38 +7931,239 @@ mod tests {
         let start = Instant::now();
         let tick = Duration::from_millis(10);
 
+        // Each drain: one data packet of 4 samples plus one heartbeat.
+        let drain = IncomingCounts {
+            bytes: 125,
+            packets: 2,
+            data_packets: 1,
+            samples: 4,
+        };
+
         // Nothing to report until the first emit interval has elapsed.
-        window.observe(125, start);
+        window.observe(drain, start);
         assert_eq!(window.kbps(start), None);
+        assert_eq!(window.packets_per_second(start), None);
+        assert_eq!(window.samples_per_packet(start), None);
 
         // 125 bytes every 10 ms is 12.5 kB/s = 100 kbps. While the window is
         // filling, the average spans the time since the first observation.
         let mut now = start;
         for _ in 1..=200 {
             now += tick;
-            window.observe(125, now);
+            window.observe(drain, now);
         }
         let kbps = window.kbps(now).unwrap();
         assert!((kbps - 100.0).abs() < 1.0, "filling window: {kbps}");
+        let pps = window.packets_per_second(now).unwrap();
+        assert!((pps - 200.0).abs() < 2.0, "filling window: {pps} packets/s");
+        assert_eq!(window.samples_per_packet(now), Some(4.0));
 
         // Past the window, older drains drop out and the rate holds steady.
         for _ in 201..=2000 {
             now += tick;
-            window.observe(125, now);
+            window.observe(drain, now);
         }
         let kbps = window.kbps(now).unwrap();
         assert!((kbps - 100.0).abs() < 0.5, "steady state: {kbps}");
+        let pps = window.packets_per_second(now).unwrap();
+        assert!((pps - 200.0).abs() < 1.0, "steady state: {pps} packets/s");
+        assert_eq!(window.samples_per_packet(now), Some(4.0));
         assert!(window.buckets.len() <= 1000);
 
-        // Quiet ticks bring the average down to zero within one window.
+        // Quiet ticks bring the averages down to zero within one window, and
+        // the aggregation is unknown again with no data packet to read.
         for _ in 0..1000 {
             now += tick;
-            window.observe(0, now);
+            window.observe(IncomingCounts::default(), now);
         }
         assert_eq!(window.kbps(now), Some(0.0));
+        assert_eq!(window.packets_per_second(now), Some(0.0));
+        assert_eq!(window.samples_per_packet(now), None);
 
         // Once observations stop (the monitor port died), the rate is unknown.
         assert_eq!(window.kbps(now + HEALTH_STALE_FLOOR + tick), None);
+        assert_eq!(window.packets_per_second(now + HEALTH_STALE_FLOOR + tick), None);
+    }
+
+    #[test]
+    fn reset_drop_counts_zeroes_every_stream() {
+        let mut health = HealthMonitor::default();
+        for (stream_id, dropped) in [(1u8, 5u64), (2, 0), (3, 12)] {
+            health.streams.insert(
+                (DeviceRoute::root(), stream_id),
+                StreamHealth {
+                    samples_dropped: dropped,
+                    received_count: 100,
+                    ..Default::default()
+                },
+            );
+        }
+
+        health.reset_drop_counts();
+
+        assert!(health.streams.values().all(|stats| stats.samples_dropped == 0));
+        assert!(health.streams.values().all(|stats| stats.received_count == 100));
+        let snapshot = health.snapshot(Instant::now());
+        assert!(snapshot["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|stream| stream["dropped"] == 0));
+    }
+
+    #[test]
+    fn counts_samples_in_raw_data_packets() {
+        let route = DeviceRoute::from_str("/0").unwrap();
+        let sizes = HashMap::from([((route.clone(), 1u8), 6usize)]);
+
+        // Three 6-byte samples aggregated into one data packet for stream 1.
+        let data = tio::Packet::samples(1, 0, 10, &[0u8; 18], route.clone()).unwrap();
+        let counts = incoming_counts_for_packet(&data, &sizes);
+        assert_eq!(counts.packets, 1);
+        assert_eq!(counts.bytes as usize, data.as_bytes().len());
+        assert_eq!(counts.data_packets, 1);
+        assert_eq!(counts.samples, 3);
+
+        // A stream without metadata yet is a packet on the wire but does not
+        // enter the aggregation ratio.
+        let unknown = tio::Packet::samples(2, 0, 10, &[0u8; 18], route.clone()).unwrap();
+        let counts = incoming_counts_for_packet(&unknown, &sizes);
+        assert_eq!(counts.packets, 1);
+        assert_eq!(counts.data_packets, 0);
+        assert_eq!(counts.samples, 0);
+
+        // A drain adds packets up.
+        let mut totals = IncomingCounts::default();
+        totals.add(incoming_counts_for_packet(&data, &sizes));
+        totals.add(incoming_counts_for_packet(&unknown, &sizes));
+        assert_eq!(totals.packets, 2);
+        assert_eq!(totals.data_packets, 1);
+        assert_eq!(totals.samples, 3);
+    }
+
+    #[test]
+    fn decodes_raw_rpc_command_fields() {
+        let command: ClientCommand = serde_json::from_value(json!({
+            "type": "callRawRpc",
+            "requestId": "req-2",
+            "route": "/0",
+            "name": "rpc.info",
+            "argHex": "6465762e6e616d65"
+        }))
+        .unwrap();
+
+        match command {
+            ClientCommand::CallRawRpc {
+                request_id,
+                route,
+                name,
+                arg_hex,
+            } => {
+                assert_eq!(request_id, "req-2");
+                assert_eq!(route, "/0");
+                assert_eq!(name, "rpc.info");
+                assert_eq!(arg_hex.as_deref(), Some("6465762e6e616d65"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // The argument is optional: a bare read carries none.
+        let read: ClientCommand = serde_json::from_value(json!({
+            "type": "callRawRpc",
+            "requestId": "req-3",
+            "route": "/",
+            "name": "dev.name"
+        }))
+        .unwrap();
+        assert!(matches!(read, ClientCommand::CallRawRpc { arg_hex: None, .. }));
+    }
+
+    /// Collects the JSON events an `Emitter::callback` emits during a test.
+    static CAPTURED_EVENTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
+    extern "C" fn capture_event(kind: u32, data: *const u8, len: usize, _context: usize) {
+        if kind != EVENT_JSON {
+            return;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+        if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+            CAPTURED_EVENTS.lock().unwrap().push(value);
+        }
+    }
+
+    #[test]
+    fn ending_session_answers_queued_raw_rpcs() {
+        let emitter = Emitter::callback(capture_event, 0);
+        let (tx, rx) = channel::unbounded::<SessionCommand>();
+        tx.send(SessionCommand::CallRawRpc {
+            request_id: "queued-1".into(),
+            route: "/".into(),
+            name: "dev.name".into(),
+            arg_hex: None,
+        })
+        .unwrap();
+        tx.send(SessionCommand::SetView(ViewConfig::default())).unwrap();
+        tx.send(SessionCommand::CallRawRpc {
+            request_id: "queued-2".into(),
+            route: "/".into(),
+            name: "rpc.info".into(),
+            arg_hex: Some("00".into()),
+        })
+        .unwrap();
+
+        CAPTURED_EVENTS.lock().unwrap().clear();
+        drop(SessionCommandDrain {
+            command_rx: rx.clone(),
+            emitter,
+        });
+
+        let answered: Vec<(String, bool, String)> = CAPTURED_EVENTS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "rawRpcResult")
+            .map(|event| {
+                (
+                    event["requestId"].as_str().unwrap().to_string(),
+                    event["ok"].as_bool().unwrap(),
+                    event["error"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            answered,
+            vec![
+                ("queued-1".to_string(), false, "Not connected to a device".to_string()),
+                ("queued-2".to_string(), false, "Not connected to a device".to_string()),
+            ]
+        );
+        // The drain consumed the channel; nothing waits behind a dead session.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn hex_round_trips_raw_rpc_bytes() {
+        assert_eq!(hex_encode(&[]), "");
+        assert_eq!(hex_encode(&[0x00, 0x7f, 0xff]), "007fff");
+        assert_eq!(hex_decode("007fff").unwrap(), vec![0x00, 0x7f, 0xff]);
+        assert_eq!(hex_decode(" 0A0b ").unwrap(), vec![0x0a, 0x0b]);
+        assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
+        assert!(hex_decode("abc").is_err());
+        assert!(hex_decode("zz").is_err());
+    }
+
+    #[test]
+    fn raw_rpc_errors_name_the_device_code() {
+        let (text, code) = raw_rpc_error_text(&CallError::DeviceError(RpcErrorPayload {
+            error: RpcError::NotFound,
+            extra: Vec::new(),
+        }));
+        assert_eq!(text, "RPC not found (error 2)");
+        assert_eq!(code, Some(2));
+
+        let (text, code) = raw_rpc_error_text(&CallError::Timeout);
+        assert_eq!(text, "timed out waiting for the RPC reply");
+        assert_eq!(code, None);
     }
 
     #[test]
@@ -8510,19 +9066,82 @@ mod tests {
     }
 
     #[test]
-    fn min_max_decimator_caps_points_and_keeps_peaks() {
-        let points: Vec<_> = (0..100)
+    fn display_decimator_caps_points_and_keeps_peaks() {
+        let points: Vec<_> = (1..=100)
             .map(|index| Point {
                 x: index as f64,
                 y: if index == 42 { 100.0 } else { index as f64 },
             })
             .collect();
 
-        let decimated = decimate_min_max_by_x(&points, 10);
-        assert!(decimated.len() <= 10);
-        assert!(decimated
-            .iter()
-            .any(|point| point.x == 42.0 && point.y == 100.0));
+        let decimated = decimate_spectrum_for_display(&points, 10, false);
+        assert!(decimated.len() <= 10, "{} points", decimated.len());
+        assert!(decimated.iter().any(|point| point.y == 100.0));
+        assert!(decimated.windows(2).all(|pair| pair[0].x <= pair[1].x));
+
+        // Under the target, and with decimation off, every bin is plotted.
+        assert_eq!(decimate_spectrum_for_display(&points, 100, false), points);
+    }
+
+    #[test]
+    fn display_decimator_plots_the_same_frequencies_for_any_data() {
+        // Two spectra on the same bins with different noise decimate to the
+        // same frequencies: bucket edges are fixed, so nothing hops between
+        // neighboring bins from frame to frame.
+        let spacing = 1000.0 / 4096.0;
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut noise = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            1.0 + (seed % 1000) as f64 / 1000.0
+        };
+        let spectrum = |noise: &mut dyn FnMut() -> f64| -> Vec<Point> {
+            (1..2048)
+                .map(|index| Point {
+                    x: index as f64 * spacing,
+                    y: noise(),
+                })
+                .collect()
+        };
+        let a = spectrum(&mut noise);
+        let b = spectrum(&mut noise);
+        for log_x in [true, false] {
+            let da = decimate_spectrum_for_display(&a, 800, log_x);
+            let db = decimate_spectrum_for_display(&b, 800, log_x);
+            assert!(da.len() <= 800 && da.len() > 400, "log_x={log_x}: {} points", da.len());
+            let xa: Vec<f64> = da.iter().map(|point| point.x).collect();
+            let xb: Vec<f64> = db.iter().map(|point| point.x).collect();
+            assert_eq!(xa, xb, "log_x={log_x}");
+            assert!(xa.windows(2).all(|pair| pair[0] <= pair[1]));
+        }
+
+        // On a log axis the low-frequency bins are sparse on screen, so the
+        // first bins come through one for one; on a linear axis the buckets
+        // are uniform from the start.
+        let log = decimate_spectrum_for_display(&a, 800, true);
+        assert_eq!(log[0], a[0]);
+        assert_eq!(log[1], a[1]);
+        assert_eq!(log[2], a[2]);
+        let linear = decimate_spectrum_for_display(&a, 800, false);
+        assert_eq!(linear[0].x, a[0].x);
+        assert!(linear[1].x > a[1].x);
+    }
+
+    #[test]
+    fn fft_window_sample_count_snaps_whole_products() {
+        let count = |window: f64, rate: f64| {
+            ColumnState::new("signal".to_string(), "V".to_string(), rate)
+                .fft_window_sample_count(window)
+        };
+        // Products a few ulps above a whole number no longer round up.
+        assert_eq!(8.3 * 100.0_f64, 830.0000000000001);
+        assert_eq!(count(8.3, 100.0), 830);
+        assert_eq!(count(15.0, 4166.666666666667), 62500);
+        assert_eq!(count(10.0, 1000.0), 10000);
+        // A genuinely fractional window still rounds up to cover it.
+        assert_eq!(count(0.333, 100.0), 34);
+        assert_eq!(count(1e-9, 100.0), 1);
     }
 
     #[test]

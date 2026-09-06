@@ -407,6 +407,14 @@ final class RustRuntime {
         }
     }
 
+    func callRawRpc(requestId: String, route: String, name: String, argumentHex: String?) {
+        send(CallRawRpcCommand(requestId: requestId, route: route, name: name, argHex: argumentHex))
+    }
+
+    func resetHealthCounters() {
+        send(ResetHealthCountersCommand())
+    }
+
     private static func findLibraryURL() throws -> URL {
         let fileName = "libtwinleaf_core.dylib"
         let environment = ProcessInfo.processInfo.environment
@@ -610,6 +618,21 @@ private struct SetDerivedChannelsCommand: Encodable {
 private struct SetViewCommand: Encodable {
     let type = "setView"
     let view: ViewConfig
+}
+
+/// An RPC by name with pre-encoded argument bytes; the reply comes back as
+/// raw bytes in a `rawRpcResult` event. Bytes travel as hex in both
+/// directions.
+private struct CallRawRpcCommand: Encodable {
+    let type = "callRawRpc"
+    let requestId: String
+    let route: String
+    let name: String
+    let argHex: String?
+}
+
+private struct ResetHealthCountersCommand: Encodable {
+    let type = "resetHealthCounters"
 }
 
 private struct PlotPaneConfigPayload: Encodable {

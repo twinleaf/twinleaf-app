@@ -23,6 +23,8 @@ private protocol BridgeRuntime: AnyObject {
     func setDerivedChannels(_ channels: [DerivedChannelSpec])
     func setView(_ view: ViewConfig)
     func callRpc(requestId: String, route: String, name: String, argument: Any?)
+    func callRawRpc(requestId: String, route: String, name: String, argumentHex: String?)
+    func resetHealthCounters()
     func checkUpgrade()
     func performUpgrade(route: String)
 }
@@ -44,6 +46,8 @@ private final class UnavailableBridgeRuntime: BridgeRuntime {
     func setDerivedChannels(_ channels: [DerivedChannelSpec]) {}
     func setView(_ view: ViewConfig) {}
     func callRpc(requestId: String, route: String, name: String, argument: Any?) {}
+    func callRawRpc(requestId: String, route: String, name: String, argumentHex: String?) {}
+    func resetHealthCounters() {}
     func checkUpgrade() {}
     func performUpgrade(route: String) {}
 }
@@ -169,8 +173,8 @@ final class BridgeClient: ObservableObject {
     /// Per-stream timing/rate diagnostics (mirrors `tio health`), refreshed
     /// continuously while connected.
     @Published private(set) var streamHealth: [StreamHealthInfo] = []
-    /// Rolling average of the incoming TIO packet bytes across every device.
-    @Published private(set) var incomingDataRate: IncomingDataRate?
+    /// Rolling averages of the incoming TIO packet traffic across every device.
+    @Published private(set) var incomingLinkStats: IncomingLinkStats?
     @Published private(set) var logMessages: [LogMessage] = []
     @Published private(set) var logRevision: UInt64 = 0
     @Published private(set) var isInspectionMode = false
@@ -224,6 +228,11 @@ final class BridgeClient: ObservableObject {
     private var shouldRetryAllSerialAfterStrictDiscovery = false
     private var nextConnectionAttemptID: UInt64 = 1
     private var connectionRPCReadbackRequestIDs: Set<String> = []
+    /// Raw RPC calls awaiting their `rawRpcResult`, keyed by request id.
+    private var pendingRawRpcContinuations: [String: CheckedContinuation<Data, Error>] = [:]
+    /// The RPC terminal's transcript, history, and target. Owned here rather
+    /// than by the pane so they survive the pane being hidden and shown.
+    lazy var terminal = RpcTerminal(bridge: self)
     private let decoder = JSONDecoder()
     private static let rememberedURLsDefaultsKey = "rememberedDeviceURLs"
     private static let rpcReadbackInterval: TimeInterval = 2
@@ -331,11 +340,12 @@ final class BridgeClient: ObservableObject {
         let attemptID = nextConnectionAttemptID
         nextConnectionAttemptID &+= 1
         connectionRPCReadbackRequestIDs.removeAll()
+        failPendingRawRpcs()
         connectionProgress = .started(attemptID: attemptID, device: device)
         availableUpgrades = []
         upgradeProgress = nil
         streamHealth = []
-        incomingDataRate = nil
+        incomingLinkStats = nil
         isInspectionMode = false
         rpcCacheNeedsReload = false
         clearLogMessages()
@@ -364,7 +374,7 @@ final class BridgeClient: ObservableObject {
         isPlotPaused = true
         rpcCacheNeedsReload = false
         streamHealth = []
-        incomingDataRate = nil
+        incomingLinkStats = nil
         clearLogMessages()
         clearRPCReadbackState()
         clearStreamDisplayValues()
@@ -393,6 +403,7 @@ final class BridgeClient: ObservableObject {
         clearRPCReadbackState()
         clearStreamDisplayValues()
         connectionRPCReadbackRequestIDs.removeAll()
+        failPendingRawRpcs()
         connectionProgress = ConnectionProgress()
         plotFrames.resetViewportEnd()
         resetLogTiming()
@@ -403,10 +414,15 @@ final class BridgeClient: ObservableObject {
         availableUpgrades = []
         upgradeProgress = nil
         streamHealth = []
-        incomingDataRate = nil
+        incomingLinkStats = nil
     }
 
     /// Re-run the lazy firmware-availability check for the active session.
+    /// Zero the dropped-sample counters in the Connection Health popover.
+    func resetHealthCounters() {
+        runtime?.resetHealthCounters()
+    }
+
     func checkUpgrade() {
         runtime?.checkUpgrade()
     }
@@ -434,6 +450,7 @@ final class BridgeClient: ObservableObject {
         clearRPCReadbackState()
         clearStreamDisplayValues()
         connectionRPCReadbackRequestIDs.removeAll()
+        failPendingRawRpcs()
         resetLivePlotTiming()
         updateConnectionProgress { progress in
             progress.phase = .cancelled
@@ -863,6 +880,12 @@ final class BridgeClient: ObservableObject {
         updateAllPaneViewConfigs { $0.fftLogX = enabled }
     }
 
+    func setFFTDisplayDecimation(_ enabled: Bool) {
+        guard viewConfig.fftDisplayDecimation != enabled else { return }
+        viewConfig.fftDisplayDecimation = enabled
+        updateAllPaneViewConfigs { $0.fftDisplayDecimation = enabled }
+    }
+
     func setFFTLogX(_ enabled: Bool, for paneID: Int) {
         guard let index = plotPanes.firstIndex(where: { $0.id == paneID }),
               plotPanes[index].viewConfig.fftLogX != enabled else {
@@ -1059,6 +1082,76 @@ final class BridgeClient: ObservableObject {
             argument: argument
         )
         return requestId
+    }
+
+    /// Calls `name` at `route` with already-encoded argument bytes and returns
+    /// the raw reply. Unlike `callRpc(_:argumentText:)` this needs no entry in
+    /// the device's RPC list, which is what the terminal's lazy typing and
+    /// `rpc.*` introspection calls rely on. Every request resolves: the Rust
+    /// side answers each one exactly once, and a disconnect fails the rest.
+    func callRawRpc(route: String, name: String, argument: Data?) async throws -> Data {
+        guard let runtime, !isInspectionMode else {
+            throw RawRpcError.notConnected
+        }
+        let requestId = UUID().uuidString
+        // Safety net only: the device's own RPC timeout comes back as a
+        // `failed` result long before this fires.
+        let watchdog = Task { [weak self] in
+            try? await Task.sleep(for: Self.rawRpcWatchdogInterval)
+            guard !Task.isCancelled else { return }
+            self?.failPendingRawRpc(requestId: requestId, error: .timedOut)
+        }
+        defer { watchdog.cancel() }
+        return try await withCheckedThrowingContinuation { continuation in
+            pendingRawRpcContinuations[requestId] = continuation
+            runtime.callRawRpc(
+                requestId: requestId,
+                route: route,
+                name: name,
+                argumentHex: argument.map { $0.map { String(format: "%02x", $0) }.joined() }
+            )
+        }
+    }
+
+    private static let rawRpcWatchdogInterval: Duration = .seconds(20)
+
+    private func handleRawRpcResult(_ event: RawRpcResultEvent) {
+        guard let continuation = pendingRawRpcContinuations.removeValue(forKey: event.requestId) else {
+            return
+        }
+        guard event.ok else {
+            continuation.resume(throwing: RawRpcError.failed(
+                message: event.error ?? "RPC failed",
+                code: event.code
+            ))
+            return
+        }
+        continuation.resume(returning: Self.data(fromHex: event.valueHex ?? ""))
+    }
+
+    private func failPendingRawRpc(requestId: String, error: RawRpcError) {
+        pendingRawRpcContinuations.removeValue(forKey: requestId)?.resume(throwing: error)
+    }
+
+    private func failPendingRawRpcs() {
+        let pending = pendingRawRpcContinuations
+        pendingRawRpcContinuations.removeAll()
+        for continuation in pending.values {
+            continuation.resume(throwing: RawRpcError.notConnected)
+        }
+    }
+
+    private static func data(fromHex hex: String) -> Data {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(hex.utf8.count / 2)
+        var digits = hex.utf8.makeIterator()
+        while let high = digits.next(), let low = digits.next() {
+            guard let value = UInt8(String(decoding: [high, low], as: UTF8.self), radix: 16) else {
+                break
+            }
+            bytes.append(value)
+        }
+        return Data(bytes)
     }
 
     private func scheduleRPCReadbackAfterWrite(rpcID: String) {
@@ -1550,6 +1643,8 @@ final class BridgeClient: ObservableObject {
                 handleRpcResult(try decoder.decode(RpcResultEvent.self, from: data))
             case "rpcInvalidated":
                 handleRpcInvalidated(try decoder.decode(RpcInvalidatedEvent.self, from: data))
+            case "rawRpcResult":
+                handleRawRpcResult(try decoder.decode(RawRpcResultEvent.self, from: data))
             case "deviceEvent":
                 handleDeviceEvent(try decoder.decode(DeviceEventEvent.self, from: data))
             case "upgradeStatus":
@@ -1560,9 +1655,14 @@ final class BridgeClient: ObservableObject {
             case "health":
                 let event = try decoder.decode(StreamHealthEvent.self, from: data)
                 streamHealth = event.streams
-                incomingDataRate = event.incomingKbps.map {
-                    IncomingDataRate(kbps: $0, windowSeconds: event.incomingWindowSeconds)
-                }
+                incomingLinkStats = event.incomingKbps == nil && event.incomingPacketsPerSecond == nil
+                    ? nil
+                    : IncomingLinkStats(
+                        kbps: event.incomingKbps,
+                        packetsPerSecond: event.incomingPacketsPerSecond,
+                        samplesPerPacket: event.incomingSamplesPerPacket,
+                        windowSeconds: event.incomingWindowSeconds
+                    )
             default:
                 break
             }
@@ -2626,11 +2726,16 @@ struct StreamHealthInfo: Decodable, Hashable, Identifiable {
     var id: String { "\(route)#\(streamId)" }
 }
 
-/// Aggregate incoming data rate across every connected device, averaged over
-/// the trailing `windowSeconds`.
-struct IncomingDataRate: Hashable {
+/// Aggregate incoming link statistics across every connected device, each
+/// averaged over the trailing `windowSeconds`. A field is `nil` when the
+/// bridge cannot report it yet.
+struct IncomingLinkStats: Hashable {
     /// Kilobits per second of TIO packet bytes (header, payload, and routing).
-    let kbps: Double
+    let kbps: Double?
+    /// Packets of every type per second.
+    let packetsPerSecond: Double?
+    /// Mean samples aggregated into each stream data packet.
+    let samplesPerPacket: Double?
     let windowSeconds: Double
 }
 
@@ -2639,6 +2744,9 @@ private struct StreamHealthEvent: Decodable {
     /// `nil` until the bridge has a full emit interval of data, or when the
     /// raw packet feed is gone.
     let incomingKbps: Double?
+    let incomingPacketsPerSecond: Double?
+    /// `nil` until a data packet with known sample size has arrived.
+    let incomingSamplesPerPacket: Double?
     let incomingWindowSeconds: Double
 }
 
@@ -2734,6 +2842,14 @@ private struct RpcInvalidatedEvent: Decodable {
     let route: String
     let name: String?
     let rpcId: UInt16?
+}
+
+private struct RawRpcResultEvent: Decodable {
+    let requestId: String
+    let ok: Bool
+    let valueHex: String?
+    let error: String?
+    let code: UInt16?
 }
 
 private enum TypedRuntimeEventCode: UInt16 {
