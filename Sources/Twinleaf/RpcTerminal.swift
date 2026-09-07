@@ -318,13 +318,13 @@ final class RpcTerminal: ObservableObject {
     }
 
     private func run(_ line: String) async {
-        append(.command, "> " + line)
+        let route = selectedRoute
+        append(.command, Self.prompt(for: route) + " " + line)
         let (name, value) = Self.splitCommand(line)
         guard let bridge else {
             append(.error, "! " + RawRpcError.notConnected.localizedDescription)
             return
         }
-        let route = selectedRoute
         isBusy = true
         defer { isBusy = false }
 
@@ -439,6 +439,11 @@ final class RpcTerminal: ObservableObject {
         }
     }
 
+    /// The prompt for a route: `/>` at the root, `/0>` one hop down.
+    static func prompt(for route: String) -> String {
+        route + ">"
+    }
+
     /// `name` reads; `name value` writes, and the value may contain spaces.
     static func splitCommand(_ line: String) -> (name: String, value: String?) {
         guard let space = line.firstIndex(of: " ") else { return (line, nil) }
@@ -486,20 +491,6 @@ struct RpcTerminalPane: View {
                 .font(.headline)
 
             Spacer()
-
-            Picker("Target", selection: $terminal.selectedRoute) {
-                if bridge.devices.isEmpty {
-                    Text("No device").tag(terminal.selectedRoute)
-                }
-                ForEach(bridge.devices) { device in
-                    Text(Self.routeTitle(for: device)).tag(device.route)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .fixedSize()
-            .disabled(bridge.devices.isEmpty)
-            .help("Sensor the commands are sent to")
 
             Button {
                 copyTranscript()
@@ -564,9 +555,7 @@ struct RpcTerminalPane: View {
 
     private var prompt: some View {
         HStack(alignment: .center, spacing: 6) {
-            Text(">")
-                .font(Self.font)
-                .foregroundStyle(.secondary)
+            routePrompt
 
             inputField
                 .frame(maxWidth: .infinity)
@@ -581,6 +570,28 @@ struct RpcTerminalPane: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The prompt names the sensor the commands go to (`/>`, `/0>`, ...)
+    /// and is itself the way to pick another one.
+    private var routePrompt: some View {
+        Menu {
+            Picker("Target", selection: $terminal.selectedRoute) {
+                ForEach(bridge.devices) { device in
+                    Text(Self.routeTitle(for: device)).tag(device.route)
+                }
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Text(RpcTerminal.prompt(for: terminal.selectedRoute))
+                .font(Self.font)
+                .foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(bridge.devices.isEmpty)
+        .help("Sensor the commands go to. Click to pick another.")
     }
 
     @ViewBuilder
