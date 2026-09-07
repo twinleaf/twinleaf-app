@@ -140,7 +140,60 @@ struct DocumentWindow: View {
             + rpcSliders.map { RpcFocusField.slider($0.id) }
     }
 
+    // The modifier chain is split into stages so the type checker solves each
+    // one separately; as a single expression it timed out on Xcode 26.6.
     var body: some View {
+        documentObservers
+            .onReceive(NotificationCenter.default.publisher(for: .showDevicePicker)) { _ in
+                guard !bridge.isInspectionMode else { return }
+                // The picker starts live discovery in its own onAppear.
+                showingDevicePicker = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .showExportPanel)) { notification in
+                guard receivesWindowCommand(notification) else { return }
+                presentExportPanel()
+            }
+            #if os(macOS)
+            .onReceive(NotificationCenter.default.publisher(for: .printDocument)) { notification in
+                handlePrintCommand(notification)
+            }
+            #endif
+            .onReceive(NotificationCenter.default.publisher(for: .showPlotSettings)) { _ in
+                showingPlotSettings = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .togglePlotPause)) { _ in
+                bridge.togglePlotPaused()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .toggleDataLogging)) { notification in
+                guard receivesWindowCommand(notification) else { return }
+                setDataLoggingEnabled(!isDataLoggingEnabled)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .refreshDeviceList)) { _ in
+                guard !bridge.isInspectionMode else { return }
+                bridge.listDevices(includeAllSerial: showAllSerialPorts)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .focusRPCSearch)) { _ in
+                distractionFree = false
+                showStreamSidebar = true
+                DispatchQueue.main.async {
+                    rpcSearchFocusRequest &+= 1
+                }
+            }
+            .onDisappear {
+#if os(macOS)
+                closeAllPlotPopouts()
+                closeAllAuxiliaryPopouts()
+#endif
+                bridge.disconnect()
+#if os(iOS)
+                deleteUntouchedDocumentFileIfNeeded()
+#endif
+            }
+    }
+
+    /// Chrome: platform toolbar, theme, minimum frame, window-frame
+    /// persistence, the smoke warning, and the device picker.
+    private var documentChrome: some View {
         documentContentWithPlatformToolbar
             .preferredColorScheme(themePreference.preferredColorScheme)
             .twinleafDocumentMinimumFrame()
@@ -178,6 +231,12 @@ struct DocumentWindow: View {
 #endif
             .twinleafIOSNavigationBackButtonHidden()
             .twinleafWindowToolbarVisibility(effectiveShowToolbar)
+    }
+
+    /// Presentations and startup: export panel, first-launch document setup,
+    /// plot settings, and layout-preference plumbing.
+    private var documentPresentations: some View {
+        documentChrome
             .fileExporter(
                 isPresented: $showingExportPanel,
                 document: ExportDestinationDocument(),
@@ -226,6 +285,11 @@ struct DocumentWindow: View {
             #if os(macOS)
             .background(TabFocusMonitor(chain: focusChain, focus: $focusedField))
             #endif
+    }
+
+    /// State observers that persist layout and keep pop-out windows in sync.
+    private var documentObservers: some View {
+        documentPresentations
             .onChange(of: distractionFree) { wasDistractionFree, isDistractionFree in
                 if wasDistractionFree && !isDistractionFree {
                     showToolbar = true
@@ -260,51 +324,6 @@ struct DocumentWindow: View {
             }
             .onChange(of: independentAxisLabelVisibility) { _, _ in
                 saveBoardViewLayoutsForCurrentDevices()
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .showDevicePicker)) { _ in
-                guard !bridge.isInspectionMode else { return }
-                // The picker starts live discovery in its own onAppear.
-                showingDevicePicker = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .showExportPanel)) { notification in
-                guard receivesWindowCommand(notification) else { return }
-                presentExportPanel()
-            }
-            #if os(macOS)
-            .onReceive(NotificationCenter.default.publisher(for: .printDocument)) { notification in
-                handlePrintCommand(notification)
-            }
-            #endif
-            .onReceive(NotificationCenter.default.publisher(for: .showPlotSettings)) { _ in
-                showingPlotSettings = true
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .togglePlotPause)) { _ in
-                bridge.togglePlotPaused()
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .toggleDataLogging)) { notification in
-                guard receivesWindowCommand(notification) else { return }
-                setDataLoggingEnabled(!isDataLoggingEnabled)
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .refreshDeviceList)) { _ in
-                guard !bridge.isInspectionMode else { return }
-                bridge.listDevices(includeAllSerial: showAllSerialPorts)
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .focusRPCSearch)) { _ in
-                distractionFree = false
-                showStreamSidebar = true
-                DispatchQueue.main.async {
-                    rpcSearchFocusRequest &+= 1
-                }
-            }
-            .onDisappear {
-#if os(macOS)
-                closeAllPlotPopouts()
-                closeAllAuxiliaryPopouts()
-#endif
-                bridge.disconnect()
-#if os(iOS)
-                deleteUntouchedDocumentFileIfNeeded()
-#endif
             }
     }
 
