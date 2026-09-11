@@ -693,6 +693,17 @@ enum RawRpcError: LocalizedError, Equatable {
     }
 }
 
+/// How a settings write ended, handed back to the control that issued it so it
+/// can show the device's answer.
+enum RPCWriteOutcome: Equatable {
+    case succeeded
+    case failed(String?)
+
+    var isFailure: Bool {
+        if case .failed = self { true } else { false }
+    }
+}
+
 struct LogMessage: Hashable, Identifiable {
     let id = UUID()
     let route: String

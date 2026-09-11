@@ -230,12 +230,18 @@ final class BridgeClient: ObservableObject {
     private var connectionRPCReadbackRequestIDs: Set<String> = []
     /// Raw RPC calls awaiting their `rawRpcResult`, keyed by request id.
     private var pendingRawRpcContinuations: [String: CheckedContinuation<Data, Error>] = [:]
+    /// Writes whose issuing control wants the device's answer (the settings
+    /// fields' success/failure flash), keyed by request id.
+    private var rpcWriteOutcomeHandlers: [String: (RPCWriteOutcome) -> Void] = [:]
     /// The RPC terminal's transcript, history, and target. Owned here rather
     /// than by the pane so they survive the pane being hidden and shown.
     lazy var terminal = RpcTerminal(bridge: self)
     private let decoder = JSONDecoder()
     private static let rememberedURLsDefaultsKey = "rememberedDeviceURLs"
     private static let rpcReadbackInterval: TimeInterval = 2
+    /// Safety net only: a device answers a write — or refuses it — long before
+    /// this fires.
+    private static let rpcWriteOutcomeTimeout: TimeInterval = 10
     private static let streamDisplayUpdateInterval: TimeInterval = 0.2
     private static let streamDisplayEMATimeConstant: TimeInterval = 0.4
 
@@ -341,6 +347,7 @@ final class BridgeClient: ObservableObject {
         nextConnectionAttemptID &+= 1
         connectionRPCReadbackRequestIDs.removeAll()
         failPendingRawRpcs()
+        failPendingWriteOutcomes()
         connectionProgress = .started(attemptID: attemptID, device: device)
         availableUpgrades = []
         upgradeProgress = nil
@@ -404,6 +411,7 @@ final class BridgeClient: ObservableObject {
         clearStreamDisplayValues()
         connectionRPCReadbackRequestIDs.removeAll()
         failPendingRawRpcs()
+        failPendingWriteOutcomes()
         connectionProgress = ConnectionProgress()
         plotFrames.resetViewportEnd()
         resetLogTiming()
@@ -451,6 +459,7 @@ final class BridgeClient: ObservableObject {
         clearStreamDisplayValues()
         connectionRPCReadbackRequestIDs.removeAll()
         failPendingRawRpcs()
+        failPendingWriteOutcomes()
         resetLivePlotTiming()
         updateConnectionProgress { progress in
             progress.phase = .cancelled
@@ -1063,7 +1072,12 @@ final class BridgeClient: ObservableObject {
     }
 
     @discardableResult
-    func callRpc(_ rpc: RpcInfo, argumentText: String? = nil, optimisticallyUpdate: Bool = true) -> String {
+    func callRpc(
+        _ rpc: RpcInfo,
+        argumentText: String? = nil,
+        optimisticallyUpdate: Bool = true,
+        onOutcome: ((RPCWriteOutcome) -> Void)? = nil
+    ) -> String {
         let requestId = UUID().uuidString
         let argument = argumentText.flatMap { rpcArgument(for: rpc, text: $0) }
         if argument != nil {
@@ -1075,6 +1089,9 @@ final class BridgeClient: ObservableObject {
            let argumentText {
             previewRpcValue(rpc, argumentText: argumentText)
         }
+        if let onOutcome {
+            trackWriteOutcome(onOutcome, requestId: requestId)
+        }
         runtime?.callRpc(
             requestId: requestId,
             route: rpc.route,
@@ -1082,6 +1099,35 @@ final class BridgeClient: ObservableObject {
             argument: argument
         )
         return requestId
+    }
+
+    /// Holds `handler` until the reply for `requestId` lands. A request that
+    /// never gets one — no runtime, or a device that went quiet — fails at the
+    /// watchdog rather than leaving the caller waiting forever.
+    private func trackWriteOutcome(
+        _ handler: @escaping (RPCWriteOutcome) -> Void,
+        requestId: String
+    ) {
+        guard runtime != nil else {
+            handler(.failed("Twinleaf runtime is unavailable"))
+            return
+        }
+        rpcWriteOutcomeHandlers[requestId] = handler
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.rpcWriteOutcomeTimeout) { [weak self] in
+            self?.completeWriteOutcome(.failed("No reply from the device"), requestId: requestId)
+        }
+    }
+
+    private func completeWriteOutcome(_ outcome: RPCWriteOutcome, requestId: String) {
+        rpcWriteOutcomeHandlers.removeValue(forKey: requestId)?(outcome)
+    }
+
+    private func failPendingWriteOutcomes() {
+        let handlers = rpcWriteOutcomeHandlers
+        rpcWriteOutcomeHandlers.removeAll()
+        for handler in handlers.values {
+            handler(.failed("Not connected to a device"))
+        }
     }
 
     /// Calls `name` at `route` with already-encoded argument bytes and returns
@@ -1931,8 +1977,15 @@ final class BridgeClient: ObservableObject {
             return
         }
 
+        copyDataText(text, rows: event.rows ?? 0)
+    }
+
+    /// Puts tab-separated rows on the clipboard and reports it the way a plot
+    /// pane's copy does. Panes whose data the app already holds — the capture
+    /// plot — format their own rows rather than asking the bridge for them.
+    func copyDataText(_ text: String, rows: Int) {
         copyTextToClipboard(text)
-        status = "Copied \(event.rows ?? 0) data row(s) to clipboard"
+        status = "Copied \(rows) data row(s) to clipboard"
         statusState = isInspectionMode ? "inspection" : "streaming"
     }
 
@@ -2335,6 +2388,11 @@ final class BridgeClient: ObservableObject {
         if connectionRPCReadbackRequestIDs.remove(event.requestId) != nil {
             markConnectionRPCReply(ok: event.ok)
         }
+
+        completeWriteOutcome(
+            event.ok ? .succeeded : .failed(event.error),
+            requestId: event.requestId
+        )
 
         let writeRPCID = writeRPCIDByRequestID.removeValue(forKey: event.requestId)
 

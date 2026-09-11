@@ -3494,6 +3494,14 @@ private struct CaptureResultPane: View {
             if let plotData {
                 CapturePlotView(data: plotData)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                    .contextMenu {
+                        Button {
+                            bridge.copyDataText(plotData.dataText, rows: plotData.points.count)
+                        } label: {
+                            Label("Copy View Data", systemImage: "doc.on.doc")
+                        }
+                    }
             } else {
                 ContentUnavailableView("No Capture", systemImage: "waveform.path.ecg")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -3661,6 +3669,25 @@ private struct CapturePlotData {
         xTitle = Self.axisTitle(name: xName, units: xUnits)
         yTitle = Self.axisTitle(name: name, units: units)
         self.points = points
+    }
+
+    /// The capture in the tab-separated shape a plot pane's "Copy View Data"
+    /// produces — axis titles as the header, then one row per point. Formatted
+    /// here rather than in the bridge because the app already holds the points.
+    var dataText: String {
+        var text = "\(Self.escapeTSV(xTitle))\t\(Self.escapeTSV(yTitle))\n"
+        for point in points {
+            text += String(format: "%.17f\t%.17f\n", point.x, point.y)
+        }
+        return text
+    }
+
+    private static func escapeTSV(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\t", with: "\\t")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
     }
 
     private static func points(from object: [String: JSONValue]) -> [PlotPoint] {
@@ -8933,6 +8960,66 @@ private struct EditableSettingIDsKey: PreferenceKey {
 
 private let favoriteRPCTextColor = Color.green
 
+/// One write's answer, kept distinct per write so that two identical outcomes
+/// in a row each flash the field.
+private struct RPCWriteFlash: Equatable {
+    let id = UUID()
+    let isFailure: Bool
+}
+
+private extension View {
+    /// Fades a halo around a settings field when its write lands: green for the
+    /// device's acknowledgement, red for a refusal or a missing reply.
+    func rpcWriteHalo(_ flash: RPCWriteFlash?) -> some View {
+        modifier(RPCWriteHalo(flash: flash))
+    }
+}
+
+private struct RPCWriteHalo: ViewModifier {
+    let flash: RPCWriteFlash?
+
+    @State private var opacity: Double = 0
+
+    func body(content: Content) -> some View {
+        content
+            .overlay {
+                haloShape
+                    .strokeBorder(color, lineWidth: 2)
+                    .shadow(color: color.opacity(0.6), radius: 3)
+                    .opacity(opacity)
+                    .allowsHitTesting(false)
+            }
+            .task(id: flash) {
+                guard flash != nil else {
+                    opacity = 0
+                    return
+                }
+                opacity = 1
+                // Hold at full strength in its own transaction so the fade has
+                // something to animate down from. A write landing during the hold
+                // cancels this task; leave its fresh halo alone.
+                try? await Task.sleep(for: .milliseconds(120))
+                guard !Task.isCancelled else { return }
+                withAnimation(.easeOut(duration: 0.85)) {
+                    opacity = 0
+                }
+            }
+    }
+
+    private var color: Color {
+        flash?.isFailure == true ? .red : .green
+    }
+
+    private var haloShape: some InsettableShape {
+        #if os(macOS)
+        // Matches the rounded bezel of the settings fields.
+        Capsule()
+        #else
+        RoundedRectangle(cornerRadius: 6, style: .continuous)
+        #endif
+    }
+}
+
 private struct RpcRow: View, @MainActor Equatable {
     let bridge: BridgeClient
     let rpc: RpcInfo
@@ -8952,6 +9039,7 @@ private struct RpcRow: View, @MainActor Equatable {
     @AppStorage(ViewPreferenceKeys.rpcFloatPrecisionPPM) private var rpcFloatPrecisionPPM = NumericDisplayPolicy.defaultRPCFloatPrecisionPPM
     @State private var argument = ""
     @State private var committedArgument = ""
+    @State private var writeFlash: RPCWriteFlash?
 
     static func == (lhs: RpcRow, rhs: RpcRow) -> Bool {
         lhs.rpc == rhs.rpc
@@ -8985,7 +9073,7 @@ private struct RpcRow: View, @MainActor Equatable {
         }
         .onChange(of: focusedField.wrappedValue) { oldValue, newValue in
             guard oldValue == .rpc(rpc.id), newValue != .rpc(rpc.id) else { return }
-            updateRPCIfChanged()
+            updateRPCIfChanged(argument)
         }
         .onChange(of: rpcFloatPrecisionPPM) { _, _ in
             guard let value = rpc.value,
@@ -9143,11 +9231,13 @@ private struct RpcRow: View, @MainActor Equatable {
                 placeholder: rpcDisplayType,
                 isEnabled: rpc.writable && rpc.hasMetadata,
                 fixedFractionDigits: rpc.isIntegerRPC ? nil : 3,
-                onStep: commitSteppedValue,
-                onCommit: updateRPC
+                onStep: updateRPC,
+                onCommit: updateRPC,
+                onCommitIfChanged: updateRPCIfChanged
             )
             .frame(width: 128)
             .focused(focusedField, equals: .rpc(rpc.id))
+            .rpcWriteHalo(writeFlash)
             #else
             TextField(rpcDisplayType, text: $argument)
                 .textFieldStyle(.roundedBorder)
@@ -9155,7 +9245,8 @@ private struct RpcRow: View, @MainActor Equatable {
                 .disabled(!rpc.writable || !rpc.hasMetadata)
                 .frame(width: 128)
                 .focused(focusedField, equals: .rpc(rpc.id))
-                .onSubmit(updateRPC)
+                .onSubmit { updateRPC(argument) }
+                .rpcWriteHalo(writeFlash)
             #endif
         }
     }
@@ -9166,10 +9257,7 @@ private struct RpcRow: View, @MainActor Equatable {
                 enableValue
             },
             set: { isEnabled in
-                guard rpc.writable else { return }
-                committedArgument = enableArgumentText(isEnabled)
-                argument = committedArgument
-                bridge.callRpc(rpc, argumentText: committedArgument)
+                updateRPC(enableArgumentText(isEnabled))
             }
         )
     }
@@ -9238,23 +9326,20 @@ private struct RpcRow: View, @MainActor Equatable {
         }
     }
 
-    private func updateRPC() {
+    private func updateRPC(_ text: String) {
         guard rpc.writable, rpc.hasMetadata else { return }
-        committedArgument = argument
-        bridge.callRpc(rpc, argumentText: argument)
+        committedArgument = text
+        if argument != text {
+            argument = text
+        }
+        bridge.callRpc(rpc, argumentText: text) { outcome in
+            writeFlash = RPCWriteFlash(isFailure: outcome.isFailure)
+        }
     }
 
-    private func updateRPCIfChanged() {
-        guard rpc.writable,
-              rpc.hasMetadata,
-              argument != committedArgument else { return }
-        updateRPC()
-    }
-
-    private func commitSteppedValue(_ newText: String) {
-        guard rpc.writable, rpc.hasMetadata else { return }
-        committedArgument = newText
-        bridge.callRpc(rpc, argumentText: newText)
+    private func updateRPCIfChanged(_ text: String) {
+        guard text != committedArgument else { return }
+        updateRPC(text)
     }
 
 }
@@ -9288,6 +9373,10 @@ private struct UnifiedRpcRow: View {
     @AppStorage(ViewPreferenceKeys.rpcFloatPrecisionPPM) private var rpcFloatPrecisionPPM = NumericDisplayPolicy.defaultRPCFloatPrecisionPPM
     @State private var argument = ""
     @State private var committedArgument = ""
+    @State private var writeFlash: RPCWriteFlash?
+    /// Set when any sensor refuses the current write, so one refusal colors the
+    /// row's flash red even if other sensors answer after it.
+    @State private var didWriteFail = false
 
     private var primary: RpcInfo { rpcs[0] }
 
@@ -9327,7 +9416,7 @@ private struct UnifiedRpcRow: View {
         }
         .onChange(of: focusedField.wrappedValue) { oldValue, newValue in
             guard oldValue == .rpc(fieldID), newValue != .rpc(fieldID) else { return }
-            commitIfChanged()
+            commitIfChanged(argument)
         }
     }
 
@@ -9406,10 +9495,12 @@ private struct UnifiedRpcRow: View {
                 isEnabled: primary.writable && primary.hasMetadata,
                 fixedFractionDigits: primary.isIntegerRPC ? nil : 3,
                 onStep: { writeAll($0) },
-                onCommit: commit
+                onCommit: { commit($0) },
+                onCommitIfChanged: commitIfChanged
             )
             .frame(width: 128)
             .focused(focusedField, equals: .rpc(fieldID))
+            .rpcWriteHalo(writeFlash)
             #else
             TextField(valuesDiffer ? "mixed" : rpcDisplayType, text: $argument)
                 .textFieldStyle(.roundedBorder)
@@ -9417,7 +9508,8 @@ private struct UnifiedRpcRow: View {
                 .disabled(!primary.writable || !primary.hasMetadata)
                 .frame(width: 128)
                 .focused(focusedField, equals: .rpc(fieldID))
-                .onSubmit(commit)
+                .onSubmit { commit(argument) }
+                .rpcWriteHalo(writeFlash)
             #endif
         }
     }
@@ -9471,15 +9563,15 @@ private struct UnifiedRpcRow: View {
         }
     }
 
-    private func commit() {
-        let trimmed = argument.trimmingCharacters(in: .whitespacesAndNewlines)
+    private func commit(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        writeAll(argument)
+        writeAll(text)
     }
 
-    private func commitIfChanged() {
-        guard argument != committedArgument else { return }
-        commit()
+    private func commitIfChanged(_ text: String) {
+        guard text != committedArgument else { return }
+        commit(text)
     }
 
     private func writeAll(_ text: String) {
@@ -9487,8 +9579,12 @@ private struct UnifiedRpcRow: View {
         if argument != text {
             argument = text
         }
+        didWriteFail = false
         for rpc in rpcs where rpc.writable && rpc.hasMetadata {
-            bridge.callRpc(rpc, argumentText: text)
+            bridge.callRpc(rpc, argumentText: text) { outcome in
+                didWriteFail = didWriteFail || outcome.isFailure
+                writeFlash = RPCWriteFlash(isFailure: didWriteFail)
+            }
         }
     }
 
@@ -9514,7 +9610,11 @@ private struct SteppableRPCField: NSViewRepresentable {
     let isEnabled: Bool
     let fixedFractionDigits: Int?
     let onStep: (String) -> Void
-    let onCommit: () -> Void
+    /// Return: send the field's text whether or not it changed.
+    let onCommit: (String) -> Void
+    /// Focus loss, or a click on the way to something else: send only an actual
+    /// edit.
+    let onCommitIfChanged: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -9569,6 +9669,10 @@ private struct SteppableRPCField: NSViewRepresentable {
         }
     }
 
+    static func dismantleNSView(_ nsView: NSTextField, coordinator: Coordinator) {
+        RPCFieldEditFlusher.shared.end(field: nsView)
+    }
+
     @MainActor
     final class Coordinator: NSObject, NSTextFieldDelegate {
         var parent: SteppableRPCField
@@ -9586,9 +9690,17 @@ private struct SteppableRPCField: NSViewRepresentable {
             if parent.focus.wrappedValue != parent.focusTag {
                 parent.focus.wrappedValue = parent.focusTag
             }
+            guard let field = obj.object as? NSTextField else { return }
+            RPCFieldEditFlusher.shared.begin(field: field) { [weak self, weak field] in
+                guard let self, let field else { return }
+                commitIfChanged(field)
+            }
         }
 
         func controlTextDidEndEditing(_ obj: Notification) {
+            if let field = obj.object as? NSTextField {
+                RPCFieldEditFlusher.shared.end(field: field)
+            }
             // Clear focus only if the field genuinely lost it (the user clicked
             // away to something untracked, or the window blurred). Deferred so
             // a focus transition that resigned this field has time to land its
@@ -9602,6 +9714,18 @@ private struct SteppableRPCField: NSViewRepresentable {
             }
         }
 
+        /// Sends the field's live text if it differs from the value last sent.
+        /// Reads the AppKit field rather than the SwiftUI binding so a click
+        /// arriving in the same tick as the last keystroke still writes what the
+        /// user actually typed.
+        func commitIfChanged(_ field: NSTextField) {
+            let text = field.stringValue
+            if parent.text != text {
+                parent.text = text
+            }
+            parent.onCommitIfChanged(text)
+        }
+
         func control(
             _ control: NSControl,
             textView: NSTextView,
@@ -9613,7 +9737,11 @@ private struct SteppableRPCField: NSViewRepresentable {
             case #selector(NSResponder.moveDown(_:)):
                 return step(textView, direction: -1)
             case #selector(NSResponder.insertNewline(_:)):
-                parent.onCommit()
+                let text = textView.string
+                if parent.text != text {
+                    parent.text = text
+                }
+                parent.onCommit(text)
                 return true
             default:
                 return false
@@ -9639,6 +9767,55 @@ private struct SteppableRPCField: NSViewRepresentable {
             parent.onStep(stepped.text)
             return true
         }
+    }
+}
+
+/// Sends a settings field's pending edit before a click elsewhere is acted on.
+///
+/// Buttons never become first responder on macOS, so clicking one leaves the
+/// field editing and its value uncommitted until the focus change eventually
+/// lands — after the button's own RPC. A local mouse-down monitor runs before
+/// the event is dispatched, so committing there puts the field's write on the
+/// wire first. Only one field can be editing app-wide, hence the singleton.
+@MainActor
+private final class RPCFieldEditFlusher {
+    static let shared = RPCFieldEditFlusher()
+
+    private weak var field: NSTextField?
+    private var commit: (() -> Void)?
+    private var monitor: Any?
+
+    private init() {}
+
+    func begin(field: NSTextField, commit: @escaping () -> Void) {
+        self.field = field
+        self.commit = commit
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] event in
+            self?.flushIfClickIsElsewhere(event)
+            return event
+        }
+    }
+
+    func end(field: NSTextField) {
+        guard self.field === field else { return }
+        self.field = nil
+        commit = nil
+        if let monitor {
+            NSEvent.removeMonitor(monitor)
+        }
+        monitor = nil
+    }
+
+    private func flushIfClickIsElsewhere(_ event: NSEvent) {
+        guard let field, let commit else { return }
+        if event.window === field.window,
+           field.convert(field.bounds, to: nil).contains(event.locationInWindow) {
+            return   // Click inside the field just moves the caret.
+        }
+        commit()
     }
 }
 
