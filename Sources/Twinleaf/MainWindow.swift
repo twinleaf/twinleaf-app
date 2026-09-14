@@ -91,6 +91,7 @@ struct DocumentWindow: View {
     @State private var rpcSliders: [RPCSliderConfiguration] = []
     @State private var activeCaptureRPCID: String?
     @State private var captureAutoEnabled = false
+    @State private var capturePlotOptions = CapturePlotOptions()
     @State private var isDataLoggingEnabled = true
     @State private var clearDocumentEditedRequest = 0
     @State private var windowObjectID: ObjectIdentifier?
@@ -1184,6 +1185,7 @@ struct DocumentWindow: View {
                         bridge: bridge,
                         rpcID: captureRPC.id,
                         isAutoEnabled: $captureAutoEnabled,
+                        plotOptions: $capturePlotOptions,
                         alwaysShowsRail: shouldAlwaysShowPlotControls,
                         maximumHeight: .infinity,
                         onTrigger: triggerCapture,
@@ -1230,6 +1232,7 @@ struct DocumentWindow: View {
                                 bridge: bridge,
                                 rpcID: captureRPC.id,
                                 isAutoEnabled: $captureAutoEnabled,
+                                plotOptions: $capturePlotOptions,
                                 alwaysShowsRail: shouldAlwaysShowPlotControls,
                                 maximumHeight: .infinity,
                                 onTrigger: triggerCapture,
@@ -2063,7 +2066,8 @@ extension DocumentWindow {
     private func printPlotArea() {
         let panes = visiblePlotPanes.filter { !$0.columns.isEmpty }
         let capture = activeCaptureRPC.flatMap { rpc in
-            CapturePlotData(value: rpc.value, fallbackTitle: "\(rpc.route) \(rpc.name)")
+            CapturePlotData(value: rpc.value, fallbackTitle: "\(rpc.route) \(rpc.name)")?
+                .trace(for: capturePlotOptions)
         }
         guard !panes.isEmpty || capture != nil else {
             NSSound.beep()
@@ -2177,7 +2181,7 @@ private struct PlotPrintSnapshot {
     let showsKey: Bool
     let rightAxisReservationCount: Int
     let panes: [PlotPrintPaneSnapshot]
-    let capture: CapturePlotData?
+    let capture: CapturePlotTrace?
 }
 
 /// One printed page: a title line, then the graphs stacked the way the
@@ -2279,7 +2283,7 @@ private struct PlotPrintPage: View {
                 if !panes.isEmpty {
                     Divider()
                 }
-                CapturePlotView(data: capture)
+                CapturePlotView(trace: capture)
                     .frame(height: captureHeight)
             }
         }
@@ -2606,6 +2610,7 @@ private struct CapturePopoutWindowView: View {
     @ObservedObject var bridge: BridgeClient
     let rpcID: String
     @State private var isAutoEnabled = false
+    @State private var plotOptions = CapturePlotOptions()
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(ViewPreferenceKeys.theme) private var themeRaw = ThemePreference.system.rawValue
     private static let graphMargin: CGFloat = 36
@@ -2619,6 +2624,7 @@ private struct CapturePopoutWindowView: View {
                 bridge: bridge,
                 rpcID: rpcID,
                 isAutoEnabled: $isAutoEnabled,
+                plotOptions: $plotOptions,
                 alwaysShowsRail: false,
                 maximumHeight: .infinity,
                 onTrigger: { rpc in
@@ -3476,6 +3482,7 @@ private struct CaptureResultPane: View {
     @ObservedObject var bridge: BridgeClient
     let rpcID: String
     @Binding var isAutoEnabled: Bool
+    @Binding var plotOptions: CapturePlotOptions
     let alwaysShowsRail: Bool
     let maximumHeight: CGFloat
     let onTrigger: (RpcInfo) -> Void
@@ -3483,25 +3490,34 @@ private struct CaptureResultPane: View {
     let onClose: (() -> Void)?
 
     @Environment(\.colorScheme) private var colorScheme
+    @State private var dataCache = CapturePlotDataCache()
     @AppStorage(ViewPreferenceKeys.captureAutoDelaySeconds) private var captureAutoDelaySeconds = CaptureAutoDelay.defaultSeconds
 
     var body: some View {
         let plotData = capturePlotData
+        let trace = plotData?.trace(for: plotOptions)
 
         ZStack(alignment: .topTrailing) {
             TwinleafSurfaceColors.canvasBackgroundColor(for: colorScheme)
 
-            if let plotData {
-                CapturePlotView(data: plotData)
+            if let trace {
+                CapturePlotView(trace: trace)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .contentShape(Rectangle())
                     .contextMenu {
                         Button {
-                            bridge.copyDataText(plotData.dataText, rows: plotData.points.count)
+                            bridge.copyDataText(trace.dataText, rows: trace.points.count)
                         } label: {
                             Label("Copy View Data", systemImage: "doc.on.doc")
                         }
                     }
+            } else if plotData != nil {
+                ContentUnavailableView(
+                    "No Spectrum",
+                    systemImage: "waveform",
+                    description: Text("A spectrum needs at least \(CaptureSpectrum.minimumSampleCount) evenly spaced samples.")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ContentUnavailableView("No Capture", systemImage: "waveform.path.ecg")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -3532,6 +3548,41 @@ private struct CaptureResultPane: View {
 
     private var captureControlSection: some View {
         HStack(spacing: 6) {
+            let showsSpectrum = plotOptions.showsSpectrum
+
+            if showsSpectrum {
+                GraphControlToggleButton(
+                    title: "Log X",
+                    icon: .logX,
+                    isOn: plotOptions.spectrumLogX,
+                    action: {
+                        plotOptions.spectrumLogX.toggle()
+                    }
+                )
+            }
+
+            GraphControlToggleButton(
+                title: "Log Y",
+                icon: .logY,
+                isOn: showsSpectrum ? plotOptions.spectrumLogY : plotOptions.logY,
+                action: {
+                    if showsSpectrum {
+                        plotOptions.spectrumLogY.toggle()
+                    } else {
+                        plotOptions.logY.toggle()
+                    }
+                }
+            )
+
+            GraphControlToggleButton(
+                title: "FFT",
+                icon: .fft,
+                isOn: showsSpectrum,
+                action: {
+                    plotOptions.showsSpectrum.toggle()
+                }
+            )
+
             GraphControlActionButton(
                 title: "Trigger",
                 systemImage: "bolt.fill",
@@ -3598,7 +3649,10 @@ private struct CaptureResultPane: View {
     }
 
     private var capturePlotData: CapturePlotData? {
-        CapturePlotData(value: rpc?.value, fallbackTitle: captureTitle)
+        guard let rpc, rpc.value != nil else { return nil }
+        return dataCache.data(for: rpc.id, revision: bridge.rpcValueRevision(id: rpc.id)) {
+            CapturePlotData(value: rpc.value, fallbackTitle: captureTitle)
+        }
     }
 
     private func trigger() {
@@ -3648,11 +3702,50 @@ private struct CaptureAutoTaskKey: Hashable {
     var delaySeconds: Double
 }
 
-private struct CapturePlotData {
+/// How the capture pane draws its record: the capture itself or its power
+/// spectrum. Each mode keeps its own log-Y choice, like a plot pane's
+/// timeseries and FFT modes, so toggling the mode restores the axes it had.
+private struct CapturePlotOptions: Equatable {
+    var showsSpectrum = false
+    var logY = false
+    var spectrumLogX = true
+    var spectrumLogY = true
+}
+
+/// Keeps the decoded record across body evaluations, which stream in far
+/// more often than captures arrive; a new value decodes afresh.
+private final class CapturePlotDataCache {
+    private var rpcID: String?
+    private var revision: UInt64?
+    private var data: CapturePlotData?
+
+    func data(
+        for rpcID: String,
+        revision: UInt64,
+        decode: () -> CapturePlotData?
+    ) -> CapturePlotData? {
+        if self.rpcID != rpcID || self.revision != revision {
+            data = decode()
+            self.rpcID = rpcID
+            self.revision = revision
+        }
+        return data
+    }
+}
+
+/// One capture reply, decoded. A class so the spectrum, derived on first
+/// use, stays with the record for as long as the cache holds it.
+private final class CapturePlotData {
     let title: String
     let xTitle: String
     let yTitle: String
     let points: [PlotPoint]
+    private let name: String
+    private let units: String
+    private let xUnits: String
+    /// x between consecutive samples: the metadata stride, else the mean
+    /// spacing of the points.
+    private let sampleSpacing: Double?
 
     init?(value: JSONValue?, fallbackTitle: String) {
         guard case .object(let object)? = value else { return nil }
@@ -3669,25 +3762,73 @@ private struct CapturePlotData {
         xTitle = Self.axisTitle(name: xName, units: xUnits)
         yTitle = Self.axisTitle(name: name, units: units)
         self.points = points
+        self.name = name
+        self.units = units
+        self.xUnits = xUnits
+        sampleSpacing = Self.sampleSpacing(metadata: metadata, points: points)
     }
 
-    /// The capture in the tab-separated shape a plot pane's "Copy View Data"
-    /// produces — axis titles as the header, then one row per point. Formatted
-    /// here rather than in the bridge because the app already holds the points.
-    var dataText: String {
-        var text = "\(Self.escapeTSV(xTitle))\t\(Self.escapeTSV(yTitle))\n"
-        for point in points {
-            text += String(format: "%.17f\t%.17f\n", point.x, point.y)
+    /// What the pane draws for `options`: the record, or its spectrum. Nil
+    /// when a spectrum is asked of a record that cannot give one.
+    func trace(for options: CapturePlotOptions) -> CapturePlotTrace? {
+        guard options.showsSpectrum else {
+            return CapturePlotTrace(
+                title: title,
+                xTitle: xTitle,
+                yTitle: yTitle,
+                points: points,
+                logX: false,
+                logY: options.logY
+            )
         }
-        return text
+        guard let spectrum, !spectrum.isEmpty else { return nil }
+        return CapturePlotTrace(
+            title: title,
+            xTitle: spectrumXTitle,
+            yTitle: spectrumYTitle,
+            points: spectrum,
+            logX: options.spectrumLogX,
+            logY: options.spectrumLogY
+        )
     }
 
-    private static func escapeTSV(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\t", with: "\\t")
-            .replacingOccurrences(of: "\n", with: "\\n")
-            .replacingOccurrences(of: "\r", with: "\\r")
+    private lazy var spectrum: [PlotPoint]? = {
+        guard let sampleSpacing else { return nil }
+        let secondsPerUnit = CaptureSpectrum.secondsPerUnit(xUnits) ?? 1
+        return CaptureSpectrum.powerSpectralDensity(
+            of: points.map(\.y),
+            sampleRate: 1 / (sampleSpacing * secondsPerUnit)
+        )
+    }()
+
+    /// x in a time unit gives frequency in Hz; any other x unit gives cycles
+    /// per that unit, and the density's units follow.
+    private var isFrequencyInHertz: Bool {
+        CaptureSpectrum.secondsPerUnit(xUnits) != nil
+    }
+
+    private var spectrumXTitle: String {
+        "frequency (\(isFrequencyInHertz ? "Hz" : "1/\(xUnits)"))"
+    }
+
+    private var spectrumYTitle: String {
+        let squaredUnits = units.isEmpty ? "1" : "\(units)²"
+        return isFrequencyInHertz
+            ? "\(name) PSD (\(squaredUnits)/Hz)"
+            : "\(name) PSD (\(squaredUnits)·\(xUnits))"
+    }
+
+    private static func sampleSpacing(metadata: [String: JSONValue], points: [PlotPoint]) -> Double? {
+        if let stride = metadata["xStride"].flatMap(finiteDouble), stride > 0 {
+            return stride
+        }
+        guard points.count >= 2,
+              let first = points.first?.x,
+              let last = points.last?.x,
+              last > first else {
+            return nil
+        }
+        return (last - first) / Double(points.count - 1)
     }
 
     private static func points(from object: [String: JSONValue]) -> [PlotPoint] {
@@ -3742,8 +3883,37 @@ private struct CapturePlotData {
     }
 }
 
+/// What the capture pane draws: axis titles, points, and each axis's scale.
+private struct CapturePlotTrace {
+    let title: String
+    let xTitle: String
+    let yTitle: String
+    let points: [PlotPoint]
+    let logX: Bool
+    let logY: Bool
+
+    /// The trace in the tab-separated shape a plot pane's "Copy View Data"
+    /// produces — axis titles as the header, then one row per point. Formatted
+    /// here rather than in the bridge because the app already holds the points.
+    var dataText: String {
+        var text = "\(Self.escapeTSV(xTitle))\t\(Self.escapeTSV(yTitle))\n"
+        for point in points {
+            text += String(format: "%.17g\t%.17g\n", point.x, point.y)
+        }
+        return text
+    }
+
+    private static func escapeTSV(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\t", with: "\\t")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+    }
+}
+
 private struct CapturePlotView: View {
-    let data: CapturePlotData
+    let trace: CapturePlotTrace
 
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(ViewPreferenceKeys.traceColorPaletteLight) private var traceColorPaletteLightRaw = PlotTracePalette.defaultLightRawValue
@@ -3754,7 +3924,7 @@ private struct CapturePlotView: View {
             draw(context: &context, size: size)
         }
         .frame(maxWidth: .infinity)
-        .accessibilityLabel(data.title)
+        .accessibilityLabel(trace.title)
     }
 
     private var traceColor: Color {
@@ -3770,41 +3940,82 @@ private struct CapturePlotView: View {
         )[0]
     }
 
+    /// One axis of the drawing. A log axis with no positive value to show
+    /// falls back to linear, so the trace still draws.
+    private struct Axis {
+        let range: ClosedRange<Double>
+        let isLog: Bool
+
+        func fraction(_ value: Double) -> Double {
+            min(max(plotAxisFraction(value, in: range, useLog: isLog), 0), 1)
+        }
+
+        func shows(_ value: Double) -> Bool {
+            value.isFinite && (!isLog || value > 0)
+        }
+    }
+
     private func draw(context: inout GraphicsContext, size: CGSize) {
         guard size.width > 120, size.height > 120 else { return }
 
+        let plotHeight = max(40, size.height - 58)
+        let yAxis = Self.axis(for: trace.points.map(\.y), log: trace.logY, padFraction: 0.08)
+        let yTicks = Self.majorTicks(for: yAxis, targetCount: Self.tickTarget(for: plotHeight))
+        // The y tick labels sit between the plot and the rotated axis title,
+        // so the right inset grows with the widest of them.
+        let yLabelWidth = yTicks
+            .map { context.resolve(Self.tickLabel($0, on: yAxis)).measure(in: CGSize(width: 200, height: 40)).width }
+            .max() ?? 0
+        let rightInset = max(72, ceil(yLabelWidth) + 32)
         let plotRect = CGRect(
             x: 10,
             y: 16,
-            width: max(40, size.width - 82),
-            height: max(40, size.height - 58)
+            width: max(40, size.width - 10 - rightInset),
+            height: plotHeight
         )
-        let xRange = Self.paddedRange(data.points.map(\.x), fraction: 0.02)
-        let yRange = Self.paddedRange(data.points.map(\.y), fraction: 0.08)
-        let xTicks = Self.majorTicks(in: xRange, targetCount: Self.tickTarget(for: plotRect.width))
-        let yTicks = Self.majorTicks(in: yRange, targetCount: Self.tickTarget(for: plotRect.height))
+        let xAxis = Self.axis(for: trace.points.map(\.x), log: trace.logX, padFraction: 0.02)
+        let xTicks = Self.majorTicks(for: xAxis, targetCount: Self.tickTarget(for: plotRect.width))
 
-        drawGrid(context: &context, rect: plotRect, xRange: xRange, yRange: yRange, xTicks: xTicks, yTicks: yTicks)
-        drawTrace(context: &context, rect: plotRect, xRange: xRange, yRange: yRange)
-        drawAxisLabels(context: &context, size: size, rect: plotRect, xRange: xRange, yRange: yRange, xTicks: xTicks, yTicks: yTicks)
+        drawGrid(context: &context, rect: plotRect, xAxis: xAxis, yAxis: yAxis, xTicks: xTicks, yTicks: yTicks)
+        drawTrace(context: &context, rect: plotRect, xAxis: xAxis, yAxis: yAxis)
+        drawAxisLabels(context: &context, size: size, rect: plotRect, xAxis: xAxis, yAxis: yAxis, xTicks: xTicks, yTicks: yTicks)
     }
 
     private func drawGrid(
         context: inout GraphicsContext,
         rect: CGRect,
-        xRange: ClosedRange<Double>,
-        yRange: ClosedRange<Double>,
+        xAxis: Axis,
+        yAxis: Axis,
         xTicks: [Double],
         yTicks: [Double]
     ) {
+        // Decades alone leave a log axis sparse, so it also gets the 2×–9×
+        // lines, faintly.
+        var minorGrid = Path()
+        if xAxis.isLog {
+            for tick in plotMinorTicks(in: xAxis.range, majorTicks: xTicks, useLog: true) {
+                let x = rect.minX + rect.width * CGFloat(xAxis.fraction(tick))
+                minorGrid.move(to: CGPoint(x: x, y: rect.minY))
+                minorGrid.addLine(to: CGPoint(x: x, y: rect.maxY))
+            }
+        }
+        if yAxis.isLog {
+            for tick in plotMinorTicks(in: yAxis.range, majorTicks: yTicks, useLog: true) {
+                let y = rect.maxY - rect.height * CGFloat(yAxis.fraction(tick))
+                minorGrid.move(to: CGPoint(x: rect.minX, y: y))
+                minorGrid.addLine(to: CGPoint(x: rect.maxX, y: y))
+            }
+        }
+        context.stroke(minorGrid, with: .color(.secondary.opacity(0.08)), lineWidth: 1)
+
         var grid = Path()
         for tick in xTicks {
-            let x = rect.minX + rect.width * CGFloat(Self.fraction(tick, in: xRange))
+            let x = rect.minX + rect.width * CGFloat(xAxis.fraction(tick))
             grid.move(to: CGPoint(x: x, y: rect.minY))
             grid.addLine(to: CGPoint(x: x, y: rect.maxY))
         }
         for tick in yTicks {
-            let y = rect.maxY - rect.height * CGFloat(Self.fraction(tick, in: yRange))
+            let y = rect.maxY - rect.height * CGFloat(yAxis.fraction(tick))
             grid.move(to: CGPoint(x: rect.minX, y: y))
             grid.addLine(to: CGPoint(x: rect.maxX, y: y))
         }
@@ -3818,14 +4029,15 @@ private struct CapturePlotView: View {
     private func drawTrace(
         context: inout GraphicsContext,
         rect: CGRect,
-        xRange: ClosedRange<Double>,
-        yRange: ClosedRange<Double>
+        xAxis: Axis,
+        yAxis: Axis
     ) {
         var path = Path()
         var didStart = false
-        for point in data.points {
-            let x = rect.minX + rect.width * CGFloat(Self.fraction(point.x, in: xRange))
-            let y = rect.maxY - rect.height * CGFloat(Self.fraction(point.y, in: yRange))
+        for point in trace.points {
+            guard xAxis.shows(point.x), yAxis.shows(point.y) else { continue }
+            let x = rect.minX + rect.width * CGFloat(xAxis.fraction(point.x))
+            let y = rect.maxY - rect.height * CGFloat(yAxis.fraction(point.y))
             let screenPoint = CGPoint(x: x, y: y)
             if didStart {
                 path.addLine(to: screenPoint)
@@ -3841,16 +4053,14 @@ private struct CapturePlotView: View {
         context: inout GraphicsContext,
         size: CGSize,
         rect: CGRect,
-        xRange: ClosedRange<Double>,
-        yRange: ClosedRange<Double>,
+        xAxis: Axis,
+        yAxis: Axis,
         xTicks: [Double],
         yTicks: [Double]
     ) {
         for tick in xTicks {
-            let x = rect.minX + rect.width * CGFloat(Self.fraction(tick, in: xRange))
-            let label = Text(Self.formatTick(tick))
-                .font(.body.monospacedDigit())
-                .foregroundStyle(.secondary)
+            let x = rect.minX + rect.width * CGFloat(xAxis.fraction(tick))
+            let label = Self.tickLabel(tick, on: xAxis)
             let clampedX = min(max(x, rect.minX + 3), rect.maxX - 3)
             let anchor: UnitPoint = if x <= rect.minX + 3 {
                 .leading
@@ -3863,14 +4073,11 @@ private struct CapturePlotView: View {
         }
 
         for tick in yTicks {
-            let y = rect.maxY - rect.height * CGFloat(Self.fraction(tick, in: yRange))
-            let label = Text(Self.formatTick(tick))
-                .font(.body.monospacedDigit())
-                .foregroundStyle(.secondary)
-            context.draw(label, at: CGPoint(x: rect.maxX + 7, y: y), anchor: .leading)
+            let y = rect.maxY - rect.height * CGFloat(yAxis.fraction(tick))
+            context.draw(Self.tickLabel(tick, on: yAxis), at: CGPoint(x: rect.maxX + 7, y: y), anchor: .leading)
         }
 
-        let xTitle = Text(data.xTitle)
+        let xTitle = Text(trace.xTitle)
             .font(.body)
             .foregroundStyle(.secondary)
         context.draw(xTitle, at: CGPoint(x: rect.midX, y: size.height - 10), anchor: .bottom)
@@ -3878,10 +4085,20 @@ private struct CapturePlotView: View {
         var labelContext = context
         labelContext.translateBy(x: min(rect.maxX + 68, size.width - 12), y: rect.midY)
         labelContext.rotate(by: .degrees(90))
-        let yTitle = Text(data.yTitle)
+        let yTitle = Text(trace.yTitle)
             .font(.body)
             .foregroundStyle(.secondary)
         labelContext.draw(yTitle, at: .zero, anchor: .center)
+    }
+
+    private static func axis(for values: [Double], log: Bool, padFraction: Double) -> Axis {
+        if log {
+            let positive = values.filter { $0.isFinite && $0 > 0 }
+            if let lower = positive.min(), let upper = positive.max() {
+                return Axis(range: paddedLogRange(lower: lower, upper: upper, fraction: padFraction), isLog: true)
+            }
+        }
+        return Axis(range: paddedRange(values, fraction: padFraction), isLog: false)
     }
 
     private static func paddedRange(_ values: [Double], fraction: Double) -> ClosedRange<Double> {
@@ -3901,14 +4118,33 @@ private struct CapturePlotView: View {
         return lower...upper
     }
 
-    private static func fraction(_ value: Double, in range: ClosedRange<Double>) -> Double {
-        let span = range.upperBound - range.lowerBound
-        guard span > 0, span.isFinite else { return 0.5 }
-        return min(max((value - range.lowerBound) / span, 0), 1)
+    private static func paddedLogRange(lower: Double, upper: Double, fraction: Double) -> ClosedRange<Double> {
+        var lowerExponent = log10(lower)
+        var upperExponent = log10(upper)
+        if lowerExponent == upperExponent {
+            lowerExponent -= 0.5
+            upperExponent += 0.5
+        } else {
+            let padding = max((upperExponent - lowerExponent) * fraction, 0.02)
+            lowerExponent -= padding
+            upperExponent += padding
+        }
+        return pow(10, lowerExponent)...pow(10, upperExponent)
     }
 
     private static func tickTarget(for length: CGFloat) -> Int {
         min(max(Int(length / 95), 2), 6)
+    }
+
+    private static func majorTicks(for axis: Axis, targetCount: Int) -> [Double] {
+        guard axis.isLog else {
+            return majorTicks(in: axis.range, targetCount: targetCount)
+        }
+        return plotLogTicks(
+            from: axis.range.lowerBound,
+            to: axis.range.upperBound,
+            maxCount: targetCount + 2
+        )
     }
 
     private static func majorTicks(in range: ClosedRange<Double>, targetCount: Int) -> [Double] {
@@ -3946,7 +4182,14 @@ private struct CapturePlotView: View {
         return niceFraction * base
     }
 
+    private static func tickLabel(_ tick: Double, on axis: Axis) -> Text {
+        Text(axis.isLog ? formatLogTick(tick) : formatTick(tick))
+            .font(.body.monospacedDigit())
+            .foregroundStyle(.secondary)
+    }
+
     private static func formatTick(_ value: Double) -> String {
+        let value = value == 0 ? 0 : value
         let magnitude = abs(value)
         if magnitude > 0, magnitude < 0.001 || magnitude >= 10_000 {
             return String(format: "%.2e", value)
@@ -3955,6 +4198,22 @@ private struct CapturePlotView: View {
             return String(format: "%.3g", value)
         }
         return String(format: "%.4g", value)
+    }
+
+    /// Log ticks are 1×, 2×, 3× or 5× a decade, so outside the plain range a
+    /// one-digit mantissa and the exponent say it all.
+    private static func formatLogTick(_ value: Double) -> String {
+        let magnitude = abs(value)
+        if magnitude >= 0.001, magnitude < 10_000 {
+            return formatTick(value)
+        }
+        var exponent = Int(floor(log10(magnitude)))
+        var mantissa = (magnitude / pow(10, Double(exponent))).rounded()
+        if mantissa >= 10 {
+            mantissa = 1
+            exponent += 1
+        }
+        return "\(Int(mantissa))e\(exponent)"
     }
 }
 

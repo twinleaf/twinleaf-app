@@ -53,12 +53,12 @@ fileprivate struct PlotSidebarMaterialBackground: View {
 // trace layer can render without reaching back into the host view.
 
 @inline(__always)
-fileprivate func plotAxisValue(_ value: Double, useLog: Bool) -> Double {
+func plotAxisValue(_ value: Double, useLog: Bool) -> Double {
     useLog ? log10(max(value, .leastNonzeroMagnitude)) : value
 }
 
 @inline(__always)
-fileprivate func plotAxisFraction(_ value: Double, in range: ClosedRange<Double>, useLog: Bool) -> Double {
+func plotAxisFraction(_ value: Double, in range: ClosedRange<Double>, useLog: Bool) -> Double {
     let lower = plotAxisValue(range.lowerBound, useLog: useLog)
     let upper = plotAxisValue(range.upperBound, useLog: useLog)
     let v = plotAxisValue(value, useLog: useLog)
@@ -104,7 +104,7 @@ fileprivate func plotNiceTicks(from minValue: Double, to maxValue: Double, targe
     return ticks
 }
 
-fileprivate func plotLogTicks(from minValue: Double, to maxValue: Double, maxCount: Int = 12) -> [Double] {
+func plotLogTicks(from minValue: Double, to maxValue: Double, maxCount: Int = 12) -> [Double] {
     guard minValue.isFinite, maxValue.isFinite, minValue > 0, minValue < maxValue else {
         return []
     }
@@ -143,7 +143,7 @@ fileprivate func plotLogTicks(from minValue: Double, to maxValue: Double, maxCou
     return ticks
 }
 
-fileprivate func plotMinorTicks(in range: ClosedRange<Double>, majorTicks: [Double], useLog: Bool) -> [Double] {
+func plotMinorTicks(in range: ClosedRange<Double>, majorTicks: [Double], useLog: Bool) -> [Double] {
     if useLog {
         return plotLogMinorTicks(from: range.lowerBound, to: range.upperBound, majorTicks: majorTicks)
     }

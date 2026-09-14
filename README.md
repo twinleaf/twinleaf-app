@@ -22,6 +22,7 @@ This keeps the app native while keeping the hardware boundary in Rust, without a
 - Plotting supports one or more columns.
 - Timeseries display uses the same FPCS-style min/max decimation strategy as Trendline.
 - FFT display uses Welch spectral density through the Rust `welch-sde` crate on a Rust worker thread. The live spectrum is reduced to about one point per pixel using buckets with fixed frequency edges, so plotted frequencies never depend on the data; Plot Settings can turn this off to plot every bin.
+- A capture RPC (`*.capture`) plots its record below the graphs. The pane's FFT toggle shows the record's power spectral density instead, in units²/Hz on log or linear axes: a Hann-windowed periodogram of the whole record, scaled like the live FFT so its square root is that display's ASD.
 - Live logging writes Twinleaf packets to a temporary `.tio` backing file. Save or Save As snapshots that backing file into the document path, so an Untitled document can begin logging immediately and keep logging through the save transition.
 - Opening an existing `.tio` file starts in inspection mode: Rust parses the saved packets, stream ID 1 is selected by default, plotting is paused-only, and the toolbar scrubber moves the displayed time window through the log.
 - File > Export writes the raw `.tio` log to CSV or HDF5 through Rust. CSV is available in the default Rust build; HDF5 is available when the Rust core is built with `--features hdf5`.
