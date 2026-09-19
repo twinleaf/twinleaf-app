@@ -21,7 +21,7 @@ fileprivate enum PlotAxisLayout {
     static let xAxisTitleWithOffsetYOffset: CGFloat = 41
 }
 
-fileprivate struct PlotSidebarMaterialBackground: View {
+struct PlotSidebarMaterialBackground: View {
     let cornerRadius: CGFloat
     @Environment(\.colorScheme) private var colorScheme
 
@@ -66,7 +66,7 @@ func plotAxisFraction(_ value: Double, in range: ClosedRange<Double>, useLog: Bo
 }
 
 @inline(__always)
-fileprivate func plotAxisCoordinate(fraction: Double, in range: ClosedRange<Double>, useLog: Bool) -> Double {
+func plotAxisCoordinate(fraction: Double, in range: ClosedRange<Double>, useLog: Bool) -> Double {
     let lower = plotAxisValue(range.lowerBound, useLog: useLog)
     let upper = plotAxisValue(range.upperBound, useLog: useLog)
     let value = lower + min(max(fraction, 0), 1) * (upper - lower)
@@ -282,6 +282,7 @@ struct PlotCanvas: View {
     @AppStorage(ViewPreferenceKeys.yAxisHysteresis) private var yAxisHysteresis = PlotAxisHysteresis.defaultFraction
     @AppStorage(ViewPreferenceKeys.fftAxisHysteresis) private var fftAxisHysteresis = PlotAxisHysteresis.defaultFraction
     @State private var cursorLocation: CGPoint?
+    @ObservedObject private var cursorModifiers = PlotCursorModifiers.shared
     @State private var isPlotDropTargeted = false
     @State private var snappedAxisRangeMemory = SnappedAxisRangeMemory()
     @State private var timeseriesAxisRangeMemory = LinearAxisRangeMemory()
@@ -320,7 +321,12 @@ struct PlotCanvas: View {
                 let rect = plotRect(size: geometry.size)
                 let plotWidth = rect.width
                 let activeCursorSelection = cursorLocation.flatMap {
-                    self.cursorSelection(size: geometry.size, location: $0, plan: plan)
+                    self.cursorSelection(
+                        size: geometry.size,
+                        location: $0,
+                        plan: plan,
+                        snapsToData: !cursorModifiers.freesCursor
+                    )
                 }
                 let activeCursorSignature = cursorSelectionSignature(activeCursorSelection)
 
@@ -333,8 +339,15 @@ struct PlotCanvas: View {
                     // on hover, but it only renders a few line+circle paths
                     // — it never iterates the trace points.
                     if let activeCursorSelection {
-                        PlotCursorOverlay(selection: activeCursorSelection, plotRect: rect)
-                            .allowsHitTesting(false)
+                        PlotCursorOverlay(
+                            screenX: activeCursorSelection.screenX,
+                            freeScreenY: activeCursorSelection.freeScreenY,
+                            marks: activeCursorSelection.values.map {
+                                PlotCursorMark(color: $0.color, screenPoint: $0.screenPoint)
+                            },
+                            plotRect: rect
+                        )
+                        .allowsHitTesting(false)
                     }
                 }
                 .contentShape(Rectangle())
@@ -374,6 +387,7 @@ struct PlotCanvas: View {
                 .onContinuousHover { phase in
                     switch phase {
                     case .active(let location):
+                        cursorModifiers.refresh()
                         cursorLocation = location
                     case .ended:
                         cursorLocation = nil
@@ -678,7 +692,7 @@ struct PlotCanvas: View {
         let showsNoiseFloors = selection == nil && mode == .fft
         let showsValues = selection != nil || (showsNoiseFloors && series.contains { $0.noiseFloor != nil })
 
-        return VStack(alignment: .leading, spacing: 6) {
+        return PlotLegendBox(rendersForPrint: rendersForPrint) {
             legendRows(
                 valuesByID: valuesByID,
                 showsNoiseFloors: showsNoiseFloors,
@@ -686,35 +700,12 @@ struct PlotCanvas: View {
             )
 
             if let selection {
-                HStack(spacing: 6) {
-                    CursorTimeIndicatorIcon()
-                        .frame(width: 18, height: 18)
-                    Text(selection.xText)
-                        .font(.body.monospacedDigit().weight(.semibold))
-                        .lineLimit(1)
-                }
-                .foregroundStyle(.secondary)
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel("Cursor time \(selection.xText)")
+                PlotLegendCursorRow(
+                    xText: selection.xText,
+                    accessibilityLabel: "Cursor time \(selection.xText)"
+                )
             }
         }
-        .padding(8)
-        .background {
-            if rendersForPrint {
-                // Glass needs something behind it to blur; on paper it would
-                // print as nothing and leave the labels sitting on the traces.
-                RoundedRectangle(cornerRadius: Self.legendCornerRadius, style: .continuous)
-                    .fill(Color.white.opacity(0.92))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: Self.legendCornerRadius, style: .continuous)
-                            .strokeBorder(Color.secondary.opacity(0.35), lineWidth: 1)
-                    }
-            } else {
-                PlotSidebarMaterialBackground(cornerRadius: Self.legendCornerRadius)
-                    .allowsHitTesting(false)
-            }
-        }
-        .clipShape(RoundedRectangle(cornerRadius: Self.legendCornerRadius, style: .continuous))
         .overlay {
             if isPlotDropTargeted {
                 RoundedRectangle(cornerRadius: Self.legendCornerRadius, style: .continuous)
@@ -726,7 +717,7 @@ struct PlotCanvas: View {
 
     private static let legendSafeAreaMargin: CGFloat = 8
     private static let legendTopSafeAreaMargin: CGFloat = 3
-    private static let legendCornerRadius: CGFloat = 6
+    private static let legendCornerRadius = PlotLegendBox<EmptyView>.cornerRadius
     private static let legendMinimumContentWidth: CGFloat = 120
 
     private func noiseFloorText(_ value: Double, units: String) -> String {
@@ -923,7 +914,15 @@ struct PlotCanvas: View {
         )
     }
 
-    private func cursorSelection(size: CGSize, location: CGPoint, plan: PlotDataPlan?) -> CursorSelection? {
+    /// What the cursor reads at `location`. Snapped, each series reports its
+    /// sample nearest the pointer's x; free (Option held), each reports the
+    /// value its own y axis has at the pointer, wherever the data is.
+    private func cursorSelection(
+        size: CGSize,
+        location: CGPoint,
+        plan: PlotDataPlan?,
+        snapsToData: Bool
+    ) -> CursorSelection? {
         let profileStart = PlotProfiler.start()
         var checkedPoints = 0
         defer {
@@ -956,9 +955,24 @@ struct PlotCanvas: View {
                 ? seriesYRanges[item.id] ?? sharedYRange
                 : sharedYRange
 
+            guard snapsToData else {
+                let yFraction = Double((rect.maxY - location.y) / max(rect.height, 1))
+                let cursorY = plotAxisCoordinate(fraction: yFraction, in: yRange, useLog: useLogY)
+                values.append(
+                    CursorValue(
+                        id: item.id,
+                        label: item.label,
+                        color: colors[index % colors.count],
+                        screenPoint: CGPoint(x: screenX, y: location.y),
+                        yText: formatCursorY(cursorY, units: item.units)
+                    )
+                )
+                continue
+            }
+
             var nearestPoint: PlotPoint?
             var nearestDistance = Double.infinity
-            for pointIndex in cursorCandidateRange(in: item.points, near: cursorX) {
+            for pointIndex in plotCursorCandidateRange(in: item.points, near: cursorX) {
                 checkedPoints += 1
                 let point = item.points[pointIndex]
                 if !point.x.isFinite || !point.y.isFinite { continue }
@@ -995,6 +1009,7 @@ struct PlotCanvas: View {
         guard !values.isEmpty else { return nil }
         return CursorSelection(
             screenX: screenX,
+            freeScreenY: snapsToData ? nil : location.y,
             xText: formatCursorX(relativeX),
             values: values
         )
@@ -1158,29 +1173,6 @@ struct PlotCanvas: View {
         )
     }
 
-    private func cursorCandidateRange(in points: [PlotPoint], near x: Double) -> Range<Int> {
-        let radius = 12
-        guard points.count > radius * 2 + 1,
-              let first = points.first,
-              let last = points.last,
-              first.x <= last.x else {
-            return points.startIndex..<points.endIndex
-        }
-
-        var low = points.startIndex
-        var high = points.endIndex
-        while low < high {
-            let mid = low + (high - low) / 2
-            if points[mid].x < x {
-                low = mid + 1
-            } else {
-                high = mid
-            }
-        }
-
-        return max(points.startIndex, low - radius)..<min(points.endIndex, low + radius + 1)
-    }
-
     private func resolvedYRange(
         minY: Double,
         maxY: Double,
@@ -1240,25 +1232,9 @@ struct PlotCanvas: View {
     }
 
     private func formatCursorY(_ value: Double, units: String) -> String {
-        let formatted: String
-        let absValue = abs(value)
-        if NumericDisplayPolicy.usesScientificNotation(value) {
-            formatted = String(format: "%.4e", value)
-        } else if absValue > 0 && absValue < 0.001 {
-            formatted = NumericDisplayPolicy.fixed(
-                value,
-                fractionDigits: NumericDisplayPolicy.scientificDecimalDistance
-            )
-        } else {
-            formatted = NumericDisplayPolicy.significant(value, maximumDigits: 6)
-        }
-
-        guard !units.isEmpty else { return formatted }
-        return "\(formatted) \(units)"
+        plotFormatCursorValue(value, units: units)
     }
 }
-
-// MARK: - PlotAxesLayer
 
 private struct PlotAxesLayer: View, Equatable {
     let canvasSize: CGSize
@@ -1602,13 +1578,66 @@ private struct PlotTraceLayer: View, Equatable {
     }
 }
 
+/// The points worth checking for the one nearest `x`: a window around where a
+/// binary search lands when the points run in x order, else all of them.
+func plotCursorCandidateRange(in points: [PlotPoint], near x: Double) -> Range<Int> {
+    let radius = 12
+    guard points.count > radius * 2 + 1,
+          let first = points.first,
+          let last = points.last,
+          first.x <= last.x else {
+        return points.startIndex..<points.endIndex
+    }
+
+    var low = points.startIndex
+    var high = points.endIndex
+    while low < high {
+        let mid = low + (high - low) / 2
+        if points[mid].x < x {
+            low = mid + 1
+        } else {
+            high = mid
+        }
+    }
+
+    return max(points.startIndex, low - radius)..<min(points.endIndex, low + radius + 1)
+}
+
+/// A cursor read-out: enough digits to tell neighbouring samples apart.
+func plotFormatCursorValue(_ value: Double, units: String) -> String {
+    let formatted: String
+    let absValue = abs(value)
+    if NumericDisplayPolicy.usesScientificNotation(value) {
+        formatted = String(format: "%.4e", value)
+    } else if absValue > 0 && absValue < 0.001 {
+        formatted = NumericDisplayPolicy.fixed(
+            value,
+            fractionDigits: NumericDisplayPolicy.scientificDecimalDistance
+        )
+    } else {
+        formatted = NumericDisplayPolicy.significant(value, maximumDigits: 6)
+    }
+
+    guard !units.isEmpty else { return formatted }
+    return "\(formatted) \(units)"
+}
+
 // MARK: - PlotCursorOverlay
 //
-// Lightweight cursor renderer. Re-renders on every hover tick (since
-// `selection` changes), but does only a handful of line + ellipse strokes
-// — never iterates the trace point arrays.
-private struct PlotCursorOverlay: View {
-    let selection: CursorSelection
+// Lightweight cursor renderer. Re-renders on every hover tick (since the
+// marks change), but does only a handful of line + ellipse strokes — never
+// iterates the trace point arrays. Shared by the stream and capture plots.
+struct PlotCursorMark {
+    let color: Color
+    let screenPoint: CGPoint
+}
+
+struct PlotCursorOverlay: View {
+    let screenX: CGFloat
+    /// The pointer's y when the cursor is free of the data (Option held):
+    /// one neutral rule there replaces the per-trace rules and markers.
+    let freeScreenY: CGFloat?
+    let marks: [PlotCursorMark]
     let plotRect: CGRect
 
     var body: some View {
@@ -1619,15 +1648,27 @@ private struct PlotCursorOverlay: View {
 
     private func drawCursor(context: inout GraphicsContext) {
         var vertical = Path()
-        vertical.move(to: CGPoint(x: selection.screenX, y: plotRect.minY))
-        vertical.addLine(to: CGPoint(x: selection.screenX, y: plotRect.maxY))
+        vertical.move(to: CGPoint(x: screenX, y: plotRect.minY))
+        vertical.addLine(to: CGPoint(x: screenX, y: plotRect.maxY))
         context.stroke(
             vertical,
             with: .color(.secondary.opacity(0.72)),
             style: StrokeStyle(lineWidth: 1, dash: [5, 5])
         )
 
-        for value in selection.values {
+        if let freeScreenY {
+            var horizontal = Path()
+            horizontal.move(to: CGPoint(x: plotRect.minX, y: freeScreenY))
+            horizontal.addLine(to: CGPoint(x: plotRect.maxX, y: freeScreenY))
+            context.stroke(
+                horizontal,
+                with: .color(.secondary.opacity(0.72)),
+                style: StrokeStyle(lineWidth: 1, dash: [5, 5])
+            )
+            return
+        }
+
+        for value in marks {
             var horizontal = Path()
             horizontal.move(to: CGPoint(x: plotRect.minX, y: value.screenPoint.y))
             horizontal.addLine(to: CGPoint(x: plotRect.maxX, y: value.screenPoint.y))
@@ -2238,8 +2279,98 @@ private final class PlotInteractionEventView: NSView {
 
 struct CursorSelection {
     let screenX: CGFloat
+    /// The pointer's y when Option frees the cursor from the data; nil when
+    /// each value sits on its nearest sample.
+    var freeScreenY: CGFloat? = nil
     let xText: String
     let values: [CursorValue]
+}
+
+/// Whether the plot cursor is free of the data. It normally snaps to the
+/// sample nearest the pointer; holding Option frees it, so it reads the axes
+/// at the pointer itself — for a level between samples or off the trace.
+@MainActor
+final class PlotCursorModifiers: ObservableObject {
+    static let shared = PlotCursorModifiers()
+
+    @Published private(set) var freesCursor = false
+
+    private init() {
+#if os(macOS)
+        // Catches the key going down or up while the pointer rests on a plot.
+        NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+            self?.update(event.modifierFlags)
+            return event
+        }
+#endif
+    }
+
+    /// Re-reads the keyboard. A plot calls this as the pointer moves, which
+    /// covers a key that changed while another app had the keyboard.
+    func refresh() {
+#if os(macOS)
+        update(NSEvent.modifierFlags)
+#endif
+    }
+
+#if os(macOS)
+    private func update(_ flags: NSEvent.ModifierFlags) {
+        let freesCursor = flags.contains(.option)
+        if self.freesCursor != freesCursor {
+            self.freesCursor = freesCursor
+        }
+    }
+#endif
+}
+
+/// The legend's frame: glass over the plot, or opaque white on paper.
+struct PlotLegendBox<Content: View>: View {
+    let rendersForPrint: Bool
+    @ViewBuilder var content: () -> Content
+
+    static var cornerRadius: CGFloat { 6 }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            content()
+        }
+        .padding(8)
+        .background {
+            if rendersForPrint {
+                // Glass needs something behind it to blur; on paper it would
+                // print as nothing and leave the labels sitting on the traces.
+                RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
+                    .fill(Color.white.opacity(0.92))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
+                            .strokeBorder(Color.secondary.opacity(0.35), lineWidth: 1)
+                    }
+            } else {
+                PlotSidebarMaterialBackground(cornerRadius: Self.cornerRadius)
+                    .allowsHitTesting(false)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
+    }
+}
+
+/// The legend's last row while the cursor is on the plot: where it is in x.
+struct PlotLegendCursorRow: View {
+    let xText: String
+    let accessibilityLabel: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            CursorTimeIndicatorIcon()
+                .frame(width: 18, height: 18)
+            Text(xText)
+                .font(.body.monospacedDigit().weight(.semibold))
+                .lineLimit(1)
+        }
+        .foregroundStyle(.secondary)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+    }
 }
 
 struct CursorValue: Identifiable {
@@ -2323,7 +2454,7 @@ private extension Color {
     }
 }
 
-private struct CursorTimeIndicatorIcon: View {
+struct CursorTimeIndicatorIcon: View {
     var body: some View {
         Canvas { context, size in
             let center = CGPoint(x: size.width * 0.5, y: size.height * 0.5)

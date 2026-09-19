@@ -2720,13 +2720,26 @@ fn main() {
                 name,
                 arg,
             } => {
-                if let Some(tx) = &session_tx {
-                    let _ = tx.send(SessionCommand::CallRpc {
+                let answer_id = request_id.clone();
+                let sent = session_tx.as_ref().is_some_and(|tx| {
+                    tx.send(SessionCommand::CallRpc {
                         request_id,
                         route,
                         name,
                         arg,
-                    });
+                    })
+                    .is_ok()
+                });
+                // Like a raw RPC, every call is answered: a caller pacing
+                // itself on the reply (a capture on Auto) must not wait on one
+                // that was never sent.
+                if !sent {
+                    emitter.emit(&json!({
+                        "type": "rpcResult",
+                        "requestId": answer_id,
+                        "ok": false,
+                        "error": "Not connected to a device"
+                    }));
                 }
             }
             ClientCommand::CallRawRpc {

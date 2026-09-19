@@ -216,6 +216,8 @@ final class BridgeClient: ObservableObject {
     private var nextPlotRevision: UInt64 = 1
     private var latestWriteRequestIDByRPCID: [String: String] = [:]
     private var writeRPCIDByRequestID: [String: String] = [:]
+    /// Requests handed to the runtime whose `rpcResult` has not come back.
+    private var pendingRPCRequestIDs: Set<String> = []
     private var lastRPCReadbackAtByRPCID: [String: Date] = [:]
     private var pendingRPCReadbackWorkItems: [String: DispatchWorkItem] = [:]
     private var pendingRPCReadbackGenerations: [String: UInt64] = [:]
@@ -348,6 +350,7 @@ final class BridgeClient: ObservableObject {
         connectionRPCReadbackRequestIDs.removeAll()
         failPendingRawRpcs()
         failPendingWriteOutcomes()
+        pendingRPCRequestIDs.removeAll()
         connectionProgress = .started(attemptID: attemptID, device: device)
         availableUpgrades = []
         upgradeProgress = nil
@@ -412,6 +415,7 @@ final class BridgeClient: ObservableObject {
         connectionRPCReadbackRequestIDs.removeAll()
         failPendingRawRpcs()
         failPendingWriteOutcomes()
+        pendingRPCRequestIDs.removeAll()
         connectionProgress = ConnectionProgress()
         plotFrames.resetViewportEnd()
         resetLogTiming()
@@ -460,6 +464,7 @@ final class BridgeClient: ObservableObject {
         connectionRPCReadbackRequestIDs.removeAll()
         failPendingRawRpcs()
         failPendingWriteOutcomes()
+        pendingRPCRequestIDs.removeAll()
         resetLivePlotTiming()
         updateConnectionProgress { progress in
             progress.phase = .cancelled
@@ -1092,6 +1097,9 @@ final class BridgeClient: ObservableObject {
         if let onOutcome {
             trackWriteOutcome(onOutcome, requestId: requestId)
         }
+        if runtime != nil {
+            pendingRPCRequestIDs.insert(requestId)
+        }
         runtime?.callRpc(
             requestId: requestId,
             route: rpc.route,
@@ -1305,6 +1313,14 @@ final class BridgeClient: ObservableObject {
 
     func rpcReplyRevision(id: String) -> UInt64 {
         rpcReplyRevisions[id] ?? 0
+    }
+
+    /// True until the reply to `requestId` — a value from `callRpc` — arrives.
+    /// Every request the runtime accepts is answered exactly once, failures
+    /// included, and a disconnect forgets the rest, so a caller pacing itself
+    /// on this never waits on a request that cannot finish.
+    func isRPCRequestPending(_ requestId: String) -> Bool {
+        pendingRPCRequestIDs.contains(requestId)
     }
 
     func reloadAllRPCs() {
@@ -2385,6 +2401,7 @@ final class BridgeClient: ObservableObject {
     }
 
     private func handleRpcResult(_ event: RpcResultEvent) {
+        pendingRPCRequestIDs.remove(event.requestId)
         if connectionRPCReadbackRequestIDs.remove(event.requestId) != nil {
             markConnectionRPCReply(ok: event.ok)
         }
