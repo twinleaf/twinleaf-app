@@ -31,7 +31,7 @@ use twinleaf::proto::rpc::RpcError;
 use twinleaf::proto::sync::Epoch;
 use twinleaf::proto::DeviceRoute;
 use twinleaf::tio;
-use twinleaf::tio::packet::{Payload, RpcMethod};
+use twinleaf::tio::packet::Payload;
 use twinleaf::tio::proxy;
 use twinleaf_tools::tui::spectral::WelchOp;
 
@@ -681,9 +681,6 @@ fn write_plot_payload<W: Write>(
     rename_all_fields = "camelCase"
 )]
 enum ClientCommand {
-    ListDevices {
-        include_all: Option<bool>,
-    },
     /// Start or stop live device discovery for the connection view. While
     /// active, the bridge pushes a full `deviceList` snapshot whenever the
     /// set of reachable devices changes.
@@ -2546,13 +2543,6 @@ fn main() {
 
     while let Ok(command) = command_rx.recv() {
         match command {
-            ClientCommand::ListDevices { include_all } => {
-                let devices = list_available_devices(include_all.unwrap_or(false));
-                emitter.emit(&json!({
-                    "type": "deviceList",
-                    "devices": devices
-                }));
-            }
             ClientCommand::SetDiscovery {
                 active,
                 include_all,
@@ -2857,11 +2847,6 @@ fn spawn_stdin_reader(command_tx: Sender<ClientCommand>, emitter: Emitter) {
         .expect("failed to spawn stdin reader");
 }
 
-/// How long the one-shot `listDevices` path browses before reporting.
-/// Discovery keeps producing events past this; the live path (`setDiscovery`)
-/// streams them instead of sampling once.
-const DEVICE_LIST_WINDOW: Duration = Duration::from_millis(1500);
-
 fn local_proxy_row() -> AvailableDevice {
     AvailableDevice {
         url: "tcp://localhost".to_string(),
@@ -2875,6 +2860,7 @@ fn local_proxy_row() -> AvailableDevice {
 fn discovery_config(include_all: bool) -> DiscoveryConfig {
     DiscoveryConfig {
         include_unknown: include_all,
+        probe_unknown: include_all,
         network: true,
         probe_names: true,
         prefer_udp: false,
@@ -3022,27 +3008,6 @@ fn interface_detail(interface: &PortInterface) -> String {
         PortInterface::STM32 => "VID 0483, PID 5740".to_string(),
         PortInterface::Unknown(vid, pid) => format!("VID {vid:04x}, PID {pid:04x}"),
         PortInterface::Network => "Network".to_string(),
-    }
-}
-
-fn list_available_devices(include_all: bool) -> Vec<AvailableDevice> {
-    #[cfg(not(any(feature = "serial", feature = "mdns")))]
-    {
-        let _ = include_all;
-        vec![local_proxy_row()]
-    }
-    #[cfg(any(feature = "serial", feature = "mdns"))]
-    {
-        let discovery = Discovery::start(discovery_config(include_all));
-        let mut state = DiscoveryState::new();
-        let deadline = Instant::now() + DEVICE_LIST_WINDOW;
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            match discovery.events().recv_timeout(remaining) {
-                Ok(event) => state.apply(event),
-                Err(_) => break,
-            }
-        }
-        state.snapshot()
     }
 }
 
@@ -3263,7 +3228,7 @@ fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, em
                 let Ok(absolute) = link.prefix.absolute_route(&pkt.route()) else {
                     continue;
                 };
-                if absolute.len() > twinleaf::proto::MAX_ROUTING_SIZE {
+                if absolute.len() > DeviceRoute::MAX_HOPS {
                     continue;
                 }
                 match client.try_send(pkt.with_route(absolute)) {
@@ -3721,8 +3686,8 @@ fn bundle_batches(
     bundle
 }
 
-/// The `deviceEvent` text the app parses: `RpcInvalidated(Name("x"))` keeps
-/// its Debug form, while a metadata snapshot is named rather than dumped.
+/// The `deviceEvent` text sent to the app: events keep their Debug form,
+/// while a metadata snapshot is named rather than dumped.
 fn device_event_summary(event: &DeviceEvent) -> String {
     match event {
         DeviceEvent::Metadata(_) => "Metadata".to_string(),
@@ -3780,11 +3745,14 @@ fn run_session(
     let (proxy_status_tx, proxy_status_rx) = channel::unbounded();
     let (status_tx, mut status_rx) = channel::unbounded();
     spawn_proxy_status_forwarder(url.clone(), proxy_status_rx, status_tx, emitter.clone());
-    let connection = Connection::open_with(
+    // Open the transport directly rather than through `Connection::open_with`,
+    // which shares serial devices by launching a background `tio` holder. The
+    // app is sandboxed (and iOS cannot spawn processes), so it owns the port.
+    let connection = Connection::over(&proxy::Connection::open_with(
         &connect_url,
         Some(CONNECTION_STARTUP_TIMEOUT),
         Some(proxy_status_tx),
-    );
+    ));
 
     let mut pending_startup_commands = VecDeque::new();
     let retry_transient_connect_failures = is_retryable_connect_url(&connect_url);
@@ -3866,6 +3834,10 @@ fn run_session(
     let mut last_rpc_metadata_recovery = Instant::now();
     let mut last_sample_number_by_stream: HashMap<(DeviceRoute, u8), u32> = HashMap::new();
     let mut last_reset_refresh_by_route: HashMap<DeviceRoute, Instant> = HashMap::new();
+    // Routes whose RPC table a `NewHash` reported stale: the hash that said so
+    // (`None` after a reconnect) and when. Served on the tick, under the same
+    // cooldown as a reset refresh, since a reboot raises both.
+    let mut stale_rpc_tables: HashMap<DeviceRoute, (Option<u32>, Instant)> = HashMap::new();
 
     // Accumulates across select iterations; recorded and reset on every tick,
     // so a profile window covers one tick interval like the old poll loop.
@@ -3995,8 +3967,11 @@ fn run_session(
                             loop_profile.device_events += 1;
                             match event {
                                 Event::Device { route, event } => {
-                                    if let DeviceEvent::RpcInvalidated(method) = &event {
-                                        emit_rpc_invalidated(&emitter, &route, method);
+                                    if let DeviceEvent::NewHash(hash) = &event {
+                                        let fetched = discovery.rpc_hashes.get(&route).copied();
+                                        if rpc_table_is_stale(fetched, *hash) {
+                                            stale_rpc_tables.insert(route, (*hash, Instant::now()));
+                                        }
                                     }
                                     emitter.emit(&json!({
                                         "type": "deviceEvent",
@@ -4072,6 +4047,7 @@ fn run_session(
                                 &mut logger,
                                 &latest_stream_timestamp_by_route,
                                 health.stream_sample_sizes(),
+                                &rpc_index,
                                 &emitter,
                             );
                             loop_profile.raw_packets += drain.counts.packets as usize;
@@ -4079,6 +4055,57 @@ fn run_session(
                             monitor_port_alive = drain.alive;
                             health.observe_incoming(drain.counts, Instant::now());
                         }
+                    }
+
+                    let due_rpc_tables: Vec<(DeviceRoute, Option<u32>, Instant)> = stale_rpc_tables
+                        .iter()
+                        .filter(|(route, _)| {
+                            last_reset_refresh_by_route
+                                .get(*route)
+                                .is_none_or(|at| at.elapsed() >= DEVICE_RESET_REFRESH_COOLDOWN)
+                        })
+                        .map(|(route, (hash, seen))| (*route, *hash, *seen))
+                        .collect();
+                    for (route, hash, seen) in due_rpc_tables {
+                        stale_rpc_tables.remove(&route);
+                        // A refresh since the event may already have fetched
+                        // this table.
+                        let already_fetched = match hash {
+                            Some(hash) => discovery.rpc_hashes.get(&route) == Some(&hash),
+                            None => last_reset_refresh_by_route
+                                .get(&route)
+                                .is_some_and(|at| *at >= seen),
+                        };
+                        let route_text = route.to_string();
+                        if already_fetched
+                            || !discovery.devices.iter().any(|device| device.route == route_text)
+                        {
+                            continue;
+                        }
+                        last_reset_refresh_by_route.insert(route, Instant::now());
+                        emitter.status(
+                            "metadata",
+                            format!("Settings on {route} changed; reloading settings"),
+                        );
+                        if refresh_route_metadata(
+                            &connection,
+                            &url,
+                            &route,
+                            &root_route,
+                            &emitter,
+                            &mut discovery,
+                            &mut column_states,
+                            &mut rpc_index,
+                        ) {
+                            // A table fetched without a hash of its own still
+                            // answers this one; don't refetch it every broadcast.
+                            if let Some(hash) = hash {
+                                discovery.rpc_hashes.entry(route).or_insert(hash);
+                            }
+                            emit_metadata_devices(&emitter, &discovery.devices);
+                            health.update_stream_sample_sizes(&discovery.devices);
+                        }
+                        emitter.status("streaming", format!("Streaming from {url}"));
                     }
 
                     if !discovery.incomplete_rpc_routes.is_empty()
@@ -4235,7 +4262,15 @@ fn run_session(
                     route,
                     name,
                     arg,
-                } => dispatch_rpc(&connection, &rpc_index, request_id, route, name, arg, &emitter),
+                } => dispatch_rpc(
+                    &connection,
+                    &rpc_index,
+                    request_id,
+                    route,
+                    name,
+                    arg,
+                    &emitter,
+                ),
                 SessionCommand::CallRawRpc {
                     request_id,
                     route,
@@ -4277,21 +4312,6 @@ fn run_session(
             }
         }
         loop_profile.command_elapsed += command_start.elapsed();
-    }
-}
-
-fn emit_rpc_invalidated(emitter: &Emitter, route: &DeviceRoute, method: &RpcMethod) {
-    match method {
-        RpcMethod::Name(name) => emitter.emit(&json!({
-            "type": "rpcInvalidated",
-            "route": route.to_string(),
-            "name": name
-        })),
-        RpcMethod::Id(id) => emitter.emit(&json!({
-            "type": "rpcInvalidated",
-            "route": route.to_string(),
-            "rpcId": id
-        })),
     }
 }
 
@@ -4354,6 +4374,7 @@ fn refresh_route_metadata(
     } else {
         discovery.incomplete_rpc_routes.insert(route.clone());
     }
+    discovery.record_rpc_hash(route, fetched.rpc_hash);
 
     for stream in &fetched.device.streams {
         for column in &stream.columns {
@@ -4633,6 +4654,7 @@ fn add_late_discovered_route(
     if !fetched.rpc_metadata_complete {
         discovery.incomplete_rpc_routes.insert(route.clone());
     }
+    discovery.record_rpc_hash(route, fetched.rpc_hash);
 
     for stream in &fetched.device.streams {
         for column in &stream.columns {
@@ -4675,8 +4697,14 @@ fn recover_incomplete_rpc_metadata(
             continue;
         };
 
-        let RpcFetchResult { rpcs, complete } =
-            fetch_rpcs(&connection.device(route), &route, emitter);
+        let RpcFetchResult {
+            rpcs,
+            complete,
+            hash,
+        } = fetch_rpcs(&connection.device(route), &route, emitter);
+        if complete {
+            discovery.record_rpc_hash(&route, hash);
+        }
         if !rpc_lists_equivalent(&discovery.devices[device_index].rpcs, &rpcs) {
             discovery.devices[device_index].rpcs = rpcs;
             metadata_changed = true;
@@ -4689,6 +4717,13 @@ fn recover_incomplete_rpc_metadata(
     }
 
     metadata_changed
+}
+
+/// Whether a `NewHash` leaves the RPC table fetched for a route stale. A
+/// reconnect (`None`) always does; a broadcast only when it names a table
+/// other than the one fetched.
+fn rpc_table_is_stale(fetched: Option<u32>, announced: Option<u32>) -> bool {
+    announced.is_none_or(|hash| fetched != Some(hash))
 }
 
 fn rpc_lists_equivalent(lhs: &[RpcDto], rhs: &[RpcDto]) -> bool {
@@ -4712,6 +4747,7 @@ fn handle_monitor_packet(
     logger: &mut PacketLogger,
     latest_stream_timestamp_by_route: &HashMap<DeviceRoute, f64>,
     stream_sample_sizes: &HashMap<(DeviceRoute, u8), usize>,
+    rpc_index: &HashMap<(String, String), RpcDto>,
     emitter: &Emitter,
 ) -> IncomingCounts {
     emit_tio_log_message(
@@ -4721,9 +4757,36 @@ fn handle_monitor_packet(
             .copied(),
         emitter,
     );
+    if let Some(event) = setting_changed_event(&packet, rpc_index) {
+        emitter.emit(&event);
+    }
     let counts = incoming_counts_for_packet(&packet, stream_sample_sizes);
     logger.write_packet(&packet);
     counts
+}
+
+/// A SETTING broadcast as the app's `settingChanged` event. The device sends
+/// one whenever a setting changes, whoever changed it, carrying the bytes the
+/// RPC of that name would reply; they decode by that RPC's type. A setting
+/// the RPC table does not list, or a value that does not decode, is dropped.
+fn setting_changed_event(
+    packet: &tio::Packet,
+    rpc_index: &HashMap<(String, String), RpcDto>,
+) -> Option<Value> {
+    let Payload::Setting(setting) = packet.payload() else {
+        return None;
+    };
+    let route = packet.route().to_string();
+    let name = setting.name_str()?;
+    let rpc = rpc_index.get(&(route.clone(), name.to_string()))?;
+    let value =
+        bytes_to_json_value(setting.reply, &rpc.arg_type).filter(|value| !value.is_null())?;
+    Some(json!({
+        "type": "settingChanged",
+        "route": route,
+        "name": name,
+        "value": value
+    }))
 }
 
 /// What one raw packet adds to the link statistics. A data packet's sample
@@ -4766,6 +4829,7 @@ fn drain_packet_monitor_port(
     logger: &mut PacketLogger,
     latest_stream_timestamp_by_route: &HashMap<DeviceRoute, f64>,
     stream_sample_sizes: &HashMap<(DeviceRoute, u8), usize>,
+    rpc_index: &HashMap<(String, String), RpcDto>,
     emitter: &Emitter,
 ) -> MonitorDrain {
     let mut drain = MonitorDrain {
@@ -4780,6 +4844,7 @@ fn drain_packet_monitor_port(
                     logger,
                     latest_stream_timestamp_by_route,
                     stream_sample_sizes,
+                    rpc_index,
                     emitter,
                 ));
             }
@@ -4958,18 +5023,32 @@ fn wait_for_proxy_connection(
 struct DeviceDiscoveryResult {
     devices: Vec<DeviceDto>,
     incomplete_rpc_routes: HashSet<DeviceRoute>,
+    /// The `rpc.hash` each route's RPC table was fetched under, so a later
+    /// `NewHash` can tell whether that table is stale.
+    rpc_hashes: HashMap<DeviceRoute, u32>,
+}
+
+impl DeviceDiscoveryResult {
+    fn record_rpc_hash(&mut self, route: &DeviceRoute, hash: Option<u32>) {
+        match hash {
+            Some(hash) => self.rpc_hashes.insert(*route, hash),
+            None => self.rpc_hashes.remove(route),
+        };
+    }
 }
 
 #[derive(Debug)]
 struct FetchedDevice {
     device: DeviceDto,
     rpc_metadata_complete: bool,
+    rpc_hash: Option<u32>,
 }
 
 #[derive(Debug)]
 struct RpcFetchResult {
     rpcs: Vec<RpcDto>,
     complete: bool,
+    hash: Option<u32>,
 }
 
 fn discover_devices_until_available(
@@ -5049,6 +5128,7 @@ fn discover_devices(
 
     let mut devices = Vec::new();
     let mut incomplete_rpc_routes = HashSet::new();
+    let mut rpc_hashes = HashMap::new();
     for named in named_routes {
         let route = named.route;
         emitter.status("metadata", format!("Fetching metadata for route {route}"));
@@ -5066,6 +5146,9 @@ fn discover_devices(
             Ok(Ok(fetched)) => {
                 if !fetched.rpc_metadata_complete {
                     incomplete_rpc_routes.insert(route.clone());
+                }
+                if let Some(hash) = fetched.rpc_hash {
+                    rpc_hashes.insert(route, hash);
                 }
                 devices.push(fetched.device);
             }
@@ -5089,6 +5172,7 @@ fn discover_devices(
     DeviceDiscoveryResult {
         devices,
         incomplete_rpc_routes,
+        rpc_hashes,
     }
 }
 
@@ -5168,32 +5252,33 @@ fn fetch_device(
 ) -> Result<FetchedDevice, String> {
     let rpc_fetch = fetch_rpcs(&connection.device(*route), route, emitter);
 
-    let (meta, streams, full_metadata) =
-        match panic::catch_unwind(AssertUnwindSafe(|| fetch_stream_metadata(connection, route))) {
-            Ok(Ok(metadata)) => {
-                let (meta, streams) = metadata_to_stream_dtos(route, &metadata);
-                (meta, streams, Some(metadata))
-            }
-            Ok(Err(err)) => {
-                emit_metadata_issue(
-                    emitter,
-                    report_errors,
-                    format!("Failed to fetch stream metadata for route {route}: {err}"),
-                );
-                (fallback_device_meta(route, fallback_name), Vec::new(), None)
-            }
-            Err(err) => {
-                emit_metadata_issue(
-                    emitter,
-                    report_errors,
-                    format!(
+    let (meta, streams, full_metadata) = match panic::catch_unwind(AssertUnwindSafe(|| {
+        fetch_stream_metadata(connection, route)
+    })) {
+        Ok(Ok(metadata)) => {
+            let (meta, streams) = metadata_to_stream_dtos(route, &metadata);
+            (meta, streams, Some(metadata))
+        }
+        Ok(Err(err)) => {
+            emit_metadata_issue(
+                emitter,
+                report_errors,
+                format!("Failed to fetch stream metadata for route {route}: {err}"),
+            );
+            (fallback_device_meta(route, fallback_name), Vec::new(), None)
+        }
+        Err(err) => {
+            emit_metadata_issue(
+                emitter,
+                report_errors,
+                format!(
                     "Twinleaf parser panic while fetching stream metadata for route {route}: {}",
                     panic_message(err)
                 ),
-                );
-                (fallback_device_meta(route, fallback_name), Vec::new(), None)
-            }
-        };
+            );
+            (fallback_device_meta(route, fallback_name), Vec::new(), None)
+        }
+    };
 
     if streams.is_empty() && rpc_fetch.rpcs.is_empty() {
         return Err("No stream metadata or RPC metadata returned".to_string());
@@ -5209,6 +5294,7 @@ fn fetch_device(
             full_metadata,
         },
         rpc_metadata_complete: rpc_fetch.complete,
+        rpc_hash: rpc_fetch.hash,
     })
 }
 
@@ -5330,6 +5416,7 @@ fn fetch_rpcs(device: &Device, route: &DeviceRoute, emitter: &Emitter) -> RpcFet
             return RpcFetchResult {
                 rpcs: Vec::new(),
                 complete: false,
+                hash: None,
             };
         }
     };
@@ -5355,6 +5442,7 @@ fn fetch_rpcs(device: &Device, route: &DeviceRoute, emitter: &Emitter) -> RpcFet
     RpcFetchResult {
         rpcs,
         complete: true,
+        hash: registry.hash,
     }
 }
 
@@ -7190,12 +7278,22 @@ fn calculate_fft_request(request: FftRequest) -> FftResult {
 /// placed at the bucket's first and last bin so the polyline traces a stable
 /// band, and a bucket holding a single bin passes it through unchanged, which
 /// on a log axis keeps every low-frequency bin.
-fn decimate_spectrum_for_display(points: &[Point], target_points: usize, log_x: bool) -> Vec<Point> {
+fn decimate_spectrum_for_display(
+    points: &[Point],
+    target_points: usize,
+    log_x: bool,
+) -> Vec<Point> {
     let bucket_count = target_points / 2;
     if points.len() <= target_points || bucket_count < 2 {
         return points.to_vec();
     }
-    let axis = |x: f64| if log_x { x.max(f64::MIN_POSITIVE).ln() } else { x };
+    let axis = |x: f64| {
+        if log_x {
+            x.max(f64::MIN_POSITIVE).ln()
+        } else {
+            x
+        }
+    };
     let low = axis(points[0].x);
     let span = axis(points[points.len() - 1].x) - low;
     if !span.is_finite() || span <= 0.0 {
@@ -7220,14 +7318,22 @@ fn decimate_spectrum_for_display(points: &[Point], target_points: usize, log_x: 
         if let [single] = group {
             output.push(*single);
         } else {
-            let (min, max) = group.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), point| {
-                (min.min(point.y), max.max(point.y))
-            });
+            let (min, max) = group
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), point| {
+                    (min.min(point.y), max.max(point.y))
+                });
             // Alternate the direction so consecutive buckets join like
             // extreme to like extreme and the band has no systematic slant.
             let (first, last) = if rising { (min, max) } else { (max, min) };
-            output.push(Point { x: group[0].x, y: first });
-            output.push(Point { x: group[group.len() - 1].x, y: last });
+            output.push(Point {
+                x: group[0].x,
+                y: first,
+            });
+            output.push(Point {
+                x: group[group.len() - 1].x,
+                y: last,
+            });
             rising = !rising;
         }
         start = end;
@@ -7562,7 +7668,10 @@ fn dispatch_raw_rpc(
                 Err(err) => emit_raw_rpc_error(
                     &worker_emitter,
                     &worker_request_id,
-                    &format!("Twinleaf parser panic while calling RPC: {}", panic_message(err)),
+                    &format!(
+                        "Twinleaf parser panic while calling RPC: {}",
+                        panic_message(err)
+                    ),
                     None,
                 ),
             }
@@ -7579,7 +7688,10 @@ fn dispatch_raw_rpc(
 
 /// Answers every raw RPC in `commands` with a not-connected error; used for
 /// commands a session ends without seeing. Other commands need no reply.
-fn fail_unanswered_raw_rpcs<I: IntoIterator<Item = SessionCommand>>(commands: I, emitter: &Emitter) {
+fn fail_unanswered_raw_rpcs<I: IntoIterator<Item = SessionCommand>>(
+    commands: I,
+    emitter: &Emitter,
+) {
     for command in commands {
         if let SessionCommand::CallRawRpc { request_id, .. } = command {
             emit_raw_rpc_error(emitter, &request_id, "Not connected to a device", None);
@@ -7654,7 +7766,9 @@ fn execute_capture_rpc(
     emitter: &Emitter,
 ) {
     const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
-    match panic::catch_unwind(AssertUnwindSafe(|| read_capture(device, &name, CAPTURE_TIMEOUT))) {
+    match panic::catch_unwind(AssertUnwindSafe(|| {
+        read_capture(device, &name, CAPTURE_TIMEOUT)
+    })) {
         Ok(Ok(readout)) => emitter.emit(&json!({
             "type": "rpcResult",
             "requestId": request_id,
@@ -7995,7 +8109,10 @@ mod tests {
 
         // Once observations stop (the monitor port died), the rate is unknown.
         assert_eq!(window.kbps(now + HEALTH_STALE_FLOOR + tick), None);
-        assert_eq!(window.packets_per_second(now + HEALTH_STALE_FLOOR + tick), None);
+        assert_eq!(
+            window.packets_per_second(now + HEALTH_STALE_FLOOR + tick),
+            None
+        );
     }
 
     #[test]
@@ -8014,8 +8131,14 @@ mod tests {
 
         health.reset_drop_counts();
 
-        assert!(health.streams.values().all(|stats| stats.samples_dropped == 0));
-        assert!(health.streams.values().all(|stats| stats.received_count == 100));
+        assert!(health
+            .streams
+            .values()
+            .all(|stats| stats.samples_dropped == 0));
+        assert!(health
+            .streams
+            .values()
+            .all(|stats| stats.received_count == 100));
         let snapshot = health.snapshot(Instant::now());
         assert!(snapshot["streams"]
             .as_array()
@@ -8088,7 +8211,10 @@ mod tests {
             "name": "dev.name"
         }))
         .unwrap();
-        assert!(matches!(read, ClientCommand::CallRawRpc { arg_hex: None, .. }));
+        assert!(matches!(
+            read,
+            ClientCommand::CallRawRpc { arg_hex: None, .. }
+        ));
     }
 
     /// Collects the JSON events an `Emitter::callback` emits during a test.
@@ -8115,7 +8241,8 @@ mod tests {
             arg_hex: None,
         })
         .unwrap();
-        tx.send(SessionCommand::SetView(ViewConfig::default())).unwrap();
+        tx.send(SessionCommand::SetView(ViewConfig::default()))
+            .unwrap();
         tx.send(SessionCommand::CallRawRpc {
             request_id: "queued-2".into(),
             route: "/".into(),
@@ -8146,8 +8273,16 @@ mod tests {
         assert_eq!(
             answered,
             vec![
-                ("queued-1".to_string(), false, "Not connected to a device".to_string()),
-                ("queued-2".to_string(), false, "Not connected to a device".to_string()),
+                (
+                    "queued-1".to_string(),
+                    false,
+                    "Not connected to a device".to_string()
+                ),
+                (
+                    "queued-2".to_string(),
+                    false,
+                    "Not connected to a device".to_string()
+                ),
             ]
         );
         // The drain consumed the channel; nothing waits behind a dead session.
@@ -8163,6 +8298,81 @@ mod tests {
         assert_eq!(hex_decode("").unwrap(), Vec::<u8>::new());
         assert!(hex_decode("abc").is_err());
         assert!(hex_decode("zz").is_err());
+    }
+
+    fn setting_packet(route: &DeviceRoute, name: &str, reply: &[u8]) -> tio::Packet {
+        let setting = twinleaf::proto::settings::Setting {
+            name: name.as_bytes(),
+            flags: 0,
+            reply,
+        };
+        let mut buf = [0u8; 512];
+        let len = setting.write(&mut buf).unwrap();
+        let (packet, _) = tio::Packet::from_slice_prefix(&buf[..len]).unwrap();
+        packet.with_route(*route)
+    }
+
+    fn indexed_rpc(route: &DeviceRoute, name: &str, arg_type: &str) -> ((String, String), RpcDto) {
+        (
+            (route.to_string(), name.to_string()),
+            RpcDto {
+                route: route.to_string(),
+                name: name.to_string(),
+                size: 4,
+                permissions: "rw".to_string(),
+                arg_type: arg_type.to_string(),
+                readable: true,
+                writable: true,
+                persistent: false,
+                unknown: false,
+                value: None,
+            },
+        )
+    }
+
+    #[test]
+    fn setting_broadcasts_decode_by_the_named_rpcs_type() {
+        let route = DeviceRoute::from_str("/1").unwrap();
+        let rpc_index = HashMap::from([
+            indexed_rpc(&route, "data.rate", "f32"),
+            indexed_rpc(&route, "dev.name", "string"),
+        ]);
+
+        let rate = setting_packet(&route, "data.rate", &250.0f32.to_le_bytes());
+        assert_eq!(
+            setting_changed_event(&rate, &rpc_index).unwrap(),
+            json!({"type": "settingChanged", "route": "/1", "name": "data.rate", "value": 250.0})
+        );
+
+        let name = setting_packet(&route, "dev.name", b"PPM");
+        assert_eq!(
+            setting_changed_event(&name, &rpc_index).unwrap()["value"],
+            json!("PPM")
+        );
+
+        // Not in this route's RPC table: another route's, or an unlisted name.
+        let other = DeviceRoute::from_str("/0").unwrap();
+        let elsewhere = setting_packet(&other, "data.rate", &250.0f32.to_le_bytes());
+        assert!(setting_changed_event(&elsewhere, &rpc_index).is_none());
+        let unlisted = setting_packet(&route, "rpc.hash", &7u32.to_le_bytes());
+        assert!(setting_changed_event(&unlisted, &rpc_index).is_none());
+
+        // Too short to decode as the RPC's type, and not a SETTING packet at all.
+        let short = setting_packet(&route, "data.rate", &[0u8; 2]);
+        assert!(setting_changed_event(&short, &rpc_index).is_none());
+        assert!(setting_changed_event(&tio::Packet::heartbeat(route), &rpc_index).is_none());
+    }
+
+    #[test]
+    fn new_hash_marks_the_rpc_table_stale_only_when_it_differs() {
+        // The broadcast names the table already fetched.
+        assert!(!rpc_table_is_stale(Some(7), Some(7)));
+        // It names another table, or none was fetched under a hash.
+        assert!(rpc_table_is_stale(Some(7), Some(8)));
+        assert!(rpc_table_is_stale(None, Some(8)));
+        // A reconnect asks for a refresh whatever was fetched.
+        assert!(rpc_table_is_stale(Some(7), None));
+        assert!(rpc_table_is_stale(None, None));
     }
 
     #[test]
@@ -9122,7 +9332,11 @@ mod tests {
         for log_x in [true, false] {
             let da = decimate_spectrum_for_display(&a, 800, log_x);
             let db = decimate_spectrum_for_display(&b, 800, log_x);
-            assert!(da.len() <= 800 && da.len() > 400, "log_x={log_x}: {} points", da.len());
+            assert!(
+                da.len() <= 800 && da.len() > 400,
+                "log_x={log_x}: {} points",
+                da.len()
+            );
             let xa: Vec<f64> = da.iter().map(|point| point.x).collect();
             let xb: Vec<f64> = db.iter().map(|point| point.x).collect();
             assert_eq!(xa, xb, "log_x={log_x}");

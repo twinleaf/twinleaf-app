@@ -35,7 +35,6 @@ typedef struct TwinleafRpcArg {
 
 TwinleafRuntime *twinleaf_runtime_create(TwinleafEventCallback callback, uintptr_t context);
 void twinleaf_runtime_destroy(TwinleafRuntime *runtime);
-void twinleaf_runtime_list_devices(TwinleafRuntime *runtime, uint8_t include_all);
 /* Start (active != 0) or stop live device discovery. While active, the
    runtime pushes a deviceList event whenever the set of reachable devices
    changes; include_all also surfaces unrecognized serial ports. */

@@ -68,19 +68,6 @@ mod direct {
         }
     }
 
-    #[no_mangle]
-    pub unsafe extern "C" fn twinleaf_runtime_list_devices(
-        runtime: *mut TwinleafRuntime,
-        include_all: u8,
-    ) {
-        send_runtime_command(
-            runtime,
-            ClientCommand::ListDevices {
-                include_all: Some(include_all != 0),
-            },
-        );
-    }
-
     /// Start (`active != 0`) or stop live device discovery. While active, the
     /// runtime pushes a `deviceList` event whenever the set of reachable
     /// devices changes; `include_all` also surfaces unrecognized serial ports.
@@ -307,13 +294,6 @@ mod direct {
 
         while let Ok(command) = command_rx.recv() {
             match command {
-                ClientCommand::ListDevices { include_all } => {
-                    let devices = list_available_devices(include_all.unwrap_or(false));
-                    emitter.emit(&json!({
-                        "type": "deviceList",
-                        "devices": devices
-                    }));
-                }
                 ClientCommand::SetDiscovery {
                     active,
                     include_all,

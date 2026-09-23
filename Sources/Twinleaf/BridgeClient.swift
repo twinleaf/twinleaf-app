@@ -10,7 +10,6 @@ import UIKit
 #endif
 
 private protocol BridgeRuntime: AnyObject {
-    func listDevices(includeAll: Bool)
     func setDiscovery(active: Bool, includeAll: Bool)
     func connect(url: String, route: String, logPath: String?)
     func setLogging(enabled: Bool, logPath: String?)
@@ -33,7 +32,6 @@ private protocol BridgeRuntime: AnyObject {
 extension RustRuntime: BridgeRuntime {}
 #else
 private final class UnavailableBridgeRuntime: BridgeRuntime {
-    func listDevices(includeAll: Bool) {}
     func setDiscovery(active: Bool, includeAll: Bool) {}
     func connect(url: String, route: String, logPath: String?) {}
     func setLogging(enabled: Bool, logPath: String?) {}
@@ -150,6 +148,10 @@ final class BridgeClient: ObservableObject {
     @Published var availableDevices: [AvailableDevice] = []
     @Published private(set) var rememberedDeviceURLs: [String] = []
     @Published var devices: [DeviceInfo] = []
+    /// True when at least two connected sensors share a device type. Tracked
+    /// apart from `devices`, which republishes with every live readout, so
+    /// this changes only when the set of sensors does.
+    @Published private(set) var hasUnifiableSensors = false
     @Published private(set) var activeColumns: Set<ColumnKey> = []
     /// Channels computed from a source column rather than received from a
     /// device, keyed by their derived `ColumnKey`. A channel lives here until
@@ -227,9 +229,9 @@ final class BridgeClient: ObservableObject {
     private var streamDisplayValues: [ColumnKey: StreamDisplayValue] = [:]
     private var lastStreamDisplayPublishAt = Date.distantPast
     private var pendingStreamDisplayFlush: DispatchWorkItem?
-    private var shouldRetryAllSerialAfterStrictDiscovery = false
     private var nextConnectionAttemptID: UInt64 = 1
     private var connectionRPCReadbackRequestIDs: Set<String> = []
+    private var reloadRPCRequestIDs: Set<String> = []
     /// Raw RPC calls awaiting their `rawRpcResult`, keyed by request id.
     private var pendingRawRpcContinuations: [String: CheckedContinuation<Data, Error>] = [:]
     /// Writes whose issuing control wants the device's answer (the settings
@@ -297,25 +299,6 @@ final class BridgeClient: ObservableObject {
 #endif
     }
 
-    func listDevices(includeAllSerial: Bool? = nil) {
-        startIfNeeded()
-        #if os(iOS)
-        // Browse the local network natively on iOS (the Rust core's raw-socket
-        // mDNS is macOS-only). Idempotent; keeps running and republishes as
-        // devices appear or vanish.
-        bonjourBrowser.start()
-        #endif
-        refreshAvailableDevices()
-        let includeAll = includeAllSerial ?? Self.loadShowAllSerialPorts()
-        shouldRetryAllSerialAfterStrictDiscovery = !includeAll
-        logDeviceDiscovery(
-            "listDevices requested includeAll=\(includeAll) explicit=\(includeAllSerial.map(String.init(describing:)) ?? "nil") " +
-            "storedShowAll=\(Self.loadShowAllSerialPorts()) runtime=\(runtime == nil ? "nil" : "ready") " +
-            "remembered=\(rememberedDeviceURLs.count) discovered=\(discoveredDevices.count) available=\(availableDevices.count)"
-        )
-        runtime?.listDevices(includeAll: includeAll)
-    }
-
     /// Start or stop live device discovery. While active, the Rust core
     /// pushes a fresh deviceList whenever the set of reachable devices
     /// changes, so the picker needs no polling. Starting again restarts the
@@ -324,9 +307,11 @@ final class BridgeClient: ObservableObject {
         startIfNeeded()
         #if os(iOS)
         // Browse the local network natively on iOS (the Rust core's raw-socket
-        // mDNS is macOS-only). Idempotent; keeps running and republishes as
-        // devices appear or vanish.
+        // mDNS is macOS-only), on the same lifetime as the Rust discovery.
+        // Like the Rust side, starting again browses from a clean slate.
+        bonjourBrowser.stop()
         if active {
+            mdnsDevices = []
             bonjourBrowser.start()
         }
         #endif
@@ -395,6 +380,7 @@ final class BridgeClient: ObservableObject {
         logSerializeErrors = 0
         resetPlotPanes()
         devices.removeAll()
+        updateHasUnifiableSensors()
         clearPlotOutput()
         playbackStart = 0
         playbackEnd = 0
@@ -1325,7 +1311,19 @@ final class BridgeClient: ObservableObject {
 
     func reloadAllRPCs() {
         rpcCacheNeedsReload = false
-        loadReadableRPCs()
+        reloadRPCRequestIDs = loadReadableRPCs()
+    }
+
+    /// Whether any connected device has a setting value to re-read.
+    var canReloadRPCs: Bool {
+        !isInspectionMode
+            && devices.flatMap(\.rpcs).contains { $0.readable && $0.hasMetadata && !$0.isCaptureRPC }
+    }
+
+    /// True while the reads from the last `reloadAllRPCs()` are still being
+    /// answered, so a held shortcut need not queue the full read again.
+    var isReloadingRPCs: Bool {
+        !reloadRPCRequestIDs.isDisjoint(with: pendingRPCRequestIDs)
     }
 
     func trimLogMessages(limit: Int) {
@@ -1705,6 +1703,8 @@ final class BridgeClient: ObservableObject {
                 handleRpcResult(try decoder.decode(RpcResultEvent.self, from: data))
             case "rpcInvalidated":
                 handleRpcInvalidated(try decoder.decode(RpcInvalidatedEvent.self, from: data))
+            case "settingChanged":
+                handleSettingChanged(try decoder.decode(SettingChangedEvent.self, from: data))
             case "rawRpcResult":
                 handleRawRpcResult(try decoder.decode(RawRpcResultEvent.self, from: data))
             case "deviceEvent":
@@ -1737,6 +1737,7 @@ final class BridgeClient: ObservableObject {
     private func handleMetadataDevices(_ nextDevices: [DeviceInfo]) {
         clearStreamDisplayValues()
         devices = nextDevices
+        updateHasUnifiableSensors()
         rpcCacheNeedsReload = false
         markConnectionMetadataLoaded(nextDevices)
         logStreamMetadataGaps()
@@ -1746,6 +1747,23 @@ final class BridgeClient: ObservableObject {
             removeAllPlotPanes()
         }
         loadReadableRPCs()
+    }
+
+    /// Only the device list itself can change this; live readouts and RPC
+    /// values rewrite `devices` without adding, removing or renaming sensors.
+    private func updateHasUnifiableSensors() {
+        var counts: [String: Int] = [:]
+        var next = false
+        for device in devices where !device.meta.name.isEmpty {
+            counts[device.meta.name, default: 0] += 1
+            if counts[device.meta.name] == 2 {
+                next = true
+                break
+            }
+        }
+        if hasUnifiableSensors != next {
+            hasUnifiableSensors = next
+        }
     }
 
     private func handleDeviceList(_ devices: [AvailableDevice]) {
@@ -1776,14 +1794,6 @@ final class BridgeClient: ObservableObject {
             .joined(separator: " ; ")
         logDeviceDiscovery("deviceList decoded summary=\(deviceDiscoverySummary) raw=[\(rawDevices)]")
         refreshAvailableDevices()
-
-        if shouldRetryAllSerialAfterStrictDiscovery && serialDevices.isEmpty {
-            shouldRetryAllSerialAfterStrictDiscovery = false
-            logDeviceDiscovery("strict serial discovery found no serial ports; retrying with includeAll=true")
-            runtime?.listDevices(includeAll: true)
-        } else {
-            shouldRetryAllSerialAfterStrictDiscovery = false
-        }
     }
 
     private func handleStatusEvent(_ event: StatusEvent) {
@@ -2381,23 +2391,27 @@ final class BridgeClient: ObservableObject {
         )
     }
 
-    private func loadReadableRPCs() {
-        guard !isInspectionMode else { return }
+    @discardableResult
+    private func loadReadableRPCs() -> Set<String> {
+        guard !isInspectionMode else { return [] }
         // `isActionRPC` (writable unit-typed) is excluded: even when the device
         // reports such an RPC as readable, "reading" a unit RPC executes the
         // action — `dev.conf.save/load/reset` etc. would all fire on startup.
         let readableRPCs = devices
             .flatMap(\.rpcs)
             .filter { $0.readable && $0.hasMetadata && !$0.isCaptureRPC && !$0.isActionRPC }
-        guard !readableRPCs.isEmpty else { return }
+        guard !readableRPCs.isEmpty else { return [] }
 
         TwinleafConsole.debug("[Twinleaf] loading \(readableRPCs.count) readable RPC value(s)")
+        var requestIDs: Set<String> = []
         for rpc in readableRPCs {
             let requestID = callRpc(rpc)
+            requestIDs.insert(requestID)
             if connectionProgress.isVisible && connectionProgress.canCancel {
                 connectionRPCReadbackRequestIDs.insert(requestID)
             }
         }
+        return requestIDs
     }
 
     private func handleRpcResult(_ event: RpcResultEvent) {
@@ -2467,6 +2481,16 @@ final class BridgeClient: ObservableObject {
 
     private func handleRpcInvalidated(_: RpcInvalidatedEvent) {
         rpcCacheNeedsReload = true
+    }
+
+    /// The device announces every setting change, whoever made it. While a
+    /// write of ours is in flight the field shows that write's value, and its
+    /// readback settles the final one; an announcement of an earlier write in
+    /// the same burst must not step the field backward.
+    private func handleSettingChanged(_ event: SettingChangedEvent) {
+        let rpcID = Self.rpcID(route: event.route, name: event.name)
+        guard latestWriteRequestIDByRPCID[rpcID] == nil else { return }
+        applyRPCValue(route: event.route, name: event.name, value: event.value)
     }
 
     private func handleUpgradeProgressEvent(_ progress: FirmwareUpgradeProgress) {
@@ -2917,6 +2941,12 @@ private struct RpcInvalidatedEvent: Decodable {
     let route: String
     let name: String?
     let rpcId: UInt16?
+}
+
+private struct SettingChangedEvent: Decodable {
+    let route: String
+    let name: String
+    let value: JSONValue
 }
 
 private struct RawRpcResultEvent: Decodable {

@@ -170,8 +170,16 @@ struct DocumentWindow: View {
                 setDataLoggingEnabled(!isDataLoggingEnabled)
             }
             .onReceive(NotificationCenter.default.publisher(for: .refreshDeviceList)) { _ in
-                guard !bridge.isInspectionMode else { return }
-                bridge.listDevices(includeAllSerial: showAllSerialPorts)
+                // Discovery only runs while the picker is open; refreshing
+                // restarts it there. Without a picker there is nothing to show.
+                guard !bridge.isInspectionMode, showingDevicePicker else { return }
+                bridge.setDiscovery(active: true, includeAllSerial: showAllSerialPorts)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .reloadSettings)) { notification in
+                guard receivesWindowCommand(notification),
+                      bridge.canReloadRPCs,
+                      !bridge.isReloadingRPCs else { return }
+                bridge.reloadAllRPCs()
             }
             .onReceive(NotificationCenter.default.publisher(for: .focusRPCSearch)) { _ in
                 distractionFree = false
@@ -262,7 +270,6 @@ struct DocumentWindow: View {
                         document.removeTemporaryLogFile()
                         clearDocumentEditedRequest &+= 1
                     }
-                    bridge.listDevices(includeAllSerial: showAllSerialPorts)
                 }
             }
             .sheet(isPresented: $showingPlotSettings) {
@@ -433,23 +440,11 @@ struct DocumentWindow: View {
         if reportsWidth {
             sidebar
                 .background(StreamSidebarWidthReporter())
-                .toolbar { UnifySensorsToolbarItem(isAvailable: hasUnifiableSensors) }
+                .toolbar { UnifySensorsToolbarItem(isAvailable: bridge.hasUnifiableSensors) }
         } else {
             sidebar
-                .toolbar { UnifySensorsToolbarItem(isAvailable: hasUnifiableSensors) }
+                .toolbar { UnifySensorsToolbarItem(isAvailable: bridge.hasUnifiableSensors) }
         }
-    }
-
-    /// True when at least two connected sensors share a device type.
-    private var hasUnifiableSensors: Bool {
-        var counts: [String: Int] = [:]
-        for device in bridge.devices where !device.meta.name.isEmpty {
-            counts[device.meta.name, default: 0] += 1
-            if counts[device.meta.name] == 2 {
-                return true
-            }
-        }
-        return false
     }
 
     private var openPlotWindowAction: (([ColumnKey]) -> Void)? {
@@ -1777,7 +1772,7 @@ struct DocumentWindow: View {
         if shouldConnectButtonDisconnect {
             bridge.disconnect()
         } else {
-            bridge.listDevices(includeAllSerial: showAllSerialPorts)
+            // The picker starts live discovery in its own onAppear.
             showingDevicePicker = true
         }
     }
@@ -4833,22 +4828,33 @@ struct TwinleafInterfaceVisibilityControls: View {
 
 /// Sidebar-toolbar toggle for unify mode. Because it's declared on the
 /// sidebar column's content, it hides whenever the sidebar is hidden; it also
-/// only appears when at least two same-type sensors are connected.
+/// only appears when at least two same-type sensors are connected. On macOS
+/// the item is always declared and merely hidden, so the sidebar's frequent
+/// updates never insert or remove it while it is on screen; iOS has no
+/// `hidden(_:)` for toolbar content and declares it conditionally.
 private struct UnifySensorsToolbarItem: ToolbarContent {
     let isAvailable: Bool
     @AppStorage(ViewPreferenceKeys.unifySensors) private var unifySensors = false
 
     var body: some ToolbarContent {
+        #if os(macOS)
+        item.hidden(!isAvailable)
+        #else
         if isAvailable {
-            ToolbarItem(placement: .automatic) {
-                Toggle(isOn: $unifySensors) {
-                    Label("Unify Matching Sensors", systemImage: "arrow.triangle.merge")
-                }
-                .toggleStyle(.button)
-                .help(unifySensors
-                    ? "Show each sensor separately"
-                    : "Unify matching sensors: group same-type sensors' streams and settings")
+            item
+        }
+        #endif
+    }
+
+    private var item: some ToolbarContent {
+        ToolbarItem(placement: .automatic) {
+            Toggle(isOn: $unifySensors) {
+                Label("Unify Matching Sensors", systemImage: "arrow.triangle.merge")
             }
+            .toggleStyle(.button)
+            .help(unifySensors
+                ? "Show each sensor separately"
+                : "Unify matching sensors: group same-type sensors' streams and settings")
         }
     }
 }
@@ -9258,22 +9264,18 @@ private struct SettingsSidebarSections: View {
 
             Spacer()
 
-            if bridge.rpcCacheNeedsReload {
-                Button {
-                    bridge.reloadAllRPCs()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .disabled(!canReloadRPCs)
-                .help(canReloadRPCs ? "Reload all readable setting values" : "No readable settings to reload")
+            Button {
+                guard !bridge.isReloadingRPCs else { return }
+                bridge.reloadAllRPCs()
+            } label: {
+                Image(systemName: "arrow.clockwise")
             }
+            .buttonStyle(.borderless)
+            .disabled(!bridge.canReloadRPCs)
+            .help(bridge.canReloadRPCs
+                ? "Reload all readable setting values (⌘R)"
+                : "No readable settings to reload")
         }
-    }
-
-    private var canReloadRPCs: Bool {
-        !bridge.isInspectionMode
-            && bridge.devices.flatMap(\.rpcs).contains { $0.readable && $0.hasMetadata && !$0.isCaptureRPC }
     }
 
     private var shouldShowSettingsSection: Bool {

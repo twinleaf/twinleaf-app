@@ -37,6 +37,11 @@ struct TwinleafCommands: Commands {
             }
             .keyboardShortcut("r", modifiers: [.command, .option, .shift])
 
+            Button("Reload Settings") {
+                postCommand(.reloadSettings)
+            }
+            .keyboardShortcut("r", modifiers: [.command])
+
             Divider()
 
             Button("Toggle Log Data") {

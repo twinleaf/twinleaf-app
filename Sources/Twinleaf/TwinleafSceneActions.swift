@@ -10,5 +10,6 @@ extension Notification.Name {
     static let togglePlotPause = Notification.Name("TwinleafTogglePlotPause")
     static let toggleDataLogging = Notification.Name("TwinleafToggleDataLogging")
     static let refreshDeviceList = Notification.Name("TwinleafRefreshDeviceList")
+    static let reloadSettings = Notification.Name("TwinleafReloadSettings")
     static let focusRPCSearch = Notification.Name("TwinleafFocusRPCSearch")
 }
