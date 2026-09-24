@@ -534,7 +534,9 @@ struct DocumentWindow: View {
 
     private var detailPane: some View {
         VStack(spacing: 0) {
-            ZStack(alignment: .trailing) {
+            // The trailing panes push the plot aside rather than covering it,
+            // so the newest samples at the right edge stay visible.
+            HStack(spacing: 0) {
                 plotArea
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .onGeometryChange(for: CGSize.self) { proxy in
@@ -544,13 +546,11 @@ struct DocumentWindow: View {
                     }
 
                 if effectiveShowLogPanel {
-                    logSlideOverPane
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
-                        .zIndex(1)
+                    logSidePane
+                        .transition(.move(edge: .trailing))
                 } else if effectiveShowTerminalPanel {
-                    terminalSlideOverPane
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
-                        .zIndex(1)
+                    terminalSidePane
+                        .transition(.move(edge: .trailing))
                 }
             }
             .animation(.easeInOut(duration: 0.16), value: effectiveShowLogPanel)
@@ -724,7 +724,7 @@ struct DocumentWindow: View {
         )
     }
 
-    private var logSlideOverPane: some View {
+    private var logSidePane: some View {
         HStack(spacing: 0) {
             SidebarResizeHandle(
                 width: $rpcPanelWidth,
@@ -743,13 +743,12 @@ struct DocumentWindow: View {
         .background {
             WindowContentTopInsetReporter(topInset: $measuredRightSidebarTopInset)
         }
-        .shadow(color: .black.opacity(effectiveWindowColorScheme == .dark ? 0.34 : 0.16), radius: 18, x: -8, y: 0)
         .ignoresSafeArea(.container, edges: .top)
     }
 
     /// The RPC terminal takes the log pane's slot on the trailing edge; the
     /// two are alternates, so showing one hides the other.
-    private var terminalSlideOverPane: some View {
+    private var terminalSidePane: some View {
         HStack(spacing: 0) {
             SidebarResizeHandle(
                 width: $rpcPanelWidth,
@@ -768,7 +767,6 @@ struct DocumentWindow: View {
         .background {
             WindowContentTopInsetReporter(topInset: $measuredRightSidebarTopInset)
         }
-        .shadow(color: .black.opacity(effectiveWindowColorScheme == .dark ? 0.34 : 0.16), radius: 18, x: -8, y: 0)
         .ignoresSafeArea(.container, edges: .top)
     }
 
@@ -1907,7 +1905,7 @@ struct DocumentWindow: View {
             }
             .toggleStyle(.button)
             .labelStyle(.iconOnly)
-            .help(effectiveShowLogPanel ? "Hide log slide-over" : "Show log slide-over")
+            .help(effectiveShowLogPanel ? "Hide log pane" : "Show log pane")
             .accessibilityValue(effectiveShowLogPanel ? "Selected" : "Not selected")
 
             Toggle(isOn: terminalInspectorSelectionBinding) {
