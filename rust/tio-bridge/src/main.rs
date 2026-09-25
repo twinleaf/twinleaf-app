@@ -2860,7 +2860,6 @@ fn local_proxy_row() -> AvailableDevice {
 fn discovery_config(include_all: bool) -> DiscoveryConfig {
     DiscoveryConfig {
         include_unknown: include_all,
-        probe_unknown: include_all,
         network: true,
         probe_names: true,
         prefer_udp: false,
@@ -3079,6 +3078,28 @@ fn spawn_discovery_hub(include_all: bool, emitter: Emitter) -> DiscoveryHubHandl
     DiscoveryHubHandle { stop_tx }
 }
 
+/// Where to open `url`, as the tio tools' `Connection::open` does: through the
+/// device's shared `tio proxy` holder, joining a live one at its loopback URL
+/// or starting one. When no holder can be had (iOS cannot spawn one, nor can a
+/// sandbox without `tio`), the device is opened directly.
+fn shared_endpoint(url: &str, emitter: &Emitter) -> String {
+    if cfg!(target_os = "ios") {
+        return url.to_string();
+    }
+    match twinleaf::device::runtime::resolve(url) {
+        Ok(endpoint) => {
+            if endpoint != url {
+                emitter.debug(format!("{url} is shared at {endpoint}"));
+            }
+            endpoint
+        }
+        Err(err) => {
+            emitter.debug(format!("no shared holder for {url}, opening it directly: {err}"));
+            url.to_string()
+        }
+    }
+}
+
 /// Serve several sensors as one device tree on a loopback TCP port: sensor k
 /// is mounted at route /k. The session connects to the returned URL and the
 /// combined tree behaves exactly like a hub. The mount thread runs until the
@@ -3115,7 +3136,7 @@ fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, em
         emitter.debug(format!("multi-mount: {sensor_url} at {prefix}"));
         let (status_tx, status_rx) = channel::bounded(100);
         let interface = proxy::Connection::open_with(
-            sensor_url,
+            &shared_endpoint(sensor_url, &emitter),
             Some(CONNECTION_STARTUP_TIMEOUT),
             Some(status_tx),
         );
@@ -3745,11 +3766,8 @@ fn run_session(
     let (proxy_status_tx, proxy_status_rx) = channel::unbounded();
     let (status_tx, mut status_rx) = channel::unbounded();
     spawn_proxy_status_forwarder(url.clone(), proxy_status_rx, status_tx, emitter.clone());
-    // Open the transport directly rather than through `Connection::open_with`,
-    // which shares serial devices by launching a background `tio` holder. The
-    // app is sandboxed (and iOS cannot spawn processes), so it owns the port.
     let connection = Connection::over(&proxy::Connection::open_with(
-        &connect_url,
+        &shared_endpoint(&connect_url, &emitter),
         Some(CONNECTION_STARTUP_TIMEOUT),
         Some(proxy_status_tx),
     ));
