@@ -262,6 +262,8 @@ struct PlotCanvas: View {
     var showsXAxisLabels = true
     var topPlotInset: CGFloat = 0
     var rightAxisReservationCount = 0
+    /// The parts of the canvas the host's chrome covers, such as a sidebar the
+    /// plot runs under. The legend and the empty-plot message stay clear of them.
     var legendSafeAreaInsets = EdgeInsets()
     var onPlotWidthChange: (Double) -> Void = { _ in }
     var onCursorSelectionChange: (CursorSelection?) -> Void = { _ in }
@@ -334,6 +336,14 @@ struct PlotCanvas: View {
 
                 plotLayers(size: geometry.size, rect: rect, plan: plan, axisDescriptor: axisDescriptor)
                 .frame(width: geometry.size.width, height: geometry.size.height)
+                .overlay {
+                    if !axisDescriptor.hasData {
+                        emptyPlotMessage
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .padding(emptyPlotMessageInsets(size: geometry.size, rect: rect))
+                            .allowsHitTesting(false)
+                    }
+                }
                 .overlay {
                     // Cursor draws in its own light Canvas. Its body re-runs
                     // on hover, but it only renders a few line+circle paths
@@ -815,6 +825,25 @@ struct PlotCanvas: View {
         }
     }
 
+    private var emptyPlotMessage: some View {
+        Text("Select one or more streams")
+            .font(.title3)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+    }
+
+    // Centers the empty-plot message in the part of the plot frame left in
+    // view. A host that runs the plot under a sidebar reports the sidebar in
+    // `legendSafeAreaInsets`, so the message centers beside it, not behind it.
+    private func emptyPlotMessageInsets(size: CGSize, rect: CGRect) -> EdgeInsets {
+        EdgeInsets(
+            top: max(0, rect.minY),
+            leading: max(0, rect.minX, legendSafeAreaInsets.leading),
+            bottom: max(0, size.height - rect.maxY),
+            trailing: max(0, size.width - rect.maxX, legendSafeAreaInsets.trailing)
+        )
+    }
+
     // The legend hangs off the plot frame's leading edge, so it may run right
     // up to the frame's trailing edge before its labels have to truncate.
     private func legendMaxWidth(rect: CGRect) -> CGFloat {
@@ -1265,10 +1294,8 @@ private struct PlotAxesLayer: View, Equatable {
     private func drawAll(context: inout GraphicsContext, size: CGSize) {
         drawGrid(context: &context)
 
-        guard descriptor.hasData else {
-            drawEmpty(context: &context)
-            return
-        }
+        // With no data, PlotCanvas overlays its empty-plot message.
+        guard descriptor.hasData else { return }
 
         drawAxisLabels(context: &context, size: size)
         drawIndependentAxes(context: &context, size: size)
@@ -1444,14 +1471,6 @@ private struct PlotAxesLayer: View, Equatable {
                 anchor: .leading
             )
         }
-    }
-
-    private func drawEmpty(context: inout GraphicsContext) {
-        let rect = plotRect
-        let text = Text("Select one or more streams")
-            .font(.title3)
-            .foregroundStyle(.secondary)
-        context.draw(text, at: CGPoint(x: rect.midX, y: rect.midY), anchor: .center)
     }
 }
 
