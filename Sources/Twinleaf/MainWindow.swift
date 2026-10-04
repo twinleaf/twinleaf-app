@@ -86,6 +86,16 @@ struct DocumentWindow: View {
     /// The sidebar's "View Graph" row flips this to `.detail` to surface the plot.
     @State private var preferredCompactColumn: NavigationSplitViewColumn = .sidebar
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    /// Which pane the log/terminal inspector last showed.
+    @State private var inspectorShowsTerminal = false
+    /// Whether the log/terminal pane is up, as an inspector column in regular
+    /// width or a sheet in compact. Stored rather than derived from the pane
+    /// flags: handed a computed binding, the inspector re-syncs it on every
+    /// update and layout never settles.
+    @State private var trailingPaneInspectorPresented = false
+    @State private var trailingPaneSheetPresented = false
+    /// False while a width change settles; see `trailingPaneHandoff()`.
+    @State private var isTrailingPaneSettled = false
     #endif
     @State private var rpcSearchFocusRequest = 0
     @State private var verticalAxisModes: [Int: VerticalAxisMode] = [:]
@@ -387,6 +397,38 @@ struct DocumentWindow: View {
         } detail: {
             detailContent
         }
+        // Collapsed, the split view gives the sidebar the document's back
+        // button and title menu. Expanded again, it hands them back to the
+        // detail but leaves the sidebar's in place, so two back buttons show
+        // (iOS 27). A fresh split view for each width class gets them right.
+        .id(horizontalSizeClass)
+        // The inspector has to sit on the detail column; the rest hangs off
+        // the split view from outside its identity, which stays put when a
+        // narrowing collapses it onto the sidebar. The detail column leaves
+        // the hierarchy then, which would cancel a handoff hosted there and
+        // strand a sheet it presented.
+        .sheet(isPresented: $trailingPaneSheetPresented) {
+            trailingPaneInspector
+        }
+        .onChange(of: effectiveShowLogPanel || effectiveShowTerminalPanel, initial: true) {
+            syncTrailingPanePresentation()
+        }
+        .task(id: horizontalSizeClass) { await trailingPaneHandoff() }
+        .onChange(of: trailingPaneSheetPresented) { _, isPresented in
+            // The sheet swiped away. The column has no way to close but
+            // the toolbar toggles; what it writes back is its own doing
+            // while the window resizes, before the width class changes.
+            guard !isPresented, isTrailingPaneSettled, horizontalSizeClass == .compact,
+                  !distractionFree else { return }
+            if showLogPanel { showLogPanel = false }
+            if showTerminalPanel { showTerminalPanel = false }
+        }
+        .onChange(of: effectiveShowLogPanel, initial: true) { _, isShown in
+            if isShown { inspectorShowsTerminal = false }
+        }
+        .onChange(of: effectiveShowTerminalPanel, initial: true) { _, isShown in
+            if isShown { inspectorShowsTerminal = true }
+        }
         #else
         NavigationSplitView(columnVisibility: streamColumnVisibility) {
             streamSidebarContent()
@@ -503,13 +545,18 @@ struct DocumentWindow: View {
     @ViewBuilder
     private var detailContent: some View {
 #if os(iOS)
+        // Returning to Streams is left to the system: the sidebar toggle in
+        // regular width, the collapsed split view's back button in compact.
         detailPane
+            .inspector(isPresented: $trailingPaneInspectorPresented) {
+                trailingPaneInspector
+            }
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                iosCompactSidebarToggle
                 iosDocumentToolbar
                 windowToolbar
+                iosStatusToolbar
             }
 #else
         detailPane
@@ -518,21 +565,97 @@ struct DocumentWindow: View {
     }
 
 #if os(iOS)
-    /// Explicit "back to sidebar" affordance on iPhone compact. Bound directly
-    /// to `preferredCompactColumn` so it works the same direction as the
-    /// sidebar's "View Graph" row (which goes the other way). The system back
-    /// button is unreliable here — NavigationSplitView's `preferredCompactColumn`
-    /// binding doesn't always synthesize one, and any toolbar item we place in
-    /// `.topBarLeading` ends up next to it anyway.
+    /// On iOS the log and terminal panes live in a native inspector in
+    /// regular width, and in a sheet in compact.
+    /// The inspector would become a sheet by itself there, but on iOS 27 that
+    /// sheet sometimes fails to present, and never comes back after a swipe
+    /// dismisses it. The two panes are alternates, so one presentation hosts
+    /// whichever is selected and the toolbar toggles switch between them.
+    private func syncTrailingPanePresentation() {
+        guard isTrailingPaneSettled else { return }
+        let isShown = effectiveShowLogPanel || effectiveShowTerminalPanel
+        let isCompact = horizontalSizeClass == .compact
+        if trailingPaneInspectorPresented != (isShown && !isCompact) {
+            trailingPaneInspectorPresented = isShown && !isCompact
+        }
+        if trailingPaneSheetPresented != (isShown && isCompact) {
+            trailingPaneSheetPresented = isShown && isCompact
+        }
+    }
+
+    /// Moves the pane between column and sheet when the width class changes,
+    /// as when an iPhone folds or unfolds. Swapping one for the other while
+    /// the window is still resizing is a race: the retired one reports its
+    /// dismissal late and the new one can fail to come up, either of which
+    /// leaves the pane closed. So the old one comes down first, the change
+    /// settles, and only then does the new one go up.
+    private func trailingPaneHandoff() async {
+        if isTrailingPaneSettled {
+            isTrailingPaneSettled = false
+            trailingPaneInspectorPresented = false
+            trailingPaneSheetPresented = false
+            try? await Task.sleep(for: .milliseconds(700))
+            // A newer change restarted the handoff.
+            guard !Task.isCancelled else { return }
+        }
+        isTrailingPaneSettled = true
+        syncTrailingPanePresentation()
+    }
+
+    /// Keeps the last shown pane while the inspector animates closed.
+    private var trailingPaneInspectorShowsTerminal: Bool {
+        effectiveShowTerminalPanel || (!effectiveShowLogPanel && inspectorShowsTerminal)
+    }
+
+    private var trailingPaneInspector: some View {
+        Group {
+            if trailingPaneInspectorShowsTerminal {
+                RpcTerminalPane(bridge: bridge, terminal: bridge.terminal)
+            } else {
+                LogSidebar(bridge: bridge)
+            }
+        }
+        .inspectorColumnWidth(
+            min: CGFloat(SidebarLayout.rpcWidthRange.lowerBound),
+            ideal: CGFloat(clampedRPCPanelWidth),
+            max: CGFloat(SidebarLayout.rpcWidthRange.upperBound)
+        )
+        // The sheet's medium detent keeps the top of the plot in view and
+        // live behind it.
+        .presentationDetents([.medium, .large])
+        .presentationBackgroundInteraction(.enabled(upThrough: .medium))
+    }
+
+    /// The status bar rides in the bottom toolbar on iOS.
     @ToolbarContentBuilder
-    private var iosCompactSidebarToggle: some ToolbarContent {
-        ToolbarItem(placement: .topBarLeading) {
-            CompactSidebarToggleButton(preferredCompactColumn: $preferredCompactColumn)
+    private var iosStatusToolbar: some ToolbarContent {
+        if effectiveShowStatusBar {
+            ToolbarItem(placement: .status) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) {
+                        statusBarDetails(isCompact: false)
+                        statusBarActivity(isCompact: false)
+                    }
+                    HStack(spacing: 12) {
+                        statusBarDetails(isCompact: true)
+                        statusBarActivity(isCompact: true)
+                    }
+                }
+            }
         }
     }
 #endif
 
     private var detailPane: some View {
+#if os(iOS)
+        plotArea
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onGeometryChange(for: CGSize.self) { proxy in
+                proxy.size
+            } action: { size in
+                plotAreaSize = size
+            }
+#else
         VStack(spacing: 0) {
             // The trailing panes push the plot aside rather than covering it,
             // so the newest samples at the right edge stay visible.
@@ -561,13 +684,12 @@ struct DocumentWindow: View {
                 statusBar
             }
         }
-        #if os(macOS)
         // The 700×640 floor keeps the plot area usable on macOS where the user
         // can resize the window arbitrarily. On iOS the screen IS the minimum
         // — forcing a 700pt floor would push the plot off the right edge of
         // every iPhone in portrait. Let the view shrink to the available size.
         .frame(minWidth: SidebarLayout.detailMinimumWidth, minHeight: 640)
-        #endif
+#endif
     }
 
     private var devicePickerOverlay: some View {
@@ -872,6 +994,11 @@ struct DocumentWindow: View {
     }
 
     private func updateStreamSidebarWidth(_ width: CGFloat?) {
+        #if os(iOS)
+        // Collapsed, the sidebar fills the window, which says nothing about
+        // the column's width.
+        guard horizontalSizeClass != .compact else { return }
+        #endif
         guard effectiveShowStreamSidebar,
               let width,
               width.isFinite,
@@ -1810,9 +1937,20 @@ struct DocumentWindow: View {
             && (!bridge.availableUpgrades.isEmpty || bridge.upgradeProgress != nil)
     }
 
+    /// iOS names the trailing bar explicitly (where `.automatic` already put
+    /// these items) so the system can carry them into iPhone's vertical bar;
+    /// macOS keeps `.automatic`.
+    private var windowToolbarPlacement: ToolbarItemPlacement {
+#if os(iOS)
+        .topBarTrailing
+#else
+        .automatic
+#endif
+    }
+
     @ToolbarContentBuilder
     private var windowToolbar: some ToolbarContent {
-        ToolbarItemGroup(placement: .automatic) {
+        ToolbarItemGroup(placement: windowToolbarPlacement) {
             if showUpgradeToolbarButton {
                 Button {
                     showingUpgradePopover = true
@@ -1899,7 +2037,7 @@ struct DocumentWindow: View {
             .help("Show settings")
         }
 
-        ToolbarItemGroup(placement: .automatic) {
+        ToolbarItemGroup(placement: windowToolbarPlacement) {
             Toggle(isOn: logInspectorSelectionBinding) {
                 Label("Log", systemImage: "text.alignleft")
             }
@@ -1972,6 +2110,21 @@ struct DocumentWindow: View {
 
     private var statusBar: some View {
         HStack(spacing: 12) {
+            statusBarDetails(isCompact: false)
+            Spacer()
+            statusBarActivity(isCompact: false)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 5)
+        .background(.bar)
+    }
+
+    /// Leading status items. The compact form (narrow iOS bottom bars) drops
+    /// the document name, which the document menu already shows, and the
+    /// less-used provenance details.
+    @ViewBuilder
+    private func statusBarDetails(isCompact: Bool) -> some View {
+        if !isCompact {
             Text(fileURL?.lastPathComponent ?? "Untitled .tio")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1985,46 +2138,47 @@ struct DocumentWindow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Label(formatFileSize(bridge.logBytes), systemImage: "internaldrive")
+        }
+        Label(formatFileSize(bridge.logBytes), systemImage: "internaldrive")
+            .font(.caption)
+            .foregroundStyle(shouldShowSmoke ? .orange : .secondary)
+            .help("Current .tio log size")
+        if let elapsedSeconds = bridge.logElapsedSeconds {
+            Label(formatPlaybackTime(elapsedSeconds), systemImage: "timer")
                 .font(.caption)
-                .foregroundStyle(shouldShowSmoke ? .orange : .secondary)
-                .help("Current .tio log size")
-            if let elapsedSeconds = bridge.logElapsedSeconds {
-                Label(formatPlaybackTime(elapsedSeconds), systemImage: "timer")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .help("Elapsed time covered by the logged data")
-            }
-            if let startSeconds = bridge.logTimeReferenceStartSeconds {
-                Label(formatRecordingStartDate(startSeconds), systemImage: "calendar")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .help("Time reference at the beginning of the logged data")
-            }
-            Text(bridge.status)
+                .foregroundStyle(.secondary)
+                .help("Elapsed time covered by the logged data")
+        }
+        if !isCompact, let startSeconds = bridge.logTimeReferenceStartSeconds {
+            Label(formatRecordingStartDate(startSeconds), systemImage: "calendar")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help("Time reference at the beginning of the logged data")
+        }
+        Text(bridge.status)
+            .font(.caption)
+            .lineLimit(1)
+            .foregroundStyle(bridge.statusState == "error" ? .red : .secondary)
+            .help("Connection status")
+    }
+
+    /// Trailing status items; the compact form drops the latest log message.
+    @ViewBuilder
+    private func statusBarActivity(isCompact: Bool) -> some View {
+        if bridge.isPlotPaused {
+            Label("Paused", systemImage: "pause.fill")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        if !isCompact, let latestLogMessage = bridge.latestLogMessage {
+            Text("\(latestLogMessage.route) \(latestLogMessage.message)")
                 .font(.caption)
                 .lineLimit(1)
-                .foregroundStyle(bridge.statusState == "error" ? .red : .secondary)
-                .help("Connection status")
-            Spacer()
-            if bridge.isPlotPaused {
-                Label("Paused", systemImage: "pause.fill")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            if let latestLogMessage = bridge.latestLogMessage {
-                Text("\(latestLogMessage.route) \(latestLogMessage.message)")
-                    .font(.caption)
-                    .lineLimit(1)
-                    .truncationMode(.head)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: 360, alignment: .trailing)
-                    .help(logMessageHelp(latestLogMessage))
-            }
+                .truncationMode(.head)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: 360, alignment: .trailing)
+                .help(logMessageHelp(latestLogMessage))
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 5)
-        .background(.bar)
     }
 }
 
@@ -2702,26 +2856,6 @@ private struct SizeClassAwareBackButtonHidden: ViewModifier {
 
     func body(content: Content) -> some View {
         content.navigationBarBackButtonHidden(horizontalSizeClass == .regular)
-    }
-}
-
-/// Toolbar leading-edge button on iPhone compact that switches
-/// `NavigationSplitView` back to the sidebar column. Renders empty on regular
-/// size classes (iPad) where both columns are already visible.
-private struct CompactSidebarToggleButton: View {
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    var preferredCompactColumn: Binding<NavigationSplitViewColumn>
-
-    var body: some View {
-        if horizontalSizeClass == .compact {
-            Button {
-                preferredCompactColumn.wrappedValue = .sidebar
-            } label: {
-                Label("Streams", systemImage: "sidebar.left")
-            }
-            .accessibilityLabel("Back to streams")
-            .help("Back to streams")
-        }
     }
 }
 #endif
