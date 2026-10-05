@@ -12,8 +12,8 @@
 # Both app jobs go through xcodebuild — the same path as Xcode's Build & Run
 # and `make` — so there is no separate (SwiftPM) build to drift out of sync.
 #
-# macos-26 runners provide Xcode 26 / Swift 6.2, matching the project's
-# macOS 26 / iOS 26 deployment targets.
+# xcode-27 runners with Xcode 27.1 (Swift 6.4), the Xcode the app is
+# developed on; the deployment targets stay macOS 26 / iOS 26.
 
 name: CI
 
@@ -27,10 +27,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The xcode-27 image defaults to Xcode 27.0. Build with 27.1, the Xcode the
+# app is developed on, so CI compiles against the same SDKs.
+env:
+  DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+
 jobs:
   rust:
     name: Rust core (build + test)
-    runs-on: macos-26
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v7
         with:
@@ -46,7 +51,7 @@ jobs:
 
   macos-app:
     name: macOS app (xcodebuild)
-    runs-on: macos-26
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v7
         with:
@@ -67,7 +72,7 @@ jobs:
 
   ios-app:
     name: iPadOS app (xcodebuild)
-    runs-on: macos-26
+    runs-on: xcode-27
     steps:
       - uses: actions/checkout@v7
         with:
