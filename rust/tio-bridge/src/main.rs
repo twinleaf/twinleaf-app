@@ -2860,7 +2860,6 @@ fn local_proxy_row() -> AvailableDevice {
 fn discovery_config(include_all: bool) -> DiscoveryConfig {
     DiscoveryConfig {
         include_unknown: include_all,
-        probe_unknown: include_all,
         network: true,
         probe_names: true,
         prefer_udp: false,
