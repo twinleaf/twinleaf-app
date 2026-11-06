@@ -8375,6 +8375,13 @@ private struct RPCSliderTray: View {
     @Binding var sliders: [RPCSliderConfiguration]
     let onOpenSliderWindow: ((RPCSliderConfiguration) -> Void)?
     let focusedField: FocusState<RpcFocusField?>.Binding
+    /// Where the tray meets the rounded corners of what holds it: along the
+    /// bottom of the window it runs into the display's corners on iPhone and
+    /// the window's on Mac and iPad.
+    @State private var cornerInsets = RectangleCornerInsets()
+
+    private static let horizontalPadding: CGFloat = 12
+    private static let verticalPadding: CGFloat = 8
 
     var body: some View {
         VStack(spacing: 6) {
@@ -8390,10 +8397,25 @@ private struct RPCSliderTray: View {
                 )
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.leading, Self.horizontalInset(clearing: cornerInsets.bottomLeading))
+        .padding(.trailing, Self.horizontalInset(clearing: cornerInsets.bottomTrailing))
+        .padding(.vertical, Self.verticalPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.bar)
+        .onGeometryChange(for: RectangleCornerInsets.self) { proxy in
+            proxy.containerCornerInsets
+        } action: { insets in
+            cornerInsets = insets
+        }
+    }
+
+    /// The rows sit `verticalPadding` above the tray's bottom edge, so they
+    /// clear a corner unless they would fall inside it on both axes; then they
+    /// move in past it.
+    private static func horizontalInset(clearing corner: CGSize) -> CGFloat {
+        corner.width > horizontalPadding && corner.height > verticalPadding
+            ? corner.width
+            : horizontalPadding
     }
 
     private func removeSlider(id: String) {
