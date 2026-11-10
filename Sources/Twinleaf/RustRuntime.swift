@@ -197,11 +197,37 @@ private let twinleafRustEventCallback: RustEventCallback = { kind, bytes, count,
     }
 }
 
+/// What a runtime's teardown needs once the runtime object is gone. It crosses to
+/// the teardown queue by value. The pointers are used only there, and only once.
+private struct RustRuntimeTeardown: @unchecked Sendable {
+    let runtime: OpaquePointer?
+    let destroy: RuntimeDestroyFn
+    let library: UnsafeMutableRawPointer?
+
+    func run() {
+        if let runtime {
+            destroy(runtime)
+        }
+        if let library {
+            dlclose(library)
+        }
+    }
+}
+
 final class RustRuntime {
     private let library: UnsafeMutableRawPointer?
     private let callbackBox: RustRuntimeCallbackBox
     private var runtime: OpaquePointer?
-    private var didCloseLibrary = false
+
+    /// Teardown joins the runtime's thread, and the last runtime also stops the
+    /// app's proxy and waits for it to release the devices. Both wait, so they
+    /// run here rather than on the main thread, which is user-interactive. The
+    /// queue runs at default QoS, the runtime threads' own level, so no waiter
+    /// outranks the thread it waits on. It is serial, so teardowns run in order.
+    private static let teardownQueue = DispatchQueue(
+        label: "com.twinleaf.rust-runtime.teardown",
+        qos: .default
+    )
 
     private let destroyFn: RuntimeDestroyFn
     private let setDiscoveryFn: RuntimeSetDiscoveryFn
@@ -276,17 +302,13 @@ final class RustRuntime {
     }
 
     deinit {
-        shutdown()
-    }
-
-    func shutdown() {
-        if let runtime {
-            destroyFn(runtime)
-            self.runtime = nil
-        }
-        if let library, !didCloseLibrary {
-            dlclose(library)
-            didCloseLibrary = true
+        let teardown = RustRuntimeTeardown(
+            runtime: runtime,
+            destroy: destroyFn,
+            library: library
+        )
+        Self.teardownQueue.async {
+            teardown.run()
         }
     }
 
