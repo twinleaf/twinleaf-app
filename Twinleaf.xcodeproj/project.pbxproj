@@ -556,12 +556,16 @@
 					"-ltwinleaf_core",
 					"-framework",
 					IOKit,
+					"-framework",
+					Security,
 				);
 				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
 					"$(inherited)",
 					"-ltwinleaf_core",
 					"-framework",
 					IOKit,
+					"-framework",
+					Security,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.twinleaf.Twinleaf;
 				PRODUCT_NAME = Twinleaf;
@@ -625,12 +629,16 @@
 					"-ltwinleaf_core",
 					"-framework",
 					IOKit,
+					"-framework",
+					Security,
 				);
 				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
 					"$(inherited)",
 					"-ltwinleaf_core",
 					"-framework",
 					IOKit,
+					"-framework",
+					Security,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.twinleaf.Twinleaf;
 				PRODUCT_NAME = Twinleaf;
