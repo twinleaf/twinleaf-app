@@ -55,8 +55,8 @@ the last three rows especially.
 | `SampleBatch` | `twinleaf/src/data/sample.rs` | Columnar, timestamped, generation-stamped, with per-column metadata. The source-node input and the sink-node output. |
 | `BatchCoalescer` | `twinleaf/src/data/coalesce.rs` | Already merges small live batches into larger chunks — the amortization the parallel scheduler needs in front of it (§8). |
 | `ColumnFilter` | `twinleaf/src/data/filter.rs` | Already defines the `/{route}/{stream}/{column}` path grammar, where naming a stream selects every column under it. The DSL adopts it verbatim, and `/255/**` addresses graph output for free. |
-| `WelchOp` | `twinleaf-tools/src/tui/spectral.rs` | A working `ColumnOp` for Welch ASD. Moving it into `tio-dsp` also drops the bridge's `twinleaf-tools` dependency, which today exists only for this one type. |
-| **Multi-sensor mount** | `tio-bridge/src/main.rs:3108` | Binds a loopback TCP port and serves several sensors as one device tree, sensor *k* at `/k`. `tiodsp` **is** this, extended. See §2. |
+| `Welch` | `twinleaf/src/data/ops/welch.rs` | A working `ColumnOp` for Welch ASD, now in the twinleaf 2.0 library. The bridge uses it directly, so `twinleaf-tools` is no longer a bridge dependency. |
+| **Multi-sensor mount** | `twinleaf/src/proxy/mod.rs` (`Layout`) | The 2.0 proxy mounts several sensors as one device tree, sensor *k* at `/k`, and the bridge opens a `Layout` for it. `tiodsp` **is** this, extended. See §2. |
 | **RPC slider convention** | `Sources/Twinleaf/MainWindow.swift:1097` | The slider tray already looks for a sibling `<name>.max` RPC and computes a default when there is none. A DSP device exposing `dsp.line` and `dsp.line.max` gets a working slider with no app change. |
 | **Chunked RPC transfer** | `twinleaf/src/firmware/mod.rs:22` | Firmware upload already moves bulk data through RPCs in 288-byte chunks with an offset/size/crc envelope and two in flight. `dsp.spec` follows the same shape (§10). |
 
@@ -920,10 +920,9 @@ every language addition touches lexer, CST, AST and the editor's span logic. It
 is the right call — the round trip requires it, and no crate gives it for free at
 this scale — but budget it as ongoing rather than one-time.
 
-### A dependency win worth taking in M7
+### A dependency win, taken with the 2.0 port
 
-The bridge depends on `twinleaf-tools` solely for `WelchOp`, and that pulls the
-tools' entire CLI and TUI dependency stack (ratatui, clap, indicatif, dialoguer)
-into the app build. Moving spectral code into `tio-dsp` removes it. Adding
-embedded Typst in M6 gives some of that budget back, so the two are worth landing
-near each other.
+The bridge used to depend on `twinleaf-tools` solely for `WelchOp`, which pulled
+the tools' entire CLI and TUI dependency stack (ratatui, clap, indicatif,
+dialoguer) into the app build. The twinleaf 2.0 library now ships that spectral
+code behind its `processing` feature, so the bridge depends on the library alone.
