@@ -13,6 +13,48 @@ mod direct {
         thread: Option<thread::JoinHandle<()>>,
     }
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use twinleaf::proxy::{HostOptions, Proxy};
+
+    /// The proxy this app hosts itself, shared by every runtime in the process.
+    /// If the library embedded one instead, it would outlive every window and
+    /// keep the proxy port and the serial ports held after the last window closed.
+    static APP_PROXY: Mutex<Option<Proxy>> = Mutex::new(None);
+    /// Runtimes alive in this process. The app's proxy stops with the last one.
+    static LIVE_RUNTIMES: AtomicUsize = AtomicUsize::new(0);
+
+    /// Hosts the app's proxy on the default port, unless a proxy already serves
+    /// the machine. Connections then go through that proxy.
+    fn host_app_proxy() {
+        let mut hosted = APP_PROXY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if hosted.is_some() {
+            return;
+        }
+        let options = HostOptions {
+            name: "Twinleaf (embedded)".to_string(),
+            ..HostOptions::default()
+        };
+        match Proxy::host(options) {
+            Ok(proxy) => *hosted = Some(proxy),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(error) => log::warn!("the app could not host its proxy: {error}"),
+        }
+    }
+
+    /// Stops the app's proxy, if this process hosts one, and waits until it has
+    /// released its devices.
+    fn stop_app_proxy() {
+        let mut hosted = APP_PROXY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Dropping a proxy stops it and waits for it, so no device is still held
+        // when the caller goes on. The lock is held throughout, so a runtime that
+        // hosts a proxy meanwhile waits for this stop to finish.
+        drop(hosted.take());
+    }
+
     #[repr(C)]
     pub struct FfiRpcArg {
         tag: u8,
@@ -36,12 +78,17 @@ mod direct {
         install_bridge_logger(&emitter);
         emitter.status("ready", "Twinleaf Rust core ready");
 
-        let (command_tx, command_rx) = channel::unbounded::<ClientCommand>();
+        let (command_tx, command_rx) = flume::unbounded::<ClientCommand>();
         let runtime_emitter = emitter.clone();
+        // The runtime thread hosts the app's proxy before it takes its first
+        // command, so `create` returns at once: hosting waits for the proxy to
+        // accept clients, which the caller, often the main thread, must not do.
         let thread = match thread::Builder::new()
             .name("twinleaf-runtime".into())
-            .spawn(move || run_direct_runtime(command_rx, runtime_emitter))
-        {
+            .spawn(move || {
+                host_app_proxy();
+                run_direct_runtime(command_rx, runtime_emitter)
+            }) {
             Ok(thread) => thread,
             Err(err) => {
                 emitter.error(format!("Failed to start Twinleaf runtime thread: {err}"));
@@ -49,6 +96,7 @@ mod direct {
             }
         };
 
+        LIVE_RUNTIMES.fetch_add(1, Ordering::SeqCst);
         Box::into_raw(Box::new(TwinleafRuntime {
             command_tx,
             thread: Some(thread),
@@ -65,6 +113,9 @@ mod direct {
         let _ = runtime.command_tx.send(ClientCommand::Shutdown);
         if let Some(thread) = runtime.thread.take() {
             let _ = thread.join();
+        }
+        if LIVE_RUNTIMES.fetch_sub(1, Ordering::SeqCst) == 1 {
+            stop_app_proxy();
         }
     }
 
@@ -310,7 +361,7 @@ mod direct {
                     emitter.debug(format!("direct connect command received for {url}"));
                     stop_direct_session(&mut session);
                     playback = None;
-                    let (tx, rx) = channel::unbounded();
+                    let (tx, rx) = flume::unbounded();
                     let session_emitter = emitter.clone();
                     let handle = match thread::Builder::new()
                         .name("twinleaf-session".into())
@@ -590,6 +641,46 @@ mod direct {
         match value {
             1 => ExportFormat::Hdf5,
             _ => ExportFormat::Csv,
+        }
+    }
+}
+
+#[cfg(test)]
+mod app_proxy_tests {
+    use super::direct::{twinleaf_runtime_create, twinleaf_runtime_destroy};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    extern "C" fn ignore(_kind: u32, _data: *const u8, _len: usize, _context: usize) {}
+
+    fn answers() -> bool {
+        let addr: SocketAddr = "127.0.0.1:7855".parse().unwrap();
+        TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+    }
+
+    #[test]
+    fn the_app_proxy_runs_while_a_runtime_lives_and_stops_with_the_last() {
+        if answers() {
+            eprintln!("skipped: another proxy already serves 127.0.0.1:7855");
+            return;
+        }
+        unsafe {
+            let first = twinleaf_runtime_create(Some(ignore), 0);
+            let second = twinleaf_runtime_create(Some(ignore), 0);
+            assert!(!first.is_null() && !second.is_null());
+            // Hosting happens on the runtime thread, so `create` returns first.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !answers() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                answers(),
+                "the app should host its proxy while runtimes live"
+            );
+            twinleaf_runtime_destroy(first);
+            assert!(answers(), "a live runtime keeps the proxy running");
+            twinleaf_runtime_destroy(second);
+            assert!(!answers(), "the proxy stops with the last runtime");
         }
     }
 }

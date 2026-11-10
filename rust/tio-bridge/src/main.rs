@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crossbeam::channel::{self, Receiver, Sender};
+use flume::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -13,9 +13,9 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use twinleaf::data::ColumnOp;
+use twinleaf::data::ops::Welch;
 use twinleaf::data::{
-    BoundaryReason, ColumnArray, DataType, DeviceMetadataSnapshot, LogFile, PacketParser,
+    Change, ColumnArray, ColumnOp, DataType, DeviceMetadataSnapshot, LogFile, PacketParser,
     SampleBatch,
 };
 use twinleaf::device::capture::{read_capture, CaptureReadout};
@@ -24,16 +24,15 @@ use twinleaf::device::rpc::{
     CallError, RpcDescriptor, RpcMetaExt, RpcMetaFlags, RpcRegistryError, RpcValue, RpcValueType,
     RpcValueTypeExt,
 };
-use twinleaf::device::{Connection, Device, DeviceEvent, Event, NamedRoute, RecvError, TreeEvent};
+use twinleaf::device::{Connection, Device, NamedRoute, Presence, RecvError, SettingChange};
 #[cfg(feature = "firmware")]
 use twinleaf::firmware::{self, FirmwareCatalog, FlashEvent, StopOutcome, UpdateStatus};
 use twinleaf::proto::rpc::RpcError;
 use twinleaf::proto::sync::Epoch;
 use twinleaf::proto::DeviceRoute;
+use twinleaf::proxy::{Layout, Mount};
 use twinleaf::tio;
-use twinleaf::tio::packet::Payload;
-use twinleaf::tio::proxy;
-use twinleaf_tools::tui::spectral::WelchOp;
+use twinleaf::tio::packet::{LinkStatus, Payload, ProxyRx};
 
 const EVENT_JSON: u32 = 0;
 const EVENT_PLOT: u32 = 1;
@@ -1553,8 +1552,8 @@ struct FftWorker {
 
 impl FftWorker {
     fn new(emitter: &Emitter) -> Self {
-        let (request_tx, request_rx) = channel::bounded::<FftRequest>(1);
-        let (result_tx, result_rx) = channel::unbounded::<FftResult>();
+        let (request_tx, request_rx) = flume::bounded::<FftRequest>(1);
+        let (result_tx, result_rx) = flume::unbounded::<FftResult>();
         let worker_emitter = emitter.clone();
 
         thread::Builder::new()
@@ -1633,10 +1632,10 @@ impl FftWorker {
                 self.in_flight = true;
                 self.last_request_at = Some(Instant::now());
             }
-            Err(channel::TrySendError::Full(_)) => {
+            Err(flume::TrySendError::Full(_)) => {
                 self.in_flight = true;
             }
-            Err(channel::TrySendError::Disconnected(_)) => {
+            Err(flume::TrySendError::Disconnected(_)) => {
                 emitter.error("FFT worker stopped unexpectedly");
             }
         }
@@ -1749,8 +1748,8 @@ struct DerivedWorker {
 
 impl DerivedWorker {
     fn new() -> Self {
-        let (request_tx, request_rx) = channel::bounded::<Vec<DerivedJob>>(1);
-        let (result_tx, result_rx) = channel::unbounded::<Vec<DerivedOutcome>>();
+        let (request_tx, request_rx) = flume::bounded::<Vec<DerivedJob>>(1);
+        let (result_tx, result_rx) = flume::unbounded::<Vec<DerivedOutcome>>();
 
         thread::Builder::new()
             .name("derived-worker".into())
@@ -1790,8 +1789,8 @@ impl DerivedWorker {
         }
         match self.request_tx.try_send(jobs) {
             Ok(()) => self.in_flight = true,
-            Err(channel::TrySendError::Full(_)) => self.in_flight = true,
-            Err(channel::TrySendError::Disconnected(_)) => {}
+            Err(flume::TrySendError::Full(_)) => self.in_flight = true,
+            Err(flume::TrySendError::Disconnected(_)) => {}
         }
     }
 }
@@ -2534,7 +2533,7 @@ fn main() {
     install_bridge_logger(&emitter);
     emitter.status("ready", "tio-bridge started");
 
-    let (command_tx, command_rx) = channel::unbounded::<ClientCommand>();
+    let (command_tx, command_rx) = flume::unbounded::<ClientCommand>();
     spawn_stdin_reader(command_tx, emitter.clone());
 
     let mut session_tx: Option<Sender<SessionCommand>> = None;
@@ -2560,7 +2559,7 @@ fn main() {
                     let _ = tx.send(SessionCommand::Stop);
                 }
                 playback = None;
-                let (tx, rx) = channel::unbounded();
+                let (tx, rx) = flume::unbounded();
                 let session_emitter = emitter.clone();
                 thread::Builder::new()
                     .name("twinleaf-session".into())
@@ -2866,6 +2865,16 @@ fn discovery_config(include_all: bool) -> DiscoveryConfig {
     }
 }
 
+/// The identity of a discovered device, so its events fold into one entry. On
+/// macOS a USB serial port is listed twice, as `/dev/cu.*` and `/dev/tty.*`, and
+/// both name the same device. A `tty` URL keys to its `cu` twin.
+fn device_key(url: &str) -> String {
+    match url.strip_prefix("serial:///dev/tty.") {
+        Some(port) => format!("serial:///dev/cu.{port}"),
+        None => url.to_string(),
+    }
+}
+
 /// Folds `DiscoveryEvent`s into the `deviceList` snapshot the UI renders. The
 /// library owns enumeration and probing (names, subdevice routes); this only
 /// maps its events onto the Swift-facing DTOs.
@@ -2889,12 +2898,24 @@ impl DiscoveryState {
         }
     }
 
+    /// The entry of the device `url` names, whichever of its URLs that is.
+    fn entry_mut(&mut self, url: &str) -> Option<&mut DiscoveredEntry> {
+        let key = device_key(url);
+        self.entries
+            .iter_mut()
+            .find(|entry| device_key(&entry.url) == key)
+    }
+
     fn apply(&mut self, event: DiscoveryEvent) {
         match event {
             DiscoveryEvent::Added(device) => {
-                if let Some(entry) = self.entries.iter_mut().find(|e| e.url == device.url) {
+                if let Some(entry) = self.entry_mut(&device.url) {
                     if device.name.is_some() {
                         entry.name = device.name;
+                    }
+                    // One URL per device, the cu twin, as the picker lists it.
+                    if device.url.starts_with("serial:///dev/cu.") {
+                        entry.url = device.url;
                     }
                 } else {
                     self.entries.push(DiscoveredEntry {
@@ -2906,12 +2927,12 @@ impl DiscoveryState {
                 }
             }
             DiscoveryEvent::Named { url, name } => {
-                if let Some(entry) = self.entries.iter_mut().find(|e| e.url == url) {
+                if let Some(entry) = self.entry_mut(&url) {
                     entry.name = Some(name);
                 }
             }
             DiscoveryEvent::Subdevices { url, routes } => {
-                if let Some(entry) = self.entries.iter_mut().find(|e| e.url == url) {
+                if let Some(entry) = self.entry_mut(&url) {
                     entry.routes = Some(
                         routes
                             .into_iter()
@@ -2923,12 +2944,15 @@ impl DiscoveryState {
                     );
                 }
             }
+            // Only the URL an entry is listed under removes it. Its other twin
+            // may still be there, and then the entry stays.
             DiscoveryEvent::Removed { url } => {
-                self.entries.retain(|e| e.url != url);
+                self.entries.retain(|entry| entry.url != url);
             }
             DiscoveryEvent::NetworkUnavailable { reason } => {
                 self.network_unavailable = Some(reason);
             }
+            _ => {}
         }
     }
 
@@ -2989,6 +3013,7 @@ fn serial_device_kind(interface: &PortInterface) -> &'static str {
         PortInterface::STM32 => "Twinleaf STM32",
         PortInterface::Unknown(_, _) => "USB serial",
         PortInterface::Network => "Network",
+        _ => "USB serial",
     }
 }
 
@@ -3007,6 +3032,7 @@ fn interface_detail(interface: &PortInterface) -> String {
         PortInterface::STM32 => "VID 0483, PID 5740".to_string(),
         PortInterface::Unknown(vid, pid) => format!("VID {vid:04x}, PID {pid:04x}"),
         PortInterface::Network => "Network".to_string(),
+        _ => "Unknown interface".to_string(),
     }
 }
 
@@ -3024,7 +3050,7 @@ impl Drop for DiscoveryHubHandle {
 }
 
 fn spawn_discovery_hub(include_all: bool, emitter: Emitter) -> DiscoveryHubHandle {
-    let (stop_tx, stop_rx) = channel::bounded(1);
+    let (stop_tx, stop_rx) = flume::bounded(1);
     thread::Builder::new()
         .name("discovery-hub".into())
         .spawn(move || {
@@ -3060,222 +3086,73 @@ fn spawn_discovery_hub(include_all: bool, emitter: Emitter) -> DiscoveryHubHandl
             sync(&state, &mut last_snapshot, &mut warned_network);
 
             loop {
-                channel::select! {
-                    recv(discovery.events()) -> event => {
-                        let Ok(event) = event else { return };
-                        state.apply(event);
-                        // Coalesce the burst a probe pass produces.
-                        for event in discovery.events().try_iter() {
-                            state.apply(event);
-                        }
-                        sync(&state, &mut last_snapshot, &mut warned_network);
-                    },
-                    recv(stop_rx) -> _ => return,
+                // `None` is a stop; a discovery event that ended ends the hub too.
+                let Some(Ok(event)) = flume::Selector::new()
+                    .recv(discovery.events(), Some)
+                    .recv(&stop_rx, |_| None)
+                    .wait()
+                else {
+                    return;
+                };
+                state.apply(event);
+                // Coalesce the burst a probe pass produces.
+                for event in discovery.events().try_iter() {
+                    state.apply(event);
                 }
+                sync(&state, &mut last_snapshot, &mut warned_network);
             }
         })
         .expect("failed to spawn discovery hub");
     DiscoveryHubHandle { stop_tx }
 }
 
-/// Where to open `url`, as the tio tools' `Connection::open` does: through the
-/// device's shared `tio proxy` holder, joining a live one at its loopback URL
-/// or starting one. When no holder can be had (iOS cannot spawn one, nor can a
-/// sandbox without `tio`), the device is opened directly.
-fn shared_endpoint(url: &str, emitter: &Emitter) -> String {
-    if cfg!(target_os = "ios") {
-        return url.to_string();
-    }
-    match twinleaf::device::runtime::resolve(url) {
-        Ok(endpoint) => {
-            if endpoint != url {
-                emitter.debug(format!("{url} is shared at {endpoint}"));
-            }
-            endpoint
-        }
-        Err(err) => {
-            emitter.debug(format!("no shared holder for {url}, opening it directly: {err}"));
-            url.to_string()
-        }
+/// The layout a multi-URL session opens: each URL mounted at /0, /1, ... so
+/// the session sees one combined device tree, exactly as it would behind a
+/// hub. The proxy does the mounting.
+fn session_layout(urls: &[String]) -> Layout {
+    Layout {
+        mounts: urls
+            .iter()
+            .enumerate()
+            .map(|(index, url)| Mount {
+                url: url.clone(),
+                source: DeviceRoute::root(),
+                prefix: DeviceRoute::from_str(&format!("/{index}"))
+                    .expect("a mount index is a valid route"),
+            })
+            .collect(),
     }
 }
 
-/// Serve several sensors as one device tree on a loopback TCP port: sensor k
-/// is mounted at route /k. The session connects to the returned URL and the
-/// combined tree behaves exactly like a hub. The mount thread runs until the
-/// session's connection closes (or any mounted sensor's proxy thread dies).
-fn start_multi_sensor_mount(urls: Vec<String>, emitter: Emitter) -> Result<String, String> {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .map_err(|err| format!("could not bind a loopback port: {err}"))?;
-    let loopback_port = listener
-        .local_addr()
-        .map_err(|err| format!("could not read the loopback address: {err}"))?
-        .port();
-
+/// Opens the session's connection on its own thread, so the session keeps
+/// taking commands while the proxy opens the device. A TCP or UDP URL, or a
+/// layout, is tried again after a failure until the startup window closes.
+fn spawn_connect(url: String, emitter: Emitter) -> flume::Receiver<std::io::Result<Connection>> {
+    let (result_tx, result_rx) = flume::bounded(1);
+    let urls: Vec<String> = url.split_whitespace().map(str::to_string).collect();
     thread::Builder::new()
-        .name("twinleaf-multi-mount".into())
-        .spawn(move || run_multi_sensor_mount(listener, urls, emitter))
-        .map_err(|err| format!("could not spawn the mount thread: {err}"))?;
-
-    Ok(format!("tcp://127.0.0.1:{loopback_port}"))
-}
-
-fn run_multi_sensor_mount(listener: std::net::TcpListener, urls: Vec<String>, emitter: Emitter) {
-    struct MountLink {
-        prefix: DeviceRoute,
-        interface: proxy::Connection,
-        status_rx: Receiver<proxy::Event>,
-    }
-
-    let mut links = Vec::with_capacity(urls.len());
-    for (index, sensor_url) in urls.iter().enumerate() {
-        let Ok(prefix) = DeviceRoute::from_str(&format!("/{index}")) else {
-            emitter.debug(format!("multi-mount: invalid route /{index}"));
-            return;
-        };
-        emitter.debug(format!("multi-mount: {sensor_url} at {prefix}"));
-        let (status_tx, status_rx) = channel::bounded(100);
-        let interface = proxy::Connection::open_with(
-            &shared_endpoint(sensor_url, &emitter),
-            Some(CONNECTION_STARTUP_TIMEOUT),
-            Some(status_tx),
-        );
-        links.push(MountLink {
-            prefix,
-            interface,
-            status_rx,
-        });
-    }
-
-    // Open each mount's port right away (before blocking on accept): a proxy
-    // connection with no ports can shut down on an early connection failure,
-    // after which opening one is refused.
-    let mut ports = Vec::with_capacity(links.len());
-    for link in &links {
-        match proxy::open_port(
-            &link.interface,
-            Some(Duration::from_millis(2000)),
-            DeviceRoute::root(),
-            usize::MAX,
-            true,
-            true,
-        ) {
-            Ok(port) => ports.push(port),
-            Err(err) => {
-                emitter.debug(format!(
-                    "multi-mount: could not open a port for {}: {err:?}",
-                    link.prefix
-                ));
-                return;
-            }
-        }
-    }
-
-    // The only client is this process's own session proxy.
-    let Ok((stream, _)) = listener.accept() else {
-        emitter.debug("multi-mount: accept failed");
-        return;
-    };
-    drop(listener);
-
-    let (rx_send, client_rx) =
-        tio::transport::Port::rx_channel_custom(proxy::client_tx_channel_size());
-    let client = match tio::transport::Port::from_tcp_stream_custom(
-        stream,
-        tio::transport::Port::rx_to_channel(rx_send),
-        proxy::client_rx_channel_size(),
-    ) {
-        Ok(client) => client,
-        Err(err) => {
-            emitter.debug(format!(
-                "multi-mount: could not wrap the session stream: {err:?}"
-            ));
-            return;
-        }
-    };
-
-    // Select slots: 0 is the session's traffic; then each link contributes
-    // its sensor packets (slot 1 + 2i) and its proxy status (slot 2 + 2i).
-    let mut sel = channel::Select::new();
-    sel.recv(&client_rx);
-    for (link, port) in links.iter().zip(&ports) {
-        sel.recv(port.receiver());
-        sel.recv(&link.status_rx);
-    }
-
-    let mut dropped_packets: u64 = 0;
-    loop {
-        let oper = sel.select();
-        let slot = oper.index();
-        if slot == 0 {
-            let Ok(Ok(pkt)) = oper.recv(&client_rx) else {
-                emitter.debug("multi-mount: session disconnected; shutting down");
-                break;
+        .name("twinleaf-connect".into())
+        .spawn(move || {
+            let deadline = Instant::now() + CONNECTION_STARTUP_TIMEOUT;
+            let retry = urls.len() > 1 || is_retryable_connect_url(&url);
+            let result = loop {
+                let attempt = if urls.len() > 1 {
+                    Connection::open_layout(&session_layout(&urls))
+                } else {
+                    Connection::open(&url)
+                };
+                match attempt {
+                    Err(err) if retry && Instant::now() < deadline => {
+                        emitter.debug(format!("retrying {url} after: {err}"));
+                        thread::sleep(Duration::from_millis(500));
+                    }
+                    other => break other,
+                }
             };
-            let mut destination = None;
-            for (link, port) in links.iter().zip(&ports) {
-                if let Ok(relative) = link.prefix.relative_route(&pkt.route()) {
-                    destination = Some((relative, port));
-                    break;
-                }
-            }
-            let Some((relative, port)) = destination else {
-                // Root-addressed heartbeats keep each sensor's link alive
-                // (devices expire clients that go quiet); broadcast them to
-                // every mount, exactly as each sensor would receive over a
-                // direct connection. Other root-addressed packets have no
-                // single destination and are dropped.
-                if pkt.route().is_empty() {
-                    if let Payload::Heartbeat(_) = pkt.payload() {
-                        for port in &ports {
-                            let _ = port.try_send(pkt.clone());
-                        }
-                    }
-                }
-                continue;
-            };
-            if port.try_send(pkt.with_route(relative)).is_err() {
-                emitter.debug("multi-mount: forwarding to a sensor failed");
-                break;
-            }
-        } else {
-            let link_index = (slot - 1) / 2;
-            let link = &links[link_index];
-            if (slot - 1) % 2 == 0 {
-                let Ok(pkt) = oper.recv(ports[link_index].receiver()) else {
-                    emitter.debug(format!("multi-mount: lost the sensor at {}", link.prefix));
-                    break;
-                };
-                let Ok(absolute) = link.prefix.absolute_route(&pkt.route()) else {
-                    continue;
-                };
-                if absolute.len() > DeviceRoute::MAX_HOPS {
-                    continue;
-                }
-                match client.try_send(pkt.with_route(absolute)) {
-                    Ok(()) => {}
-                    Err(tio::transport::SendError::Full) => {
-                        dropped_packets += 1;
-                        if dropped_packets.is_power_of_two() {
-                            emitter.debug(format!(
-                                "multi-mount: dropped {dropped_packets} packet(s); session is slow"
-                            ));
-                        }
-                    }
-                    Err(_) => {
-                        emitter.debug("multi-mount: session connection closed");
-                        break;
-                    }
-                }
-            } else {
-                let Ok(event) = oper.recv(&link.status_rx) else {
-                    emitter.debug(format!("multi-mount: proxy ended at {}", link.prefix));
-                    break;
-                };
-                emitter.debug(format!("multi-mount {}: {event:?}", link.prefix));
-            }
-        }
-    }
+            let _ = result_tx.send(result);
+        })
+        .expect("failed to spawn the connect thread");
+    result_rx
 }
 
 // MARK: - Health diagnostics
@@ -3567,24 +3444,21 @@ struct HealthMonitor {
 impl HealthMonitor {
     fn observe_batch(&mut self, batch: &SampleBatch, now: Instant) {
         let key = (batch.route(), batch.stream_key().stream_id.value());
+        let metadata = batch.metadata();
         let stats = self.streams.entry(key).or_insert_with(|| StreamHealth {
-            name: batch.stream().name.to_string(),
-            session_id: Some(batch.device().session.value()),
+            name: metadata.schema().stream().name().to_string(),
+            session_id: Some(metadata.device().session().value()),
             ..Default::default()
         });
-        stats.name = batch.stream().name.to_string();
+        stats.name = metadata.schema().stream().name().to_string();
 
         // A batch carries at most one boundary, anchored at its first row.
         if let Some(boundary) = batch.boundary() {
-            match *boundary {
-                BoundaryReason::SessionChanged { new, .. } => {
-                    stats.reset_for_new_session(new.value())
-                }
-                BoundaryReason::SamplesLost { expected, received } => {
-                    stats.samples_dropped +=
-                        u64::from(received.value().wrapping_sub(expected.value()));
-                }
-                _ => {}
+            if let Some(Change::SessionChanged { new, .. }) = &boundary.change {
+                stats.reset_for_new_session(new.value());
+            }
+            if let Some(loss) = &boundary.loss {
+                stats.samples_dropped += loss.samples;
             }
         }
 
@@ -3698,22 +3572,68 @@ fn bundle_batches(
     while bundle.len() < BATCH_BUNDLE_CAP {
         match batches.try_recv() {
             Ok(Some(batch)) => bundle.push(batch),
-            Ok(None) | Err(RecvError::Disconnected) | Err(RecvError::Timeout) => break,
+            Ok(None) | Err(RecvError::Timeout) => break,
             Err(RecvError::Lagged(skipped)) => emitter.debug(format!(
                 "session loop fell behind; {skipped} sample batch(es) dropped"
             )),
+            Err(_) => break,
         }
     }
     bundle
 }
 
-/// The `deviceEvent` text sent to the app: events keep their Debug form,
-/// while a metadata snapshot is named rather than dumped.
-fn device_event_summary(event: &DeviceEvent) -> String {
-    match event {
-        DeviceEvent::Metadata(_) => "Metadata".to_string(),
-        other => format!("{other:?}"),
+/// What woke the session loop: a command, a sample batch, a route change, a
+/// device's presence or announced setting, a finished RPC table reload, or a
+/// timer tick.
+enum Wake {
+    Command(Result<SessionCommand, flume::RecvError>),
+    Batch(Result<SampleBatch, RecvError>),
+    Routes(Result<Vec<DeviceRoute>, RecvError>),
+    Presence(DeviceRoute, Result<Presence, RecvError>),
+    Setting(DeviceRoute, Result<SettingChange, RecvError>),
+    Reloaded(Result<(DeviceRoute, RpcFetchResult), flume::RecvError>),
+    Tick,
+    PlotTick,
+}
+
+/// One device's live subscriptions: its presence, where a reconnect shows, and
+/// the settings it announces, where a changed `rpc.hash` names a table to
+/// reload.
+struct DeviceFeed {
+    route: DeviceRoute,
+    presence: twinleaf::device::Receiver<Presence>,
+    settings: twinleaf::device::Receiver<SettingChange>,
+    /// The last presence heard, or `None` before the first.
+    last_presence: Option<Presence>,
+}
+
+impl DeviceFeed {
+    fn open(connection: &Connection, route: DeviceRoute) -> Self {
+        let device = connection.device(route);
+        Self {
+            route,
+            presence: device.presence_updates(),
+            settings: device.setting_changes(),
+            last_presence: None,
+        }
     }
+}
+
+/// A receiver that yields the time once per `period`. A tick the loop has not
+/// taken yet is dropped, as a timer channel drops it.
+fn ticker(period: Duration) -> flume::Receiver<Instant> {
+    let (tick_tx, tick_rx) = flume::bounded(1);
+    thread::Builder::new()
+        .name("twinleaf-ticker".into())
+        .spawn(move || loop {
+            thread::sleep(period);
+            match tick_tx.try_send(Instant::now()) {
+                Ok(()) | Err(flume::TrySendError::Full(_)) => {}
+                Err(flume::TrySendError::Disconnected(_)) => break,
+            }
+        })
+        .expect("failed to spawn the ticker");
+    tick_rx
 }
 
 fn run_session(
@@ -3747,44 +3667,21 @@ fn run_session(
     emitter.status("connecting", format!("Connecting to {url}"));
     emitter.debug(format!("session starting: url={url}, route={root_route}"));
 
-    // Multiple whitespace-separated URLs are mounted at /0, /1, ... behind an
-    // in-process loopback proxy, so the rest of the session sees one combined
-    // device tree exactly as it would behind a hub.
-    let sensor_urls: Vec<String> = url.split_whitespace().map(str::to_string).collect();
-    let connect_url = if sensor_urls.len() > 1 {
-        match start_multi_sensor_mount(sensor_urls, emitter.clone()) {
-            Ok(loopback_url) => loopback_url,
-            Err(err) => {
-                emitter.error(format!("Could not start the multi-sensor mount: {err}"));
-                return;
-            }
-        }
-    } else {
-        url.clone()
-    };
-
-    let (proxy_status_tx, proxy_status_rx) = channel::unbounded();
-    let (status_tx, mut status_rx) = channel::unbounded();
-    spawn_proxy_status_forwarder(url.clone(), proxy_status_rx, status_tx, emitter.clone());
-    let connection = Connection::over(&proxy::Connection::open_with(
-        &shared_endpoint(&connect_url, &emitter),
-        Some(CONNECTION_STARTUP_TIMEOUT),
-        Some(proxy_status_tx),
-    ));
-
+    // Several whitespace-separated URLs are opened as one layout, each mounted
+    // at /0, /1, ..., so the rest of the session sees one combined device tree
+    // exactly as it would behind a hub.
+    let open_rx = spawn_connect(url.clone(), emitter.clone());
     let mut pending_startup_commands = VecDeque::new();
-    let retry_transient_connect_failures = is_retryable_connect_url(&connect_url);
-    if !wait_for_proxy_connection(
-        &status_rx,
+    let Some(connection) = wait_for_connection(
+        &open_rx,
         &command_rx,
         &mut pending_startup_commands,
         &emitter,
         CONNECTION_STARTUP_TIMEOUT,
-        retry_transient_connect_failures,
-    ) {
+    ) else {
         fail_unanswered_raw_rpcs(pending_startup_commands.drain(..), &emitter);
         return;
-    }
+    };
 
     let discovery = discover_devices_until_available(
         &connection,
@@ -3821,14 +3718,16 @@ fn run_session(
     let mut stream_value_profiler = StreamValueEmitProfiler::new();
     let mut loop_profiler = SessionLoopProfiler::new();
     let tree = connection.tree(root_route);
-    // Raw packets feed the .tio log and the wire byte counter. Sample batches
-    // and events arrive on their own receivers, already filtered to the
-    // subtree and pumped by the library on its own thread.
+    // Raw packets feed the .tio log and the wire byte counter. Sample batches,
+    // route changes, and each device's presence and announced settings arrive
+    // on their own receivers, already filtered to the subtree and pumped by the
+    // library on its own thread.
     let packet_monitor_port = Some(tree.packets());
     let batches = tree.samples();
-    let mut batch_rx = batches.receiver().clone();
-    let events = tree.events();
-    let mut event_rx = events.receiver().clone();
+    let mut batch_open = true;
+    let routes = tree.routes_updates();
+    let mut routes_open = true;
+    let mut feeds: Vec<DeviceFeed> = Vec::new();
 
     emitter.status("streaming", format!("Streaming from {url}"));
     // Lazily check for available firmware upgrades on a background thread so
@@ -3850,7 +3749,6 @@ fn run_session(
     let mut log_time_reference_start: Option<f64> = None;
     let mut latest_stream_timestamp_by_route: HashMap<DeviceRoute, f64> = HashMap::new();
     let mut last_rpc_metadata_recovery = Instant::now();
-    let mut last_sample_number_by_stream: HashMap<(DeviceRoute, u8), u32> = HashMap::new();
     let mut last_reset_refresh_by_route: HashMap<DeviceRoute, Instant> = HashMap::new();
     // A broadcast `rpc.hash` names the table to reload, as `dev.priv` and
     // `dev.priv.lock` send it: only that table is reloaded, off the loop and
@@ -3866,188 +3764,246 @@ fn run_session(
     // so a profile window covers one tick interval like the old poll loop.
     let mut loop_profile = SessionLoopProfile::default();
     let mut monitor_port_alive = packet_monitor_port.is_some();
-    let tick = channel::tick(Duration::from_millis(10));
+    let tick = ticker(Duration::from_millis(10));
     // Plot frames get their own timer: gating the emit on the 10 ms tick
     // quantizes a 33 ms budget up to ~40 ms and drops the frame rate.
-    let plot_tick = channel::tick(Duration::from_millis(33));
+    let plot_tick = ticker(Duration::from_millis(33));
 
     loop {
         // Startup commands queued while connecting run before live traffic.
         let command = if let Some(queued) = pending_startup_commands.pop_front() {
             Ok(queued)
         } else {
-            channel::select! {
-                recv(batch_rx) -> msg => {
-                    match batches.resolve(msg) {
-                        Ok(first) => for batch in bundle_batches(first, &batches, &emitter) {
-                            let process_start = Instant::now();
-                            let now = Instant::now();
-                            health.observe_batch(&batch, now);
-                            let route = batch.route();
-                            let stream_key = (route, batch.stream_key().stream_id.value());
-                            // A sample counter that goes backward means the
-                            // device rebooted (its counter restarted).
-                            let mut device_reset = false;
-                            if let (Some(first_n), Some(&last_n)) = (
-                                batch.sample_numbers().first().map(|n| n.value()),
-                                last_sample_number_by_stream.get(&stream_key),
-                            ) {
-                                if first_n < last_n {
-                                    device_reset = true;
-                                }
-                            }
-                            if let Some(n) = batch.sample_numbers().last() {
-                                last_sample_number_by_stream.insert(stream_key, n.value());
-                            }
+            let wake = {
+                let mut select = flume::Selector::new()
+                    .recv(&command_rx, Wake::Command)
+                    .recv(&tick, |_| Wake::Tick)
+                    .recv(&plot_tick, |_| Wake::PlotTick)
+                    .recv(&rpc_table_rx, Wake::Reloaded);
+                if batch_open {
+                    select =
+                        select.recv(batches.as_flume(), |msg| Wake::Batch(batches.resolve(msg)));
+                }
+                if routes_open {
+                    select =
+                        select.recv(routes.as_flume(), |msg| Wake::Routes(routes.resolve(msg)));
+                }
+                for feed in &feeds {
+                    select = select
+                        .recv(feed.presence.as_flume(), |msg| {
+                            Wake::Presence(feed.route, feed.presence.resolve(msg))
+                        })
+                        .recv(feed.settings.as_flume(), |msg| {
+                            Wake::Setting(feed.route, feed.settings.resolve(msg))
+                        });
+                }
+                select.wait()
+            };
+            match wake {
+                Wake::Batch(msg) => {
+                    match msg {
+                        Ok(first) => {
+                            for batch in bundle_batches(first, &batches, &emitter) {
+                                let process_start = Instant::now();
+                                let now = Instant::now();
+                                health.observe_batch(&batch, now);
+                                let route = batch.route();
+                                // A new device session, or a restarted acquisition, is a
+                                // device reset. Sample numbers alone are no sign of one:
+                                // each segment numbers its samples from its start, so a
+                                // segment rollover sends the count back to 0.
+                                let device_reset = matches!(
+                                    batch
+                                        .boundary()
+                                        .and_then(|boundary| boundary.change.as_ref()),
+                                    Some(Change::SessionChanged { .. } | Change::Restarted { .. })
+                                );
 
-                            if let Some(first_row) = batch.row(0) {
-                                let batch_start = first_row.timestamp_begin();
-                                if batch_start.is_finite() {
-                                    log_data_start = Some(
-                                        log_data_start
-                                            .map(|start| start.min(batch_start))
-                                            .unwrap_or(batch_start),
-                                    );
-                                }
-                            }
-                            if let Some(&batch_end) = batch.timestamps().last() {
-                                if batch_end.is_finite() {
-                                    log_data_end = Some(
-                                        log_data_end
-                                            .map(|end| end.max(batch_end))
-                                            .unwrap_or(batch_end),
-                                    );
-                                    latest_stream_timestamp_by_route.insert(route, batch_end);
-                                }
-                            }
-                            log_time_reference_start = earliest_time(
-                                log_time_reference_start,
-                                batch_time_reference_start(&batch),
-                            );
-                            process_batch(
-                                &batch,
-                                &mut column_states,
-                                &active_columns,
-                                &plot_panes,
-                                live_retention_seconds_for_panes(&plot_panes, &view, &derived_channels),
-                                Some(&mut ingest_profiler),
-                            );
-                            loop_profile.samples += batch.len();
-                            loop_profile.process_elapsed += process_start.elapsed();
-
-                            if device_reset {
-                                emitter.debug(format!(
-                                    "sample number went backward on {route}; treating as device reset"
-                                ));
-                                flush_route_history(&route.to_string(), &mut column_states);
-                                fft_workers.clear();
-                                health.reset_route(&route);
-                                // Drop baselines for the route's other streams so their
-                                // first post-reset sample doesn't re-trigger.
-                                last_sample_number_by_stream.retain(|(r, _), _| r != &route);
-
-                                let refresh_due = last_reset_refresh_by_route
-                                    .get(&route)
-                                    .is_none_or(|at| at.elapsed() >= DEVICE_RESET_REFRESH_COOLDOWN);
-                                if refresh_due {
-                                    last_reset_refresh_by_route.insert(route, Instant::now());
-                                    emitter.status(
-                                        "metadata",
-                                        format!("Device on {route} restarted; reloading settings"),
-                                    );
-                                    if refresh_route_metadata(
-                                        &connection,
-                                        &url,
-                                        &route,
-                                        &root_route,
-                                        &emitter,
-                                        &mut discovery,
-                                        &mut column_states,
-                                        &mut rpc_index,
-                                    ) {
-                                        emit_metadata_devices(&emitter, &discovery.devices);
-                                        health.update_stream_sample_sizes(&discovery.devices);
+                                if let Some(first_row) = batch.row(0) {
+                                    let batch_start = first_row.timestamp_begin();
+                                    if batch_start.is_finite() {
+                                        log_data_start = Some(
+                                            log_data_start
+                                                .map(|start| start.min(batch_start))
+                                                .unwrap_or(batch_start),
+                                        );
                                     }
-                                    emitter.status("streaming", format!("Streaming from {url}"));
+                                }
+                                if let Some(&batch_end) = batch.timestamps().last() {
+                                    if batch_end.is_finite() {
+                                        log_data_end = Some(
+                                            log_data_end
+                                                .map(|end| end.max(batch_end))
+                                                .unwrap_or(batch_end),
+                                        );
+                                        latest_stream_timestamp_by_route.insert(route, batch_end);
+                                    }
+                                }
+                                log_time_reference_start = earliest_time(
+                                    log_time_reference_start,
+                                    batch_time_reference_start(&batch),
+                                );
+                                process_batch(
+                                    &batch,
+                                    &mut column_states,
+                                    &active_columns,
+                                    &plot_panes,
+                                    live_retention_seconds_for_panes(
+                                        &plot_panes,
+                                        &view,
+                                        &derived_channels,
+                                    ),
+                                    Some(&mut ingest_profiler),
+                                );
+                                loop_profile.samples += batch.len();
+                                loop_profile.process_elapsed += process_start.elapsed();
+
+                                if device_reset {
+                                    emitter.debug(format!(
+                                    "{route} started a new session or acquisition; treating as device reset"
+                                ));
+                                    flush_route_history(&route.to_string(), &mut column_states);
+                                    fft_workers.clear();
+                                    health.reset_route(&route);
+
+                                    let refresh_due =
+                                        last_reset_refresh_by_route.get(&route).is_none_or(|at| {
+                                            at.elapsed() >= DEVICE_RESET_REFRESH_COOLDOWN
+                                        });
+                                    if refresh_due {
+                                        last_reset_refresh_by_route.insert(route, Instant::now());
+                                        emitter.status(
+                                            "metadata",
+                                            format!(
+                                                "Device on {route} restarted; reloading settings"
+                                            ),
+                                        );
+                                        if refresh_route_metadata(
+                                            &connection,
+                                            &url,
+                                            &route,
+                                            &root_route,
+                                            &emitter,
+                                            &mut discovery,
+                                            &mut column_states,
+                                            &mut rpc_index,
+                                        ) {
+                                            emit_metadata_devices(&emitter, &discovery.devices);
+                                            health.update_stream_sample_sizes(&discovery.devices);
+                                        }
+                                        emitter
+                                            .status("streaming", format!("Streaming from {url}"));
+                                    }
                                 }
                             }
-                        },
+                        }
                         Err(RecvError::Lagged(skipped)) => emitter.debug(format!(
                             "session loop fell behind; {skipped} sample batch(es) dropped"
                         )),
                         Err(RecvError::Timeout) => {}
-                        Err(RecvError::Disconnected) => {
+                        Err(_) => {
                             emitter.error("Twinleaf stream ended: proxy disconnected");
-                            batch_rx = channel::never();
+                            batch_open = false;
                         }
                     }
                     continue;
-                },
-                recv(event_rx) -> msg => {
-                    match events.resolve(msg) {
-                        Ok(event) => {
-                            let event_start = Instant::now();
-                            loop_profile.device_events += 1;
-                            match event {
-                                Event::Device { route, event } => {
-                                    match &event {
-                                        DeviceEvent::NewHash(Some(hash)) => {
-                                            rpc_tables.announce(route, *hash);
-                                        }
-                                        DeviceEvent::NewHash(None) => {
-                                            reconnected_routes.insert(route, Instant::now());
-                                        }
-                                        _ => {}
-                                    }
-                                    emitter.emit(&json!({
-                                        "type": "deviceEvent",
-                                        "route": route.to_string(),
-                                        "event": device_event_summary(&event)
-                                    }));
+                }
+                Wake::Routes(msg) => {
+                    match msg {
+                        Ok(routes) => {
+                            for route in routes {
+                                if feeds.iter().any(|feed| feed.route == route) {
+                                    continue;
                                 }
-                                Event::Link { subtree, event } => {
-                                    emitter.debug(format!("link event on {subtree}: {event:?}"));
+                                feeds.push(DeviceFeed::open(&connection, route));
+                                let route_text = route.to_string();
+                                if discovery
+                                    .devices
+                                    .iter()
+                                    .any(|device| device.route == route_text)
+                                {
+                                    continue;
                                 }
-                                Event::Tree { route, event: TreeEvent::RouteDiscovered } => {
-                                    if add_late_discovered_route(
-                                        &connection,
-                                        &url,
-                                        &route,
-                                        &root_route,
-                                        &emitter,
-                                        &mut discovery,
-                                        &mut column_states,
-                                        &mut rpc_index,
-                                    ) {
-                                        emit_metadata_devices(&emitter, &discovery.devices);
-                                        health.update_stream_sample_sizes(&discovery.devices);
-                                    }
+                                if add_late_discovered_route(
+                                    &connection,
+                                    &url,
+                                    &route,
+                                    &root_route,
+                                    &emitter,
+                                    &mut discovery,
+                                    &mut column_states,
+                                    &mut rpc_index,
+                                ) {
+                                    emit_metadata_devices(&emitter, &discovery.devices);
+                                    health.update_stream_sample_sizes(&discovery.devices);
                                 }
                             }
-                            loop_profile.event_elapsed += event_start.elapsed();
                         }
                         Err(RecvError::Lagged(skipped)) => emitter.debug(format!(
-                            "session loop fell behind; {skipped} device event(s) dropped"
+                            "session loop fell behind; {skipped} route update(s) dropped"
                         )),
                         Err(RecvError::Timeout) => {}
-                        Err(RecvError::Disconnected) => event_rx = channel::never(),
+                        Err(_) => routes_open = false,
                     }
                     continue;
-                },
-                recv(status_rx) -> status => {
-                    match status {
-                        Ok(status) => {
-                            loop_profile.status_events += 1;
+                }
+                Wake::Presence(route, msg) => {
+                    match msg {
+                        Ok(presence) => {
+                            loop_profile.device_events += 1;
+                            if let Some(feed) = feeds.iter_mut().find(|feed| feed.route == route) {
+                                // A device that drops out and comes back is
+                                // unsure of its settings, as a reconnect was.
+                                let reconnected = matches!(presence, Presence::Connecting)
+                                    && feed
+                                        .last_presence
+                                        .as_ref()
+                                        .is_some_and(|last| !matches!(last, Presence::Connecting));
+                                feed.last_presence = Some(presence.clone());
+                                if reconnected {
+                                    reconnected_routes.insert(route, Instant::now());
+                                }
+                            }
                             emitter.emit(&json!({
-                                "type": "proxyEvent",
-                                "event": format!("{status:?}")
+                                "type": "deviceEvent",
+                                "route": route.to_string(),
+                                "event": format!("{presence:?}")
                             }));
                         }
-                        Err(_) => status_rx = channel::never(),
+                        Err(RecvError::Lagged(skipped)) => emitter.debug(format!(
+                            "session loop fell behind; {skipped} presence update(s) dropped"
+                        )),
+                        Err(RecvError::Timeout) => {}
+                        Err(_) => feeds.retain(|feed| feed.route != route),
                     }
                     continue;
-                },
-                recv(rpc_table_rx) -> reloaded => {
+                }
+                Wake::Setting(route, msg) => {
+                    match msg {
+                        Ok(change) => {
+                            loop_profile.device_events += 1;
+                            // A changed rpc.hash names the route's RPC table, which
+                            // is reloaded off the loop.
+                            if change.name == "rpc.hash" {
+                                if let Ok(bytes) = <[u8; 4]>::try_from(change.reply.as_slice()) {
+                                    rpc_tables.announce(route, u32::from_le_bytes(bytes));
+                                }
+                            }
+                            emitter.emit(&json!({
+                                "type": "deviceEvent",
+                                "route": route.to_string(),
+                                "event": format!("Setting({})", change.name)
+                            }));
+                        }
+                        Err(RecvError::Lagged(skipped)) => emitter.debug(format!(
+                            "session loop fell behind; {skipped} setting(s) dropped"
+                        )),
+                        Err(RecvError::Timeout) => {}
+                        Err(_) => feeds.retain(|feed| feed.route != route),
+                    }
+                    continue;
+                }
+                Wake::Reloaded(reloaded) => {
                     if let Ok((route, fetched)) = reloaded {
                         match rpc_tables.finish(&route, fetched.complete, Instant::now()) {
                             Some(asked) => {
@@ -4057,7 +4013,12 @@ fn run_session(
                                     .get(&route)
                                     .is_some_and(|at| *at >= asked);
                                 if !superseded
-                                    && apply_rpc_table(&route, fetched, &mut discovery, &mut rpc_index)
+                                    && apply_rpc_table(
+                                        &route,
+                                        fetched,
+                                        &mut discovery,
+                                        &mut rpc_index,
+                                    )
                                 {
                                     emit_metadata_devices(&emitter, &discovery.devices);
                                 }
@@ -4069,8 +4030,8 @@ fn run_session(
                         emitter.status("streaming", format!("Streaming from {url}"));
                     }
                     continue;
-                },
-                recv(plot_tick) -> _ => {
+                }
+                Wake::PlotTick => {
                     let emit_start = Instant::now();
                     let stats = emit_live_plot(
                         &emitter,
@@ -4085,8 +4046,8 @@ fn run_session(
                         loop_profile.plot_emits = 1;
                     }
                     continue;
-                },
-                recv(tick) -> _ => {
+                }
+                Wake::Tick => {
                     let tick_start = Instant::now();
                     if monitor_port_alive {
                         if let Some(port) = &packet_monitor_port {
@@ -4131,7 +4092,10 @@ fn run_session(
                             .is_some_and(|at| *at >= seen);
                         let route_text = route.to_string();
                         if already_fetched
-                            || !discovery.devices.iter().any(|device| device.route == route_text)
+                            || !discovery
+                                .devices
+                                .iter()
+                                .any(|device| device.route == route_text)
                         {
                             continue;
                         }
@@ -4181,7 +4145,11 @@ fn run_session(
                         let value_count = emit_stream_values(&emitter, &column_states);
                         loop_profile.stream_values = value_count;
                         loop_profile.stream_value_elapsed = emit_start.elapsed();
-                        stream_value_profiler.record(emit_start.elapsed(), value_count, column_states.len());
+                        stream_value_profiler.record(
+                            emit_start.elapsed(),
+                            value_count,
+                            column_states.len(),
+                        );
                         last_stream_value_emit = Instant::now();
                     }
 
@@ -4223,8 +4191,8 @@ fn run_session(
                         retained_point_count(&column_states),
                     );
                     continue;
-                },
-                recv(command_rx) -> command => command,
+                }
+                Wake::Command(command) => command,
             }
         };
 
@@ -4641,6 +4609,7 @@ fn run_upgrade_flash(
             json!({ "message": "Finalizing — keeping the device powered" }),
         ),
         FlashEvent::Complete => {}
+        _ => {}
     })
     .map_err(|err| format!("flash failed: {err}"))?;
 
@@ -4786,8 +4755,8 @@ struct RpcTableReloader {
 
 impl RpcTableReloader {
     fn new(connection: Connection, emitter: Emitter) -> Self {
-        let (request_tx, request_rx) = channel::unbounded::<DeviceRoute>();
-        let (result_tx, result_rx) = channel::unbounded();
+        let (request_tx, request_rx) = flume::unbounded::<DeviceRoute>();
+        let (result_tx, result_rx) = flume::unbounded();
 
         thread::Builder::new()
             .name("rpc-table-reloader".into())
@@ -4942,6 +4911,15 @@ fn rpc_lists_equivalent(lhs: &[RpcDto], rhs: &[RpcDto]) -> bool {
 
 /// Log one raw packet (its route is already absolute) and return its wire
 /// length.
+/// The link status a packet carries: the proxy's `PROXY_RX` link packet, or a
+/// legacy status packet. Every other packet carries none.
+fn link_status(packet: &tio::Packet) -> Option<LinkStatus> {
+    match packet.payload() {
+        Payload::ProxyRx(ProxyRx::Link(status)) | Payload::LegacyStatus(status) => Some(status),
+        _ => None,
+    }
+}
+
 fn handle_monitor_packet(
     packet: tio::Packet,
     logger: &mut PacketLogger,
@@ -4959,6 +4937,12 @@ fn handle_monitor_packet(
     );
     if let Some(event) = setting_changed_event(&packet, rpc_index) {
         emitter.emit(&event);
+    }
+    if let Some(status) = link_status(&packet) {
+        emitter.emit(&json!({
+            "type": "proxyEvent",
+            "event": format!("{status:?}")
+        }));
     }
     let counts = incoming_counts_for_packet(&packet, stream_sample_sizes);
     logger.write_packet(&packet);
@@ -5083,24 +5067,6 @@ fn emit_tio_log_message(packet: &tio::Packet, timestamp_seconds: Option<f64>, em
     }));
 }
 
-fn spawn_proxy_status_forwarder(
-    url: String,
-    proxy_status_rx: Receiver<proxy::Event>,
-    session_status_tx: Sender<proxy::Event>,
-    emitter: Emitter,
-) {
-    thread::Builder::new()
-        .name("proxy-status-forwarder".into())
-        .spawn(move || {
-            for event in proxy_status_rx {
-                emitter.debug(format!("proxy event from {url}: {event:?}"));
-                let _ = session_status_tx.send(event);
-            }
-            emitter.debug(format!("proxy status channel ended for {url}"));
-        })
-        .expect("failed to spawn proxy status forwarder");
-}
-
 fn is_retryable_connect_url(url: &str) -> bool {
     url.starts_with("udp://") || url.starts_with("tcp://")
 }
@@ -5140,14 +5106,15 @@ fn sleep_with_startup_cancel(
     collect_startup_commands(command_rx, pending_commands, emitter)
 }
 
-fn wait_for_proxy_connection(
-    status_rx: &Receiver<proxy::Event>,
+/// Waits for the connection to open, taking the session's commands meanwhile.
+/// `None` when the session is stopped, the open fails, or the window closes.
+fn wait_for_connection(
+    open_rx: &flume::Receiver<std::io::Result<Connection>>,
     command_rx: &Receiver<SessionCommand>,
     pending_commands: &mut VecDeque<SessionCommand>,
     emitter: &Emitter,
     timeout: Duration,
-    retry_transient_failures: bool,
-) -> bool {
+) -> Option<Connection> {
     let deadline = Instant::now() + timeout;
     emitter.debug(format!(
         "waiting up to {:.1}s for proxy connection",
@@ -5157,66 +5124,37 @@ fn wait_for_proxy_connection(
 
     while Instant::now() < deadline {
         if !collect_startup_commands(command_rx, pending_commands, emitter) {
-            return false;
+            return None;
         }
 
-        match status_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(proxy::Event::SensorConnected) | Ok(proxy::Event::SensorReconnected) => {
-                emitter.debug("proxy reported sensor connected");
+        match open_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(Ok(connection)) => {
+                emitter.debug("proxy opened the device");
                 emitter.status("connected", "Sensor connection established");
-                return true;
+                return Some(connection);
             }
-            Ok(proxy::Event::FailedToConnect) => {
-                emitter.debug("proxy reported FailedToConnect");
-                if !retry_transient_failures {
-                    emitter.error("Twinleaf proxy failed to connect");
-                    return false;
-                }
-                emitter.emit(&json!({
-                    "type": "proxyEvent",
-                    "event": "FailedToConnect"
-                }));
+            Ok(Err(err)) => {
+                emitter.debug(format!("proxy refused the connection: {err}"));
+                emitter.error(format!("Could not open the Twinleaf device: {err}"));
+                return None;
             }
-            Ok(proxy::Event::FailedToReconnect) => {
-                emitter.debug("proxy reported FailedToReconnect");
-                if !retry_transient_failures {
-                    emitter.error("Twinleaf proxy failed to reconnect");
-                    return false;
-                }
-                emitter.emit(&json!({
-                    "type": "proxyEvent",
-                    "event": "FailedToReconnect"
-                }));
-            }
-            Ok(proxy::Event::FatalError(err)) => {
-                emitter.debug(format!("proxy fatal error: {err:?}"));
-                emitter.error(format!("Twinleaf proxy fatal error: {err:?}"));
-                return false;
-            }
-            Ok(event) => {
-                emitter.debug(format!("proxy event while connecting: {event:?}"));
-                emitter.emit(&json!({
-                    "type": "proxyEvent",
-                    "event": format!("{event:?}")
-                }));
-            }
-            Err(channel::RecvTimeoutError::Timeout) => {
+            Err(flume::RecvTimeoutError::Timeout) => {
                 if last_wait_log.elapsed() >= Duration::from_secs(1) {
                     emitter.debug("still waiting for proxy connection...");
                     last_wait_log = Instant::now();
                 }
             }
-            Err(channel::RecvTimeoutError::Disconnected) => {
-                emitter.debug("proxy status channel disconnected while connecting");
-                emitter.error("Twinleaf proxy status channel disconnected");
-                return false;
+            Err(flume::RecvTimeoutError::Disconnected) => {
+                emitter.debug("connect thread ended without a result");
+                emitter.error("Twinleaf connection attempt ended unexpectedly");
+                return None;
             }
         }
     }
 
     emitter.debug("timed out waiting for proxy connection");
     emitter.error("Timed out waiting for Twinleaf proxy connection");
-    false
+    None
 }
 
 #[derive(Debug)]
@@ -5544,11 +5482,11 @@ fn metadata_to_stream_dtos(
 ) -> (DeviceMetaDto, Vec<StreamDto>) {
     let device = metadata.device();
     let meta = DeviceMetaDto {
-        serial_number: device.serial.to_string(),
-        firmware_hash: device.firmware.to_string(),
-        n_streams: usize::from(device.n_streams),
-        session_id: device.session.value(),
-        name: device.name.to_string(),
+        serial_number: device.serial().to_string(),
+        firmware_hash: device.firmware().to_string(),
+        n_streams: usize::from(device.n_streams()),
+        session_id: device.session().value(),
+        name: device.name().to_string(),
     };
 
     let mut streams = Vec::new();
@@ -5557,36 +5495,37 @@ fn metadata_to_stream_dtos(
 
     for (stream_id, stream) in stream_snapshots {
         let segment = stream.segment();
-        let decimation = if segment.decimation == 0 {
+        let decimation = if segment.decimation() == 0 {
             1.0
         } else {
-            f64::from(segment.decimation)
+            f64::from(segment.decimation())
         };
-        let effective_sampling_rate = f64::from(segment.sampling_rate) / decimation;
+        let effective_sampling_rate = f64::from(segment.sampling_rate()) / decimation;
 
         let mut columns: Vec<ColumnDto> = stream
+            .schema()
             .columns()
             .map(|column| ColumnDto {
                 key: ColumnKeyDto::raw(
                     route.to_string(),
                     stream_id.value(),
-                    usize::from(column.index.value()),
+                    usize::from(column.index().value()),
                 ),
-                name: column.name.to_string(),
-                units: column.units.to_string(),
-                data_type: data_type_name(column.data_type).to_string(),
-                description: column.description.to_string(),
+                name: column.name().to_string(),
+                units: column.units().to_string(),
+                data_type: data_type_name(column.data_type()).to_string(),
+                description: column.description().to_string(),
                 display_value: None,
             })
             .collect();
         columns.sort_by_key(|column| column.key.column_index);
 
-        let wire_stream = stream.stream();
+        let wire_stream = stream.schema().stream();
         streams.push(StreamDto {
             stream_id: stream_id.value(),
-            name: wire_stream.name.to_string(),
-            n_columns: usize::from(wire_stream.n_columns),
-            sample_size: usize::from(wire_stream.sample_size),
+            name: wire_stream.name().to_string(),
+            n_columns: usize::from(wire_stream.n_columns()),
+            sample_size: usize::from(wire_stream.sample_size()),
             effective_sampling_rate,
             columns,
         });
@@ -5758,7 +5697,7 @@ fn load_log_file(path: &str, emitter: &Emitter) -> Result<PlaybackSession, Strin
         return Err("Log file is empty".to_string());
     }
 
-    let mut parser = PacketParser::new(DeviceRoute::root(), false).with_batch_rows(4096);
+    let mut parser = PacketParser::new(false).with_batch_rows(4096);
     let mut routes_seen: HashSet<DeviceRoute> = HashSet::new();
     let mut column_states: HashMap<ColumnKeyDto, ColumnState> = HashMap::new();
     let active_columns = HashSet::new();
@@ -5944,7 +5883,7 @@ fn export_log_csv(
     )
     .map_err(|err| err.to_string())?;
 
-    let index = log.scan(DeviceRoute::root(), false);
+    let index = log.scan(false);
     let packets = index.summary().packet_count();
     let mut samples = 0usize;
     let mut rows = 0usize;
@@ -5978,31 +5917,31 @@ fn export_log_csv(
 
 fn write_batch_csv_records<W: Write>(writer: &mut W, batch: &SampleBatch) -> io::Result<usize> {
     let route = batch.route().to_string();
-    let device = batch.device();
-    let stream = batch.stream();
-    let session_id = device.session.to_string();
+    let metadata = batch.metadata();
+    let device = metadata.device();
+    let stream = metadata.schema().stream();
+    let session_id = device.session().to_string();
     let stream_id = batch.stream_key().stream_id.to_string();
-    let segment_id = batch.segment().segment_id.to_string();
+    let segment_id = metadata.segment().segment_id().to_string();
     let mut rows = 0usize;
 
     for row in batch.iter() {
-        let sample_number = row.n().to_string();
+        let sample_number = row.sample_number().value().to_string();
         let timestamp = format!("{:.17}", row.timestamp_end());
-        for (series, value) in batch.schema().iter().zip(row.values()) {
-            let metadata = series.metadata();
+        for (series, value) in metadata.schema().columns().zip(row.values()) {
             let fields = vec![
                 route.clone(),
-                device.name.to_string(),
+                device.name().to_string(),
                 session_id.clone(),
                 stream_id.clone(),
-                stream.name.to_string(),
+                stream.name().to_string(),
                 segment_id.clone(),
                 sample_number.clone(),
                 timestamp.clone(),
                 series.index().to_string(),
-                metadata.name.to_string(),
-                metadata.units.to_string(),
-                data_type_name(metadata.data_type).to_string(),
+                series.name().to_string(),
+                series.units().to_string(),
+                data_type_name(series.data_type()).to_string(),
                 value.to_string(),
             ];
             write_csv_record(writer, &fields)?;
@@ -6037,7 +5976,6 @@ fn export_log_hdf5(
     }
     let mut writer = Hdf5Appender::with_options(
         output_path,
-        true,
         false,
         None,
         SplitPolicy::default(),
@@ -6045,7 +5983,7 @@ fn export_log_hdf5(
     )
     .map_err(|err| format!("Failed to create HDF5 export: {err:?}"))?;
 
-    let index = log.scan(DeviceRoute::root(), false);
+    let index = log.scan(false);
     let packets = index.summary().packet_count();
     let mut samples = 0usize;
 
@@ -6168,12 +6106,14 @@ fn process_batch(
     let route = batch.route();
     let route_string = route.to_string();
     let stream_id = batch.stream_key().stream_id.value();
-    let segment = batch.segment();
-    let effective_rate = f64::from(segment.sampling_rate) / f64::from(segment.decimation.max(1));
+    let metadata = batch.metadata();
+    let segment = metadata.segment();
+    let effective_rate =
+        f64::from(segment.sampling_rate()) / f64::from(segment.decimation().max(1));
     let timestamps = batch.timestamps();
     // Per-column bookkeeping hoists out of the row loop: a batch covers one
     // (route, stream), so key, pane filter, and rate are loop-invariant.
-    for series in batch.schema() {
+    for (series, values) in metadata.schema().columns().zip(batch.columns()) {
         let key = ColumnKeyDto::raw(
             route_string.clone(),
             stream_id,
@@ -6198,11 +6138,10 @@ fn process_batch(
             active_hits += batch.len();
         }
 
-        let metadata = series.metadata();
         let state = column_states.entry(key.clone()).or_insert_with(|| {
             ColumnState::new(
                 format!("{} stream {} column {}", route, stream_id, series.index()),
-                metadata.units.to_string(),
+                series.units().to_string(),
                 effective_rate,
             )
         });
@@ -6224,7 +6163,7 @@ fn process_batch(
                 state.process_fpcs_point(*pane_id, view, point);
             }
         };
-        match series.values() {
+        match values {
             ColumnArray::F64(values) => {
                 for (i, &y) in values.iter().enumerate() {
                     push_point(
@@ -6673,12 +6612,12 @@ fn earliest_time(current: Option<f64>, candidate: Option<f64>) -> Option<f64> {
 }
 
 fn batch_time_reference_start(batch: &SampleBatch) -> Option<f64> {
-    let segment = batch.segment();
-    if segment.timeref_session.value() == 0 {
+    let segment = batch.metadata().segment();
+    if segment.timeref_session().value() == 0 {
         return None;
     }
 
-    if segment.epoch == Epoch::UNIX || segment.epoch == Epoch::SYSTIME {
+    if segment.epoch() == Epoch::UNIX || segment.epoch() == Epoch::SYSTIME {
         let start = batch.row(0)?.timestamp_begin();
         if start.is_finite() && start > 0.0 {
             Some(start)
@@ -7552,22 +7491,26 @@ fn fft_points(points: &[Point], sample_rate: f64, detrend: DetrendMethod) -> Vec
     let y = detrended_values(&y, detrend);
     let timestamps: Vec<f64> = points.iter().map(|point| point.x).collect();
 
-    // Detrending stays app-side (`WelchOp` has none); the Welch estimate
-    // itself is the library's, shared with `tio monitor`.
-    let mut op = WelchOp::new(y.len(), sample_rate, 0.0);
+    // Detrending stays app-side (`Welch` has none); the Welch estimate itself
+    // is the library's, shared with `tio monitor`.
+    let mut op = Welch::new(y.len(), sample_rate);
     op.update_batch(&timestamps, &ColumnArray::F64(y.into()));
     match op.output() {
-        Ok(data) => data.points.iter().map(|&(x, y)| Point { x, y }).collect(),
+        Ok(spectrum) => spectrum
+            .points
+            .iter()
+            .map(|&(x, y)| Point { x, y })
+            .collect(),
         Err(_) => Vec::new(),
     }
 }
 
 /// Estimate the flat, broadband ASD level while rejecting low-frequency 1/f
 /// content and narrow spectral peaks. The estimator originated here and moved
-/// upstream into twinleaf-tools; this adapts it to the plot `Point` type.
+/// upstream into twinleaf's `data::ops`; this adapts it to the plot `Point` type.
 fn estimate_white_noise_floor(points: &[Point]) -> Option<f64> {
     let pairs: Vec<(f64, f64)> = points.iter().map(|point| (point.x, point.y)).collect();
-    twinleaf_tools::tui::spectral::estimate_white_noise_floor(&pairs)
+    twinleaf::data::ops::estimate_white_noise_floor(&pairs)
 }
 
 fn detrended_values(y: &[f64], detrend: DetrendMethod) -> Vec<f64> {
@@ -8087,7 +8030,7 @@ fn rpc_arg_type(descriptor: &RpcDescriptor) -> String {
         return "capture".to_string();
     }
 
-    if descriptor.meta.flags().contains(RpcMetaFlags::BOOL) {
+    if matches!(descriptor.meta.kind(), RpcValueType::Bool) {
         return descriptor.meta.type_str();
     }
 
@@ -8435,7 +8378,7 @@ mod tests {
     #[test]
     fn ending_session_answers_queued_raw_rpcs() {
         let emitter = Emitter::callback(capture_event, 0);
-        let (tx, rx) = channel::unbounded::<SessionCommand>();
+        let (tx, rx) = flume::unbounded::<SessionCommand>();
         tx.send(SessionCommand::CallRawRpc {
             request_id: "queued-1".into(),
             route: "/".into(),
@@ -8505,7 +8448,7 @@ mod tests {
     fn setting_packet(route: &DeviceRoute, name: &str, reply: &[u8]) -> tio::Packet {
         let setting = twinleaf::proto::settings::Setting {
             name: name.as_bytes(),
-            flags: 0,
+            seq: None,
             reply,
         };
         let mut buf = [0u8; 512];
@@ -8777,10 +8720,11 @@ mod tests {
         assert_eq!(unsupported.meta.perm_str(), "R--");
 
         let enabled = RpcDescriptor::from_meta(
-            RpcMetaFlags::READABLE.bits()
-                | RpcMetaFlags::WRITABLE.bits()
-                | (1 << 4)
-                | RpcMetaFlags::BOOL.bits(),
+            twinleaf::device::rpc::RpcMeta::typed(
+                RpcValueType::Bool,
+                RpcMetaFlags::READABLE | RpcMetaFlags::WRITABLE,
+            )
+            .bits(),
             "test.enable".to_string(),
         );
         assert_eq!(rpc_arg_type(&enabled), "bool");
@@ -9904,5 +9848,68 @@ mod tests {
             rpcs: Vec::new(),
             full_metadata: None,
         }
+    }
+
+    #[test]
+    fn a_serial_port_folds_to_one_entry_under_its_cu_url() {
+        fn added(url: &str) -> DiscoveryEvent {
+            DiscoveryEvent::Added(twinleaf::device::discovery::DiscoveredDevice {
+                url: url.to_string(),
+                interface: PortInterface::STM32,
+                name: None,
+            })
+        }
+        fn listed(state: &DiscoveryState) -> Vec<String> {
+            state
+                .snapshot()
+                .into_iter()
+                .map(|device| device.url)
+                .collect()
+        }
+        const TTY: &str = "serial:///dev/tty.usbmodem14201";
+        const CU: &str = "serial:///dev/cu.usbmodem14201";
+        const LOCAL: &str = "tcp://localhost";
+
+        // Listed in either order, the pair is one entry under the cu URL.
+        for order in [[TTY, CU], [CU, TTY]] {
+            let mut state = DiscoveryState::new();
+            for url in order {
+                state.apply(added(url));
+            }
+            assert_eq!(listed(&state), [LOCAL, CU], "order {order:?}");
+        }
+
+        // Probe results for either URL reach that one entry.
+        let mut state = DiscoveryState::new();
+        state.apply(added(TTY));
+        state.apply(added(CU));
+        state.apply(DiscoveryEvent::Named {
+            url: TTY.to_string(),
+            name: "sandi".to_string(),
+        });
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.snapshot()[1].label, "sandi");
+
+        // Removing the tty node leaves the cu entry listed; removing cu removes it.
+        state.apply(DiscoveryEvent::Removed {
+            url: TTY.to_string(),
+        });
+        assert_eq!(listed(&state), [LOCAL, CU]);
+        state.apply(DiscoveryEvent::Removed {
+            url: CU.to_string(),
+        });
+        assert_eq!(listed(&state), [LOCAL]);
+
+        // With no cu twin, a tty port is listed under its own URL.
+        let mut state = DiscoveryState::new();
+        state.apply(added(TTY));
+        assert_eq!(listed(&state), [LOCAL, TTY]);
+
+        // A different port is a different device.
+        state.apply(added("serial:///dev/cu.usbmodem14202"));
+        assert_eq!(
+            listed(&state),
+            [LOCAL, TTY, "serial:///dev/cu.usbmodem14202"]
+        );
     }
 }
