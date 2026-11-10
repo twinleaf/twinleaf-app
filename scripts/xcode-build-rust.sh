@@ -43,30 +43,23 @@ esac
 
 CORE_DYLIB="$CARGO_TARGET_DIR/$CARGO_PROFILE_DIR/libtwinleaf_core.dylib"
 BRIDGE_TOOL="$CARGO_TARGET_DIR/$CARGO_PROFILE_DIR/tio-bridge"
-LEGACY_CORE_DYLIB="$ROOT_DIR/rust/tio-bridge/target/$CARGO_PROFILE_DIR/libtwinleaf_core.dylib"
-LEGACY_BRIDGE_TOOL="$ROOT_DIR/rust/tio-bridge/target/$CARGO_PROFILE_DIR/tio-bridge"
 
-if command -v cargo >/dev/null 2>&1; then
-	CARGO_COMMAND=(
-		cargo build
-		--manifest-path "$ROOT_DIR/rust/tio-bridge/Cargo.toml"
-		--features hdf5
-		--target-dir "$CARGO_TARGET_DIR"
-	)
-	if [[ "$CONFIGURATION" == "Release" ]]; then
-		CARGO_COMMAND+=(--release)
-	fi
-	"${CARGO_COMMAND[@]}"
-elif [[ -r "$CORE_DYLIB" && -r "$BRIDGE_TOOL" ]]; then
-	echo "warning: cargo was not found; packaging existing Rust $CARGO_PROFILE_DIR artifacts" >&2
-elif [[ -r "$LEGACY_CORE_DYLIB" && -r "$LEGACY_BRIDGE_TOOL" ]]; then
-	echo "warning: cargo was not found; packaging existing Rust $CARGO_PROFILE_DIR artifacts from rust/tio-bridge/target" >&2
-	CORE_DYLIB="$LEGACY_CORE_DYLIB"
-	BRIDGE_TOOL="$LEGACY_BRIDGE_TOOL"
-else
-	echo "error: cargo is required to build the Twinleaf Rust bridge, and no existing $CARGO_PROFILE_DIR artifacts were found" >&2
+# Always build from source. Artifacts left by an earlier build may be stale or
+# built with other features, so they are never packaged in their place.
+if ! command -v cargo >/dev/null 2>&1; then
+	echo "error: cargo is required to build the Twinleaf Rust bridge; install Rust with rustup or put cargo on PATH" >&2
 	exit 1
 fi
+CARGO_COMMAND=(
+	cargo build
+	--manifest-path "$ROOT_DIR/rust/tio-bridge/Cargo.toml"
+	--features hdf5
+	--target-dir "$CARGO_TARGET_DIR"
+)
+if [[ "$CONFIGURATION" == "Release" ]]; then
+	CARGO_COMMAND+=(--release)
+fi
+"${CARGO_COMMAND[@]}"
 
 : "${TARGET_BUILD_DIR:?TARGET_BUILD_DIR is required}"
 : "${FRAMEWORKS_FOLDER_PATH:?FRAMEWORKS_FOLDER_PATH is required}"
