@@ -198,24 +198,41 @@ private let twinleafRustEventCallback: RustEventCallback = { kind, bytes, count,
 }
 
 /// What a runtime's teardown needs once the runtime object is gone. It crosses to
-/// the teardown queue by value. The pointers are used only there, and only once.
+/// the teardown queue by value. The pointer is used only there, and only once.
 private struct RustRuntimeTeardown: @unchecked Sendable {
     let runtime: OpaquePointer?
     let destroy: RuntimeDestroyFn
-    let library: UnsafeMutableRawPointer?
 
     func run() {
         if let runtime {
             destroy(runtime)
         }
-        if let library {
-            dlclose(library)
-        }
     }
 }
 
+/// The Rust dylib, opened once for the life of the process and never closed. Its
+/// runtime threads and the app's proxy outlive any one window, so unloading it
+/// would pull code out from under them. The address is kept as an integer, which
+/// is Sendable, and turned back into a pointer where the library is used.
+private enum RustDylib {
+    static let address: Result<UInt, RuntimeError> = {
+        do {
+            let libraryURL = try RustRuntime.findLibraryURL()
+            logRustRuntime("loading Rust dylib from \(libraryURL.path)")
+            guard let library = dlopen(libraryURL.path, RTLD_NOW | RTLD_LOCAL) else {
+                throw RuntimeError.loadFailed(String(cString: dlerror()))
+            }
+            logRustRuntime("loaded Rust dylib")
+            return .success(UInt(bitPattern: library))
+        } catch let error as RuntimeError {
+            return .failure(error)
+        } catch {
+            return .failure(.loadFailed(error.localizedDescription))
+        }
+    }()
+}
+
 final class RustRuntime {
-    private let library: UnsafeMutableRawPointer?
     private let callbackBox: RustRuntimeCallbackBox
     private var runtime: OpaquePointer?
 
@@ -248,7 +265,6 @@ final class RustRuntime {
         self.callbackBox = callbackBox
 
 #if TWINLEAF_STATIC_RUST
-        library = nil
         logRustRuntime("using statically linked Rust runtime")
         let createFn: RuntimeCreateFn = twinleaf_runtime_create
         destroyFn = twinleaf_runtime_destroy
@@ -265,14 +281,13 @@ final class RustRuntime {
         sendCommandJsonFn = twinleaf_runtime_send_command_json
         callRpcValueFn = twinleaf_runtime_call_rpc_value
 #else
-        let libraryURL = try Self.findLibraryURL()
-        logRustRuntime("loading Rust dylib from \(libraryURL.path)")
-        guard let library = dlopen(libraryURL.path, RTLD_NOW | RTLD_LOCAL) else {
-            throw RuntimeError.loadFailed(String(cString: dlerror()))
+        let library: UnsafeMutableRawPointer
+        switch RustDylib.address {
+        case .success(let address):
+            library = UnsafeMutableRawPointer(bitPattern: address)!
+        case .failure(let error):
+            throw error
         }
-        logRustRuntime("loaded Rust dylib")
-
-        self.library = library
 
         let createFn: RuntimeCreateFn = try Self.load(library, "twinleaf_runtime_create")
         destroyFn = try Self.load(library, "twinleaf_runtime_destroy")
@@ -292,9 +307,6 @@ final class RustRuntime {
 
         let context = UInt(bitPattern: Unmanaged.passUnretained(callbackBox).toOpaque())
         guard let runtime = createFn(twinleafRustEventCallback, context) else {
-            if let library = self.library {
-                dlclose(library)
-            }
             throw RuntimeError.createFailed
         }
         self.runtime = runtime
@@ -302,11 +314,7 @@ final class RustRuntime {
     }
 
     deinit {
-        let teardown = RustRuntimeTeardown(
-            runtime: runtime,
-            destroy: destroyFn,
-            library: library
-        )
+        let teardown = RustRuntimeTeardown(runtime: runtime, destroy: destroyFn)
         Self.teardownQueue.async {
             teardown.run()
         }
@@ -425,7 +433,7 @@ final class RustRuntime {
         send(ResetHealthCountersCommand())
     }
 
-    private static func findLibraryURL() throws -> URL {
+    fileprivate static func findLibraryURL() throws -> URL {
         let fileName = "libtwinleaf_core.dylib"
         let environment = ProcessInfo.processInfo.environment
 
@@ -458,7 +466,7 @@ final class RustRuntime {
         throw RuntimeError.libraryNotFound(fileName)
     }
 
-    private static func load<T>(_ library: UnsafeMutableRawPointer, _ symbol: String) throws -> T {
+    fileprivate static func load<T>(_ library: UnsafeMutableRawPointer, _ symbol: String) throws -> T {
         guard let pointer = dlsym(library, symbol) else {
             throw RuntimeError.symbolNotFound(symbol)
         }
