@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use flume::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -14,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use twinleaf::data::ops::Welch;
+use twinleaf::flume::{self, Receiver, Sender};
 use twinleaf::data::{
     Change, ColumnArray, ColumnOp, DataType, DeviceMetadataSnapshot, LogFile, PacketParser,
     SampleBatch,
@@ -21,10 +21,12 @@ use twinleaf::data::{
 use twinleaf::device::capture::{read_capture, CaptureReadout};
 use twinleaf::device::discovery::{Discovery, DiscoveryConfig, DiscoveryEvent, PortInterface};
 use twinleaf::device::rpc::{
-    CallError, RpcDescriptor, RpcMetaExt, RpcMetaFlags, RpcRegistryError, RpcValue, RpcValueType,
-    RpcValueTypeExt,
+    CallError, RpcDescriptor, RpcMetaExt, RpcMetaFlags, RpcRegistry, RpcRegistryError, RpcValue,
+    RpcValueType, RpcValueTypeExt,
 };
-use twinleaf::device::{Connection, Device, NamedRoute, Presence, RecvError, SettingChange};
+use twinleaf::device::{
+    Connection, Device, NamedRoute, Presence, RecvError, RegistryState, SettingChange,
+};
 #[cfg(feature = "firmware")]
 use twinleaf::firmware::{self, FirmwareCatalog, FlashEvent, StopOutcome, UpdateStatus};
 use twinleaf::proto::rpc::RpcError;
@@ -3488,7 +3490,7 @@ impl HealthMonitor {
             .flat_map(|(route, streams)| {
                 streams
                     .iter()
-                    .map(move |stream| ((route.clone(), stream.stream_id), stream.sample_size))
+                    .map(move |stream| ((route, stream.stream_id), stream.sample_size))
             })
             .collect();
     }
@@ -3512,7 +3514,7 @@ impl HealthMonitor {
 
     fn snapshot(&self, now: Instant) -> Value {
         let mut entries: Vec<(&(DeviceRoute, u8), &StreamHealth)> = self.streams.iter().collect();
-        entries.sort_by(|a, b| (a.0 .0.to_string(), a.0 .1).cmp(&(b.0 .0.to_string(), b.0 .1)));
+        entries.sort_by_key(|entry| (entry.0 .0.to_string(), entry.0 .1));
         let streams: Vec<Value> = entries
             .into_iter()
             .map(|((route, stream_id), stats)| {
@@ -3591,18 +3593,18 @@ enum Wake {
     Routes(Result<Vec<DeviceRoute>, RecvError>),
     Presence(DeviceRoute, Result<Presence, RecvError>),
     Setting(DeviceRoute, Result<SettingChange, RecvError>),
-    Reloaded(Result<(DeviceRoute, RpcFetchResult), flume::RecvError>),
+    Registry(DeviceRoute, Result<RegistryState, RecvError>),
     Tick,
     PlotTick,
 }
 
-/// One device's live subscriptions: its presence, where a reconnect shows, and
-/// the settings it announces, where a changed `rpc.hash` names a table to
-/// reload.
+/// One device's live subscriptions: its presence, where a reconnect shows, the
+/// settings it announces, and its RPC table as the proxy loads it.
 struct DeviceFeed {
     route: DeviceRoute,
     presence: twinleaf::device::Receiver<Presence>,
     settings: twinleaf::device::Receiver<SettingChange>,
+    registry: twinleaf::device::Receiver<RegistryState>,
     /// The last presence heard, or `None` before the first.
     last_presence: Option<Presence>,
 }
@@ -3614,6 +3616,7 @@ impl DeviceFeed {
             route,
             presence: device.presence_updates(),
             settings: device.setting_changes(),
+            registry: device.rpc_registry_updates(),
             last_presence: None,
         }
     }
@@ -3750,11 +3753,6 @@ fn run_session(
     let mut latest_stream_timestamp_by_route: HashMap<DeviceRoute, f64> = HashMap::new();
     let mut last_rpc_metadata_recovery = Instant::now();
     let mut last_reset_refresh_by_route: HashMap<DeviceRoute, Instant> = HashMap::new();
-    // A broadcast `rpc.hash` names the table to reload, as `dev.priv` and
-    // `dev.priv.lock` send it: only that table is reloaded, off the loop and
-    // with no cooldown, since a reload is asked only while the hash differs.
-    let mut rpc_tables = RpcTableReloader::new(connection.clone(), emitter.clone());
-    let rpc_table_rx = rpc_tables.result_rx.clone();
     // Routes a reconnect (`NewHash(None)`) left unsure of, and when. Each may
     // be another device now, so it is refreshed whole on the tick, under the
     // same cooldown as a reset refresh, since a reboot raises both.
@@ -3778,8 +3776,7 @@ fn run_session(
                 let mut select = flume::Selector::new()
                     .recv(&command_rx, Wake::Command)
                     .recv(&tick, |_| Wake::Tick)
-                    .recv(&plot_tick, |_| Wake::PlotTick)
-                    .recv(&rpc_table_rx, Wake::Reloaded);
+                    .recv(&plot_tick, |_| Wake::PlotTick);
                 if batch_open {
                     select =
                         select.recv(batches.as_flume(), |msg| Wake::Batch(batches.resolve(msg)));
@@ -3795,6 +3792,9 @@ fn run_session(
                         })
                         .recv(feed.settings.as_flume(), |msg| {
                             Wake::Setting(feed.route, feed.settings.resolve(msg))
+                        })
+                        .recv(feed.registry.as_flume(), |msg| {
+                            Wake::Registry(feed.route, feed.registry.resolve(msg))
                         });
                 }
                 select.wait()
@@ -3959,7 +3959,7 @@ fn run_session(
                                         .last_presence
                                         .as_ref()
                                         .is_some_and(|last| !matches!(last, Presence::Connecting));
-                                feed.last_presence = Some(presence.clone());
+                                feed.last_presence = Some(presence);
                                 if reconnected {
                                     reconnected_routes.insert(route, Instant::now());
                                 }
@@ -3982,13 +3982,6 @@ fn run_session(
                     match msg {
                         Ok(change) => {
                             loop_profile.device_events += 1;
-                            // A changed rpc.hash names the route's RPC table, which
-                            // is reloaded off the loop.
-                            if change.name == "rpc.hash" {
-                                if let Ok(bytes) = <[u8; 4]>::try_from(change.reply.as_slice()) {
-                                    rpc_tables.announce(route, u32::from_le_bytes(bytes));
-                                }
-                            }
                             emitter.emit(&json!({
                                 "type": "deviceEvent",
                                 "route": route.to_string(),
@@ -4003,31 +3996,24 @@ fn run_session(
                     }
                     continue;
                 }
-                Wake::Reloaded(reloaded) => {
-                    if let Ok((route, fetched)) = reloaded {
-                        match rpc_tables.finish(&route, fetched.complete, Instant::now()) {
-                            Some(asked) => {
-                                // A reset refresh since the reload was asked
-                                // for read the table no earlier than it did.
-                                let superseded = last_reset_refresh_by_route
-                                    .get(&route)
-                                    .is_some_and(|at| *at >= asked);
-                                if !superseded
-                                    && apply_rpc_table(
-                                        &route,
-                                        fetched,
-                                        &mut discovery,
-                                        &mut rpc_index,
-                                    )
-                                {
-                                    emit_metadata_devices(&emitter, &discovery.devices);
-                                }
+                Wake::Registry(route, msg) => {
+                    match msg {
+                        Ok(Ok(registry)) => {
+                            // The proxy loads the table again on each new `rpc.hash`,
+                            // session, or reconnect, and publishes each one.
+                            let fetched = fetched_rpcs(&route, &registry);
+                            if apply_rpc_table(&route, fetched, &mut discovery, &mut rpc_index) {
+                                emit_metadata_devices(&emitter, &discovery.devices);
                             }
-                            None => emitter.debug(format!(
-                                "RPC table reload for {route} failed; asking again shortly"
-                            )),
                         }
-                        emitter.status("streaming", format!("Streaming from {url}"));
+                        Ok(Err(err)) => emitter.debug(format!(
+                            "RPC table for {route} could not be loaded ({err}); it loads again on the next change"
+                        )),
+                        Err(RecvError::Lagged(skipped)) => emitter.debug(format!(
+                            "session loop fell behind; {skipped} RPC table update(s) dropped"
+                        )),
+                        Err(RecvError::Timeout) => {}
+                        Err(_) => feeds.retain(|feed| feed.route != route),
                     }
                     continue;
                 }
@@ -4065,13 +4051,6 @@ fn run_session(
                             monitor_port_alive = drain.alive;
                             health.observe_incoming(drain.counts, Instant::now());
                         }
-                    }
-
-                    for route in rpc_tables.dispatch(Instant::now(), &discovery) {
-                        emitter.status(
-                            "metadata",
-                            format!("Settings on {route} changed; reloading settings"),
-                        );
                     }
 
                     let due_reconnects: Vec<(DeviceRoute, Instant)> = reconnected_routes
@@ -4388,9 +4367,8 @@ fn refresh_route_metadata(
     if fetched.rpc_metadata_complete {
         discovery.incomplete_rpc_routes.remove(route);
     } else {
-        discovery.incomplete_rpc_routes.insert(route.clone());
+        discovery.incomplete_rpc_routes.insert(*route);
     }
-    discovery.record_rpc_hash(route, fetched.rpc_hash);
 
     for stream in &fetched.device.streams {
         for column in &stream.columns {
@@ -4669,9 +4647,8 @@ fn add_late_discovered_route(
     };
 
     if !fetched.rpc_metadata_complete {
-        discovery.incomplete_rpc_routes.insert(route.clone());
+        discovery.incomplete_rpc_routes.insert(*route);
     }
-    discovery.record_rpc_hash(route, fetched.rpc_hash);
 
     for stream in &fetched.device.streams {
         for column in &stream.columns {
@@ -4714,14 +4691,8 @@ fn recover_incomplete_rpc_metadata(
             continue;
         };
 
-        let RpcFetchResult {
-            rpcs,
-            complete,
-            hash,
-        } = fetch_rpcs(&connection.device(route), &route, emitter);
-        if complete {
-            discovery.record_rpc_hash(&route, hash);
-        }
+        let RpcFetchResult { rpcs, complete } =
+            fetch_rpcs(&connection.device(route), &route, emitter);
         if !rpc_lists_equivalent(&discovery.devices[device_index].rpcs, &rpcs) {
             discovery.devices[device_index].rpcs = rpcs;
             metadata_changed = true;
@@ -4734,135 +4705,6 @@ fn recover_incomplete_rpc_metadata(
     }
 
     metadata_changed
-}
-
-/// Whether a `NewHash` leaves the RPC table fetched for a route stale. A
-/// reconnect (`None`) always does; a broadcast only when it names a table
-/// other than the one fetched.
-fn rpc_table_is_stale(fetched: Option<u32>, announced: Option<u32>) -> bool {
-    announced.is_none_or(|hash| fetched != Some(hash))
-}
-
-/// Reloads the RPC tables a broadcast `rpc.hash` names, off the session loop:
-/// `dev.priv` unlocking a device whose privileged table is not cached yet
-/// takes a whole `rpc.listinfo` walk, which would stall streaming on the loop.
-/// One walk at a time, like `tio monitor`'s registry queue.
-struct RpcTableReloader {
-    request_tx: Sender<DeviceRoute>,
-    result_rx: Receiver<(DeviceRoute, RpcFetchResult)>,
-    reloads: RpcTableReloads,
-}
-
-impl RpcTableReloader {
-    fn new(connection: Connection, emitter: Emitter) -> Self {
-        let (request_tx, request_rx) = flume::unbounded::<DeviceRoute>();
-        let (result_tx, result_rx) = flume::unbounded();
-
-        thread::Builder::new()
-            .name("rpc-table-reloader".into())
-            .spawn(move || {
-                while let Ok(route) = request_rx.recv() {
-                    let fetched = fetch_rpcs(&connection.device(route), &route, &emitter);
-                    if result_tx.send((route, fetched)).is_err() {
-                        break;
-                    }
-                }
-            })
-            .expect("failed to spawn RPC table reloader");
-
-        Self {
-            request_tx,
-            result_rx,
-            reloads: RpcTableReloads::default(),
-        }
-    }
-
-    fn announce(&mut self, route: DeviceRoute, hash: u32) {
-        self.reloads.announce(route, hash);
-    }
-
-    /// Ask for every reload now due, returning the routes asked for.
-    fn dispatch(&mut self, now: Instant, discovery: &DeviceDiscoveryResult) -> Vec<DeviceRoute> {
-        let due = self.reloads.due(now, discovery);
-        due.into_iter()
-            .filter(|route| {
-                let sent = self.request_tx.send(*route).is_ok();
-                if !sent {
-                    self.reloads.in_flight.remove(route);
-                }
-                sent
-            })
-            .collect()
-    }
-
-    /// Settle a reload the worker finished: when it was asked for, or `None`
-    /// when it failed and waits to be asked again.
-    fn finish(&mut self, route: &DeviceRoute, complete: bool, now: Instant) -> Option<Instant> {
-        self.reloads.finish(route, complete, now)
-    }
-}
-
-/// Which routes' RPC tables a broadcast has made stale, and where their
-/// reloads stand.
-#[derive(Default)]
-struct RpcTableReloads {
-    /// The hash each route last announced.
-    announced: HashMap<DeviceRoute, u32>,
-    /// Routes being reloaded, and when each was asked for.
-    in_flight: HashMap<DeviceRoute, Instant>,
-    /// When a route whose reload failed may be asked again.
-    retry_at: HashMap<DeviceRoute, Instant>,
-}
-
-impl RpcTableReloads {
-    fn announce(&mut self, route: DeviceRoute, hash: u32) {
-        self.announced.insert(route, hash);
-    }
-
-    /// The routes to reload now, marked in flight: each announced a table
-    /// other than the one held, is not being reloaded, and is not waiting out
-    /// a failure. An announcement the held table answers, or for a route no
-    /// longer in the session, is forgotten, though not while a reload is about
-    /// to replace that table.
-    fn due(&mut self, now: Instant, discovery: &DeviceDiscoveryResult) -> Vec<DeviceRoute> {
-        self.announced.retain(|route, hash| {
-            let route_text = route.to_string();
-            let in_session = discovery
-                .devices
-                .iter()
-                .any(|device| device.route == route_text);
-            let reloading = self.in_flight.contains_key(route);
-            let held = discovery.rpc_hashes.get(route).copied();
-            in_session && (reloading || rpc_table_is_stale(held, Some(*hash)))
-        });
-        let due: Vec<DeviceRoute> = self
-            .announced
-            .keys()
-            .filter(|route| {
-                !self.in_flight.contains_key(*route)
-                    && self.retry_at.get(*route).is_none_or(|at| now >= *at)
-            })
-            .copied()
-            .collect();
-        for route in &due {
-            self.in_flight.insert(*route, now);
-        }
-        due
-    }
-
-    /// When a finished reload was asked for, or `None` when it failed: the
-    /// announcement stands and is asked again after a pause.
-    fn finish(&mut self, route: &DeviceRoute, complete: bool, now: Instant) -> Option<Instant> {
-        let asked = self.in_flight.remove(route)?;
-        if complete {
-            self.retry_at.remove(route);
-            Some(asked)
-        } else {
-            self.retry_at
-                .insert(*route, now + RPC_METADATA_RECOVERY_INTERVAL);
-            None
-        }
-    }
 }
 
 /// Swap in a route's reloaded RPC table. True when the list changed; the
@@ -4881,7 +4723,6 @@ fn apply_rpc_table(
     else {
         return false;
     };
-    discovery.record_rpc_hash(route, fetched.hash);
     discovery.incomplete_rpc_routes.remove(route);
     let device = &mut discovery.devices[device_index];
     if rpc_lists_equivalent(&device.rpcs, &fetched.rpcs) {
@@ -5161,32 +5002,18 @@ fn wait_for_connection(
 struct DeviceDiscoveryResult {
     devices: Vec<DeviceDto>,
     incomplete_rpc_routes: HashSet<DeviceRoute>,
-    /// The `rpc.hash` each route's RPC table was fetched under, so a later
-    /// `NewHash` can tell whether that table is stale.
-    rpc_hashes: HashMap<DeviceRoute, u32>,
-}
-
-impl DeviceDiscoveryResult {
-    fn record_rpc_hash(&mut self, route: &DeviceRoute, hash: Option<u32>) {
-        match hash {
-            Some(hash) => self.rpc_hashes.insert(*route, hash),
-            None => self.rpc_hashes.remove(route),
-        };
-    }
 }
 
 #[derive(Debug)]
 struct FetchedDevice {
     device: DeviceDto,
     rpc_metadata_complete: bool,
-    rpc_hash: Option<u32>,
 }
 
 #[derive(Debug)]
 struct RpcFetchResult {
     rpcs: Vec<RpcDto>,
     complete: bool,
-    hash: Option<u32>,
 }
 
 fn discover_devices_until_available(
@@ -5266,7 +5093,6 @@ fn discover_devices(
 
     let mut devices = Vec::new();
     let mut incomplete_rpc_routes = HashSet::new();
-    let mut rpc_hashes = HashMap::new();
     for named in named_routes {
         let route = named.route;
         emitter.status("metadata", format!("Fetching metadata for route {route}"));
@@ -5283,10 +5109,7 @@ fn discover_devices(
         })) {
             Ok(Ok(fetched)) => {
                 if !fetched.rpc_metadata_complete {
-                    incomplete_rpc_routes.insert(route.clone());
-                }
-                if let Some(hash) = fetched.rpc_hash {
-                    rpc_hashes.insert(route, hash);
+                    incomplete_rpc_routes.insert(route);
                 }
                 devices.push(fetched.device);
             }
@@ -5310,7 +5133,6 @@ fn discover_devices(
     DeviceDiscoveryResult {
         devices,
         incomplete_rpc_routes,
-        rpc_hashes,
     }
 }
 
@@ -5432,7 +5254,6 @@ fn fetch_device(
             full_metadata,
         },
         rpc_metadata_complete: rpc_fetch.complete,
-        rpc_hash: rpc_fetch.hash,
     })
 }
 
@@ -5555,11 +5376,20 @@ fn fetch_rpcs(device: &Device, route: &DeviceRoute, emitter: &Emitter) -> RpcFet
             return RpcFetchResult {
                 rpcs: Vec::new(),
                 complete: false,
-                hash: None,
             };
         }
     };
 
+    let fetched = fetched_rpcs(route, &registry);
+    emitter.debug(format!(
+        "loaded {} RPC(s) for route {route}",
+        fetched.rpcs.len()
+    ));
+    fetched
+}
+
+/// The RPCs a device's registry lists, as the app's sorted RPC list.
+fn fetched_rpcs(route: &DeviceRoute, registry: &RpcRegistry) -> RpcFetchResult {
     let mut rpcs: Vec<RpcDto> = registry
         .iter()
         .map(|descriptor| RpcDto {
@@ -5575,13 +5405,10 @@ fn fetch_rpcs(device: &Device, route: &DeviceRoute, emitter: &Emitter) -> RpcFet
             value: None,
         })
         .collect();
-
     rpcs.sort_by(|a, b| a.name.cmp(&b.name));
-    emitter.debug(format!("loaded {} RPC(s) for route {route}", rpcs.len()));
     RpcFetchResult {
         rpcs,
         complete: true,
-        hash: registry.hash,
     }
 }
 
@@ -5625,6 +5452,8 @@ where
     F: FnMut() -> Result<T, RpcMetadataRequestError>,
 {
     for attempt in 1..=RPC_METADATA_RETRY_ATTEMPTS {
+        // A closure, not `request` itself: `request` is an `FnMut` called again later.
+        #[allow(clippy::redundant_closure)]
         let result = panic::catch_unwind(AssertUnwindSafe(|| request()));
         match result {
             Ok(Ok(value)) => {
@@ -6096,7 +5925,7 @@ fn process_batch(
     active_columns: &HashSet<ColumnKeyDto>,
     plot_panes: &[PlotPaneConfig],
     max_window_seconds: f64,
-    mut profiler: Option<&mut StreamIngestProfiler>,
+    profiler: Option<&mut StreamIngestProfiler>,
 ) {
     let profile_enabled = profiler.as_ref().is_some_and(|profiler| profiler.enabled);
     let profile_start = profile_enabled.then(Instant::now);
@@ -6191,7 +6020,7 @@ fn process_batch(
             }
         }
     }
-    if let (Some(start), Some(profiler)) = (profile_start, profiler.as_deref_mut()) {
+    if let (Some(start), Some(profiler)) = (profile_start, profiler) {
         profiler.record(
             start.elapsed(),
             display_elapsed,
@@ -7891,7 +7720,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn hex_decode(text: &str) -> Result<Vec<u8>, String> {
     let text = text.trim();
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return Err("Argument hex has an odd number of digits".to_string());
     }
     (0..text.len())
@@ -8509,110 +8338,42 @@ mod tests {
     }
 
     #[test]
-    fn new_hash_marks_the_rpc_table_stale_only_when_it_differs() {
-        // The broadcast names the table already fetched.
-        assert!(!rpc_table_is_stale(Some(7), Some(7)));
-        // It names another table, or none was fetched under a hash.
-        assert!(rpc_table_is_stale(Some(7), Some(8)));
-        assert!(rpc_table_is_stale(None, Some(8)));
-        // A reconnect asks for a refresh whatever was fetched.
-        assert!(rpc_table_is_stale(Some(7), None));
-        assert!(rpc_table_is_stale(None, None));
-    }
-
-    fn discovery_holding(route: &DeviceRoute, hash: u32) -> DeviceDiscoveryResult {
-        DeviceDiscoveryResult {
+    fn a_registry_update_replaces_the_routes_rpcs_only_when_it_differs() {
+        let route = DeviceRoute::from_str("/1").unwrap();
+        let (_, name) = indexed_rpc(&route, "dev.name", "string");
+        let mut discovery = DeviceDiscoveryResult {
             devices: vec![test_device(&route.to_string())],
             incomplete_rpc_routes: HashSet::new(),
-            rpc_hashes: HashMap::from([(*route, hash)]),
-        }
-    }
-
-    #[test]
-    fn a_broadcast_reloads_only_a_table_other_than_the_one_held() {
-        let route = DeviceRoute::from_str("/1").unwrap();
-        let discovery = discovery_holding(&route, 7);
-        let mut reloads = RpcTableReloads::default();
-        let now = Instant::now();
-
-        reloads.announce(route, 7);
-        assert!(reloads.due(now, &discovery).is_empty());
-        assert!(reloads.announced.is_empty(), "the held table answers it");
-
-        // `dev.priv` unlocks: asked for at once, and only once.
-        reloads.announce(route, 8);
-        assert_eq!(reloads.due(now, &discovery), [route]);
-        assert!(reloads.due(now, &discovery).is_empty());
-    }
-
-    #[test]
-    fn a_newer_broadcast_waits_for_the_reload_in_flight() {
-        let route = DeviceRoute::from_str("/1").unwrap();
-        let mut discovery = discovery_holding(&route, 7);
-        let mut reloads = RpcTableReloads::default();
-        let now = Instant::now();
-
-        reloads.announce(route, 8);
-        assert_eq!(reloads.due(now, &discovery), [route]);
-        // Locked again while the unlocked table is being walked.
-        reloads.announce(route, 7);
-        assert!(reloads.due(now, &discovery).is_empty());
-
-        assert_eq!(reloads.finish(&route, true, now), Some(now));
-        discovery.record_rpc_hash(&route, Some(8));
-        assert_eq!(reloads.due(now, &discovery), [route]);
-    }
-
-    #[test]
-    fn a_failed_reload_is_asked_again_after_a_pause() {
-        let route = DeviceRoute::from_str("/1").unwrap();
-        let discovery = discovery_holding(&route, 7);
-        let mut reloads = RpcTableReloads::default();
-        let now = Instant::now();
-
-        reloads.announce(route, 8);
-        assert_eq!(reloads.due(now, &discovery), [route]);
-        assert_eq!(reloads.finish(&route, false, now), None);
-        assert!(reloads.due(now, &discovery).is_empty());
-        let later = now + RPC_METADATA_RECOVERY_INTERVAL;
-        assert_eq!(reloads.due(later, &discovery), [route]);
-    }
-
-    #[test]
-    fn a_broadcast_from_a_route_gone_from_the_session_is_forgotten() {
-        let route = DeviceRoute::from_str("/1").unwrap();
-        let gone = DeviceRoute::from_str("/2").unwrap();
-        let discovery = discovery_holding(&route, 7);
-        let mut reloads = RpcTableReloads::default();
-
-        reloads.announce(gone, 8);
-        assert!(reloads.due(Instant::now(), &discovery).is_empty());
-        assert!(reloads.announced.is_empty());
-    }
-
-    #[test]
-    fn a_reloaded_table_replaces_the_routes_rpcs_and_hash() {
-        let route = DeviceRoute::from_str("/1").unwrap();
-        let mut discovery = discovery_holding(&route, 7);
-        let (_, name) = indexed_rpc(&route, "dev.name", "string");
-        let (_, password) = indexed_rpc(&route, "dev.priv.password", "string");
-        discovery.devices[0].rpcs = vec![name.clone()];
+        };
+        discovery.devices[0].rpcs = vec![name];
         let mut rpc_index = build_rpc_index(&discovery.devices);
-        let unlocked = || RpcFetchResult {
-            rpcs: vec![name.clone(), password.clone()],
-            complete: true,
-            hash: Some(8),
+        let registry = |names: &[&str]| {
+            RpcRegistry::new(
+                names
+                    .iter()
+                    .map(|name| {
+                        RpcDescriptor::from_meta(
+                            twinleaf::device::rpc::RpcMeta::typed(
+                                RpcValueType::Bool,
+                                RpcMetaFlags::READABLE,
+                            )
+                            .bits(),
+                            name.to_string(),
+                        )
+                    })
+                    .collect(),
+            )
         };
 
-        let changed = apply_rpc_table(&route, unlocked(), &mut discovery, &mut rpc_index);
-        assert!(changed);
-        assert_eq!(discovery.rpc_hashes.get(&route), Some(&8));
+        // `dev.priv` unlocks: the registry lists one more RPC, and the app hears it.
+        let unlocked = fetched_rpcs(&route, &registry(&["dev.name", "dev.priv.password"]));
+        assert!(apply_rpc_table(&route, unlocked, &mut discovery, &mut rpc_index));
         assert_eq!(discovery.devices[0].rpcs.len(), 2);
         assert!(rpc_index.contains_key(&(route.to_string(), "dev.priv.password".to_string())));
 
         // The same table again changes nothing the app must hear about.
-        let changed = apply_rpc_table(&route, unlocked(), &mut discovery, &mut rpc_index);
-        assert!(!changed);
+        let again = fetched_rpcs(&route, &registry(&["dev.name", "dev.priv.password"]));
+        assert!(!apply_rpc_table(&route, again, &mut discovery, &mut rpc_index));
     }
 
     #[test]

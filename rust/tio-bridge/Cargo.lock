@@ -1236,7 +1236,6 @@ dependencies = [
 name = "tio-bridge"
 version = "0.1.0"
 dependencies = [
- "flume",
  "log",
  "serde",
  "serde_json",

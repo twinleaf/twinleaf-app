@@ -3,8 +3,6 @@
 #![allow(dead_code)]
 
 mod direct {
-    include!("main.rs");
-
     use std::ffi::CStr;
     use std::os::raw::c_char;
 
@@ -643,6 +641,9 @@ mod direct {
             _ => ExportFormat::Csv,
         }
     }
+
+    // The bridge itself, shared with the command-line binary.
+    include!("main.rs");
 }
 
 #[cfg(test)]
