@@ -2,6 +2,7 @@
 
 import Foundation
 import SwiftUI
+import TipKit
 
 #if os(macOS)
 import AppKit
@@ -12,6 +13,10 @@ struct TwinleafApp: App {
     #if os(macOS)
     @NSApplicationDelegateAdaptor(TwinleafAppDelegate.self) private var appDelegate
     #endif
+
+    init() {
+        try? Tips.configure()
+    }
 
     var body: some Scene {
         #if os(macOS)

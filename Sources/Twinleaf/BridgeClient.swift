@@ -147,7 +147,18 @@ final class BridgeClient: ObservableObject {
 
     @Published var availableDevices: [AvailableDevice] = []
     @Published private(set) var rememberedDeviceURLs: [String] = []
-    @Published var devices: [DeviceInfo] = []
+    @Published var devices: [DeviceInfo] = [] {
+        didSet {
+            // `devices` republishes with every live readout; only connecting
+            // and disconnecting matter here.
+            if devices.isEmpty != oldValue.isEmpty {
+                refreshLoggingLiveness()
+            }
+        }
+    }
+    /// True while this window has asked the core to record. Whether packets
+    /// are actually arriving also depends on being connected.
+    private var isLoggingRequested = false
     /// True when at least two connected sensors share a device type. Tracked
     /// apart from `devices`, which republishes with every live readout, so
     /// this changes only when the set of sensors does.
@@ -213,6 +224,10 @@ final class BridgeClient: ObservableObject {
     }()
     #endif
     private var pendingPlotSnapshots: [Int: PlotSnapshot] = [:]
+    /// Frames waiting out the redraw limit `PlotRefreshGovernor` sets.
+    private var heldPlotSnapshots: [Int: PlotSnapshot] = [:]
+    private var lastLivePlotApplyAt: [Int: TimeInterval] = [:]
+    private var heldPlotFlushTask: Task<Void, Never>?
     private var lastLogRevisionMark = Date.distantPast
     private var nextPlotPaneID = 1
     private var nextPlotRevision: UInt64 = 1
@@ -266,6 +281,24 @@ final class BridgeClient: ObservableObject {
 
     deinit {
         BridgeSessionRegistry.shared.unregister(sessionID: sessionID)
+        LoggingSessionMonitor.sessionClosed(sessionID)
+    }
+
+    /// Tells the app-wide monitor whether this window is recording, so the
+    /// system is kept from napping or sleeping through a log.
+    private func refreshLoggingLiveness() {
+        let names = devices.map(\.meta.name).filter { !$0.isEmpty }
+        let deviceName: String
+        switch names.count {
+        case 0: deviceName = ""
+        case 1: deviceName = names[0]
+        default: deviceName = "\(names[0]) + \(names.count - 1) more"
+        }
+        LoggingSessionMonitor.shared.setLogging(
+            isLoggingRequested && !isInspectionMode && !devices.isEmpty,
+            sessionID: sessionID,
+            deviceName: deviceName
+        )
     }
 
     var latestLogMessage: LogMessage? {
@@ -462,6 +495,8 @@ final class BridgeClient: ObservableObject {
 
     func setLogging(enabled: Bool, logURL: URL?) {
         startIfNeeded()
+        isLoggingRequested = enabled && logURL != nil
+        refreshLoggingLiveness()
         guard enabled, let logURL else {
             runtime?.setLogging(enabled: false, logPath: nil)
             logBytes = 0
@@ -1932,6 +1967,42 @@ final class BridgeClient: ObservableObject {
         if isPlotPaused {
             pendingPlotSnapshots[paneID] = snapshot
         } else {
+            applyLivePlotSnapshot(snapshot)
+        }
+    }
+
+    /// Draws a live frame, or holds it briefly when the device is hot or
+    /// saving power. Only drawing waits: by the time a frame reaches here the
+    /// core has already logged its packets.
+    private func applyLivePlotSnapshot(_ snapshot: PlotSnapshot) {
+        let interval = PlotRefreshGovernor.shared.minimumPlotInterval
+        let now = ProcessInfo.processInfo.systemUptime
+        let dueAt = (lastLivePlotApplyAt[snapshot.paneID] ?? 0) + interval
+        guard interval > 0, now < dueAt else {
+            heldPlotSnapshots[snapshot.paneID] = nil
+            lastLivePlotApplyAt[snapshot.paneID] = now
+            applyPlotSnapshot(snapshot)
+            return
+        }
+
+        // Keep only the newest frame, and make sure it is drawn even if no
+        // later frame arrives to push it out.
+        heldPlotSnapshots[snapshot.paneID] = snapshot
+        guard heldPlotFlushTask == nil else { return }
+        heldPlotFlushTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(dueAt - now))
+            self?.flushHeldPlotSnapshots()
+        }
+    }
+
+    private func flushHeldPlotSnapshots() {
+        heldPlotFlushTask = nil
+        let held = heldPlotSnapshots
+        heldPlotSnapshots.removeAll()
+        guard !isPlotPaused, !isInspectionMode else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        for snapshot in held.values where plotPanes.contains(where: { $0.id == snapshot.paneID }) {
+            lastLivePlotApplyAt[snapshot.paneID] = now
             applyPlotSnapshot(snapshot)
         }
     }

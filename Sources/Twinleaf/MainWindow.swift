@@ -3,6 +3,7 @@
 import Combine
 import Foundation
 import SwiftUI
+import TipKit
 import UniformTypeIdentifiers
 
 #if os(macOS)
@@ -115,6 +116,7 @@ struct DocumentWindow: View {
     @State private var verticalAxisModes: [Int: VerticalAxisMode] = [:]
     @State private var independentAxisLabelVisibility: [Int: Bool] = [:]
     @State private var rpcSliders: [RPCSliderConfiguration] = []
+    @ObservedObject private var plotRefreshGovernor = PlotRefreshGovernor.shared
     /// The graph border a column drag is hovering, where a drop opens a new graph.
     @State private var newGraphDropTarget: NewGraphDropTarget?
     @StateObject private var captureStore = CapturePaneStore()
@@ -1410,6 +1412,7 @@ struct DocumentWindow: View {
     private func handleSettingsDrop(_ providers: [NSItemProvider]) -> Bool {
         SettingDragPayload.loadFirst(from: providers) { payload in
             guard let payload else { return }
+            DragSettingsTip().invalidate(reason: .actionPerformed)
             for rpcID in payload.rpcIDs {
                 guard let rpc = bridge.rpc(id: rpcID) else { continue }
                 if rpc.isCaptureRPC {
@@ -1507,6 +1510,14 @@ struct DocumentWindow: View {
                 }
             }
             .animation(.easeInOut(duration: 0.12), value: newGraphDropTarget)
+            .overlay(alignment: .bottom) {
+                if panes.count > 1 {
+                    TipView(ReorderGraphsTip())
+                        .frame(maxWidth: 380)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 44)
+                }
+            }
         }
         .frame(minWidth: 520, minHeight: 360)
     }
@@ -1557,8 +1568,10 @@ struct DocumentWindow: View {
                     },
                     onPlotColumnsDropped: { payload in
                         bridge.dropPlotColumns(payload, into: pane.id)
+                        DragStreamsTip().invalidate(reason: .actionPerformed)
                     },
                     onPlotColumnsDroppedAtEdge: bridge.canAddPlotPane ? { payload, edge in
+                        DragStreamsTip().invalidate(reason: .actionPerformed)
                         bridge.insertPlotPane(payload, adjacentTo: pane.id, above: edge == .top)
                     } : nil,
                     onDropEdgeChange: { edge, movesGraph in
@@ -1577,6 +1590,7 @@ struct DocumentWindow: View {
                         PlotPaneDragPayload.loadFirst(from: providers) { payload in
                             guard let payload, payload.sessionID == bridge.sessionID else { return }
                             bridge.movePlotPane(id: payload.paneID, adjacentTo: pane.id, above: edge == .top)
+                            ReorderGraphsTip().invalidate(reason: .actionPerformed)
                         }
                     },
                     registerPlotDragContent: { provider in
@@ -2254,6 +2268,12 @@ struct DocumentWindow: View {
             .font(.caption)
             .foregroundStyle(shouldShowSmoke ? .orange : .secondary)
             .help("Current .tio log size")
+        if let reason = plotRefreshGovernor.reason, !bridge.isInspectionMode {
+            Label(reason, systemImage: "tortoise")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help("Graphs redraw less often to save power. Logging is not affected.")
+        }
         if let elapsedSeconds = bridge.logElapsedSeconds {
             Label(formatPlaybackTime(elapsedSeconds), systemImage: "timer")
                 .font(.caption)
@@ -7221,6 +7241,10 @@ private struct StreamSidebar: View {
 
                 if !visibleStreamGroups.isEmpty || sidebarSearchQuery.isEmpty {
                     Section {
+                        TipView(DragStreamsTip())
+                            .listRowSeparator(.hidden)
+                            .listRowBackground(Color.clear)
+
                         ForEach(streamDeviceEntries) { entry in
                             switch entry {
                             case .single(let device):
@@ -8601,6 +8625,10 @@ private struct RPCSliderTray: View {
 
     var body: some View {
         VStack(spacing: 6) {
+            if sliders.count > 1 {
+                TipView(ReorderSlidersTip())
+            }
+
             ForEach($sliders) { $slider in
                 RPCSliderControlRow(
                     bridge: bridge,
@@ -8673,6 +8701,7 @@ private struct SliderReorderDropDelegate: DropDelegate {
         withAnimation(.easeInOut(duration: 0.18)) {
             sliders.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
         }
+        ReorderSlidersTip().invalidate(reason: .actionPerformed)
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
@@ -9738,6 +9767,10 @@ private struct SettingsSidebarSections: View {
                 .listRowSeparator(.hidden)
                 .listRowBackground(Color.clear)
             } else {
+                TipView(DragSettingsTip())
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+
                 ForEach(deviceEntries) { entry in
                     switch entry {
                     case .single(let device):
