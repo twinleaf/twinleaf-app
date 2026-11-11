@@ -119,6 +119,26 @@
 			<key>UTTypeIdentifier</key>
 			<string>com.twarge.twinleaf.settings</string>
 		</dict>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.json</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Twinleaf Graph</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.twarge.twinleaf.plot-pane</string>
+		</dict>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.json</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Twinleaf Slider</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.twarge.twinleaf.slider</string>
+		</dict>
 	</array>
 	<key>UTImportedTypeDeclarations</key>
 	<array>

@@ -37,6 +37,8 @@ extension UTType {
     static let twinleafHDF5 = UTType(importedAs: "org.hdfgroup.hdf5", conformingTo: .data)
     static let twinleafPlotColumns = UTType(exportedAs: "com.twarge.twinleaf.plot-columns", conformingTo: .json)
     static let twinleafSettings = UTType(exportedAs: "com.twarge.twinleaf.settings", conformingTo: .json)
+    static let twinleafPlotPane = UTType(exportedAs: "com.twarge.twinleaf.plot-pane", conformingTo: .json)
+    static let twinleafSlider = UTType(exportedAs: "com.twarge.twinleaf.slider", conformingTo: .json)
 }
 
 struct AvailableDevice: Codable, Hashable, Identifiable {
@@ -402,16 +404,15 @@ struct PlotColumnDragPayload: Codable, Hashable, Sendable {
     }
 }
 
-/// Settings dragged out of the sidebar, identified by `RpcInfo.id`. Dropped on
-/// the plot area, each becomes a slider (or a capture plot for a capture RPC).
-struct SettingDragPayload: Codable, Hashable, Sendable {
-    let rpcIDs: [String]
+/// A drag payload that only ever travels between this app's own views.
+protocol InAppDragPayload: Codable, Sendable {
+    static var contentType: UTType { get }
+}
 
-    static let contentType = UTType.twinleafSettings
-
-    var itemProvider: NSItemProvider {
-        let provider = NSItemProvider()
-        guard let data = try? JSONEncoder().encode(self) else { return provider }
+extension InAppDragPayload {
+    /// Adds this payload to a drag that may already carry other content.
+    func register(in provider: NSItemProvider) {
+        guard let data = try? JSONEncoder().encode(self) else { return }
         provider.registerDataRepresentation(
             forTypeIdentifier: Self.contentType.identifier,
             visibility: .ownProcess
@@ -419,27 +420,56 @@ struct SettingDragPayload: Codable, Hashable, Sendable {
             completion(data, nil)
             return nil
         }
+    }
+
+    var itemProvider: NSItemProvider {
+        let provider = NSItemProvider()
+        register(in: provider)
         return provider
     }
 
     static func loadFirst(
         from providers: [NSItemProvider],
-        completion: @escaping @MainActor @Sendable (SettingDragPayload?) -> Void
+        completion: @escaping @MainActor @Sendable (Self?) -> Void
     ) -> Bool {
         guard let provider = providers.first(where: {
-            $0.hasItemConformingToTypeIdentifier(Self.contentType.identifier)
+            $0.hasItemConformingToTypeIdentifier(contentType.identifier)
         }) else {
             return false
         }
 
-        provider.loadDataRepresentation(forTypeIdentifier: Self.contentType.identifier) { data, _ in
-            let payload = data.flatMap { try? JSONDecoder().decode(SettingDragPayload.self, from: $0) }
+        provider.loadDataRepresentation(forTypeIdentifier: contentType.identifier) { data, _ in
+            let payload = data.flatMap { try? JSONDecoder().decode(Self.self, from: $0) }
             Task { @MainActor in
                 completion(payload)
             }
         }
         return true
     }
+}
+
+/// Settings dragged out of the sidebar, identified by `RpcInfo.id`. Dropped on
+/// the plot area, each becomes a slider (or a capture plot for a capture RPC).
+struct SettingDragPayload: InAppDragPayload, Hashable {
+    let rpcIDs: [String]
+
+    static let contentType = UTType.twinleafSettings
+}
+
+/// A graph being dragged to a new place in its window's stack. The session
+/// keeps a drag from one document window from rearranging another's graphs.
+struct PlotPaneDragPayload: InAppDragPayload, Hashable {
+    let sessionID: UUID
+    let paneID: Int
+
+    static let contentType = UTType.twinleafPlotPane
+}
+
+/// A slider being dragged to a new place in the slider tray.
+struct SliderDragPayload: InAppDragPayload, Hashable {
+    let sliderID: String
+
+    static let contentType = UTType.twinleafSlider
 }
 
 enum PlotWindowDuration {

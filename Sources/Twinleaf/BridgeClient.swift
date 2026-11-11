@@ -781,6 +781,21 @@ final class BridgeClient: ObservableObject {
         updateRuntimePlotPanes()
     }
 
+    /// Move a graph so it sits directly above or below another one.
+    func movePlotPane(id: Int, adjacentTo neighborPaneID: Int, above: Bool) {
+        guard id != neighborPaneID,
+              let sourceIndex = plotPanes.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        var panes = plotPanes
+        let pane = panes.remove(at: sourceIndex)
+        guard let neighborIndex = panes.firstIndex(where: { $0.id == neighborPaneID }) else { return }
+        panes.insert(pane, at: above ? neighborIndex : neighborIndex + 1)
+        guard panes.map(\.id) != plotPanes.map(\.id) else { return }
+        plotPanes = panes
+        updateRuntimePlotPanes()
+    }
+
     /// Replace every pane wholesale, as a saved-layout restore does.
     ///
     /// Unlike removing a column from a graph, this discards the previous

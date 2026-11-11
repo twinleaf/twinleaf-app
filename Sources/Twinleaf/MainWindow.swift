@@ -32,7 +32,10 @@ private struct PlotCanvasFrameHost: View {
     var onTimeseriesZoom: (Double, Double) -> Void = { _, _ in }
     var onPlotColumnsDropped: (PlotColumnDragPayload) -> Void = { _ in }
     var onPlotColumnsDroppedAtEdge: ((PlotColumnDragPayload, VerticalEdge) -> Void)? = nil
-    var onDropEdgeChange: (VerticalEdge?) -> Void = { _ in }
+    var onDropEdgeChange: (VerticalEdge?, Bool) -> Void = { _, _ in }
+    var edgeOnlyDropTypes: [UTType] = []
+    var onEdgeItemsDropped: ([NSItemProvider], VerticalEdge) -> Bool = { _, _ in false }
+    var registerPlotDragContent: (NSItemProvider) -> Void = { _ in }
     var otherDropTypes: [UTType] = []
     var onOtherItemsDropped: ([NSItemProvider]) -> Bool = { _ in false }
     var legendMenu: (PlotSeries) -> AnyView = { _ in AnyView(EmptyView()) }
@@ -67,6 +70,9 @@ private struct PlotCanvasFrameHost: View {
             onPlotColumnsDropped: onPlotColumnsDropped,
             onPlotColumnsDroppedAtEdge: onPlotColumnsDroppedAtEdge,
             onDropEdgeChange: onDropEdgeChange,
+            edgeOnlyDropTypes: edgeOnlyDropTypes,
+            onEdgeItemsDropped: onEdgeItemsDropped,
+            registerPlotDragContent: registerPlotDragContent,
             otherDropTypes: otherDropTypes,
             onOtherItemsDropped: onOtherItemsDropped,
             legendMenu: legendMenu
@@ -1395,6 +1401,10 @@ struct DocumentWindow: View {
         }
     }
 
+    private func plotPaneDragPayload(for pane: PlotPaneSelection) -> PlotPaneDragPayload {
+        PlotPaneDragPayload(sessionID: bridge.sessionID, paneID: pane.id)
+    }
+
     /// Settings dragged out of the sidebar: each one that can drive a slider
     /// gets one, and a capture RPC gets its capture plot.
     private func handleSettingsDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -1486,7 +1496,7 @@ struct DocumentWindow: View {
                         + graphFrameHeight * CGFloat(borderIndex)
                     let minY = geometry.safeAreaInsets.top + 12
                     let maxY = max(minY, geometry.size.height - 12)
-                    NewGraphDropIndicator()
+                    NewGraphDropIndicator(title: target.movesGraph ? "Move Here" : "New Graph")
                         .frame(width: geometry.size.width)
                         .position(
                             x: geometry.size.width / 2,
@@ -1551,12 +1561,26 @@ struct DocumentWindow: View {
                     onPlotColumnsDroppedAtEdge: bridge.canAddPlotPane ? { payload, edge in
                         bridge.insertPlotPane(payload, adjacentTo: pane.id, above: edge == .top)
                     } : nil,
-                    onDropEdgeChange: { edge in
+                    onDropEdgeChange: { edge, movesGraph in
                         if let edge {
-                            newGraphDropTarget = NewGraphDropTarget(paneID: pane.id, above: edge == .top)
+                            newGraphDropTarget = NewGraphDropTarget(
+                                paneID: pane.id,
+                                above: edge == .top,
+                                movesGraph: movesGraph
+                            )
                         } else if newGraphDropTarget?.paneID == pane.id {
                             newGraphDropTarget = nil
                         }
+                    },
+                    edgeOnlyDropTypes: [PlotPaneDragPayload.contentType],
+                    onEdgeItemsDropped: { providers, edge in
+                        PlotPaneDragPayload.loadFirst(from: providers) { payload in
+                            guard let payload, payload.sessionID == bridge.sessionID else { return }
+                            bridge.movePlotPane(id: payload.paneID, adjacentTo: pane.id, above: edge == .top)
+                        }
+                    },
+                    registerPlotDragContent: { provider in
+                        plotPaneDragPayload(for: pane).register(in: provider)
                     },
                     otherDropTypes: [SettingDragPayload.contentType],
                     onOtherItemsDropped: handleSettingsDrop,
@@ -1756,7 +1780,10 @@ struct DocumentWindow: View {
                 onMoveDown: {
                     bridge.movePlotPane(id: pane.id, by: 1)
                 },
-                onOpenWindow: plotOpenWindowAction(for: pane)
+                onOpenWindow: plotOpenWindowAction(for: pane),
+                dragProvider: {
+                    plotPaneDragPayload(for: pane).itemProvider
+                }
             )
 
             Divider()
@@ -3633,8 +3660,18 @@ private struct GraphRailGripMenu: View {
     let onMoveUp: () -> Void
     let onMoveDown: () -> Void
     let onOpenWindow: (() -> Void)?
+    /// Lets the grip be dragged to reorder what it belongs to.
+    var dragProvider: (() -> NSItemProvider)? = nil
 
     var body: some View {
+        if let dragProvider {
+            menu.onDrag(dragProvider)
+        } else {
+            menu
+        }
+    }
+
+    private var menu: some View {
         Menu {
             Button {
                 onMoveUp()
@@ -6943,40 +6980,67 @@ private struct DevicePickerRow: View {
     let onEdit: (() -> Void)?
     let onForget: () -> Void
 
+    /// The name of the device on the port, when discovery has learned one.
+    /// Until then the label is only a stand-in: the kind of port, or its URL.
+    private var identifiedName: String? {
+        let rootName = device.routes.first(where: \.isRoot)?.name
+        if let rootName, !rootName.isEmpty { return rootName }
+        guard device.kind != "remembered",
+              !device.label.isEmpty,
+              device.label != device.kind,
+              device.label != device.url else {
+            return nil
+        }
+        return device.label
+    }
+
+    @ViewBuilder
+    private var detailCaption: some View {
+        if device.kind != "remembered", !device.detail.isEmpty {
+            Text(device.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 4) {
-                if device.kind == "remembered" {
-                    // Remembered entries are just URLs: show the URL as the
-                    // primary line, with known connected devices below. A
-                    // multi-sensor entry lists each URL with its /N mount.
-                    let urls = device.url.split(separator: " ").map(String.init)
-                    if urls.count > 1 {
-                        ForEach(Array(urls.enumerated()), id: \.offset) { index, url in
-                            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                Text("/\(index)")
-                                    .font(.caption.monospaced())
-                                    .foregroundStyle(.secondary)
-                                Text(url)
-                                    .font(.callout.monospaced().weight(.semibold))
-                            }
+                let urls = device.url.split(separator: " ").map(String.init)
+                if device.kind == "remembered", urls.count > 1 {
+                    // A remembered multi-sensor entry is a list of URLs, each
+                    // with the /N mount it connects at.
+                    ForEach(Array(urls.enumerated()), id: \.offset) { index, url in
+                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                            Text("/\(index)")
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                            Text(url)
+                                .font(.headline.monospaced())
                         }
-                    } else {
-                        Text(device.url)
-                            .font(.callout.monospaced().weight(.semibold))
                     }
-                } else {
-                    Text(device.label)
+                    DeviceRouteTree(routes: device.routes)
+                } else if let name = identifiedName {
+                    // What is on the port leads; where it is follows in small
+                    // print.
+                    Text(name)
                         .font(.headline)
+                    DeviceRouteTree(routes: device.routes)
                     Text(device.url)
-                        .font(.callout.monospaced())
-                    Text(device.detail)
-                        .font(.caption)
+                        .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
-                }
-                if !device.routes.isEmpty {
-                    DeviceRouteList(routes: device.routes)
-                        .padding(.top, 2)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    detailCaption
+                } else {
+                    // Nothing identified on the port: the port is all there is
+                    // to call it.
+                    Text(device.url)
+                        .font(.headline.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    DeviceRouteTree(routes: device.routes)
+                    detailCaption
                 }
             }
 
@@ -7015,6 +7079,8 @@ private struct DevicePickerRow: View {
     }
 }
 
+/// Every device a URL reaches, root included, as a compact list under the
+/// URL field being edited.
 private struct DeviceRouteList: View {
     let routes: [AvailableDeviceRoute]
 
@@ -7033,6 +7099,49 @@ private struct DeviceRouteList: View {
                 .padding(.leading, CGFloat(route.depth) * 12)
             }
         }
+    }
+}
+
+/// The sensors attached below a port's root device, drawn as a tree hanging
+/// off the row's headline. The root itself is the headline, so it is skipped.
+private struct DeviceRouteTree: View {
+    let routes: [AvailableDeviceRoute]
+
+    private var attached: [AvailableDeviceRoute] {
+        routes.filter { !$0.isRoot }
+    }
+
+    var body: some View {
+        let attached = attached
+        if !attached.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(Array(attached.enumerated()), id: \.element.id) { index, route in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(isLastSibling(at: index, in: attached) ? "└" : "├")
+                            .font(.headline.monospaced())
+                            .foregroundStyle(.tertiary)
+                        Text(route.displayName)
+                            .font(.headline)
+                            .lineLimit(1)
+                        Text(route.route)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.leading, CGFloat(max(0, route.depth - 1)) * 18)
+                }
+            }
+        }
+    }
+
+    /// True when no later route sits at this one's level under the same
+    /// parent, so its branch is the one that closes the level.
+    private func isLastSibling(at index: Int, in routes: [AvailableDeviceRoute]) -> Bool {
+        let depth = routes[index].depth
+        for later in routes[(index + 1)...] {
+            if later.depth < depth { return true }
+            if later.depth == depth { return false }
+        }
+        return true
     }
 }
 
@@ -8460,6 +8569,8 @@ private struct RestoredBoardPlotPane {
 private struct NewGraphDropTarget: Equatable {
     let paneID: Int
     let above: Bool
+    /// The drag is an existing graph changing place, not columns opening one.
+    let movesGraph: Bool
 }
 
 private struct RPCSliderConfiguration: Identifiable, Hashable {
@@ -8482,6 +8593,8 @@ private struct RPCSliderTray: View {
     /// bottom of the window it runs into the display's corners on iPhone and
     /// the window's on Mac and iPad.
     @State private var cornerInsets = RectangleCornerInsets()
+    /// The slider being dragged to a new place; rows reorder live under it.
+    @State private var draggedSliderID: String?
 
     private static let horizontalPadding: CGFloat = 12
     private static let verticalPadding: CGFloat = 8
@@ -8496,9 +8609,27 @@ private struct RPCSliderTray: View {
                     onOpenWindow: onOpenSliderWindow.map { open in
                         { open(slider) }
                     },
+                    dragProvider: sliders.count > 1 ? {
+                        draggedSliderID = slider.id
+                        return SliderDragPayload(sliderID: slider.id).itemProvider
+                    } : nil,
                     focusedField: focusedField
                 )
+                .opacity(draggedSliderID == slider.id ? 0.5 : 1)
+                .onDrop(
+                    of: [SliderDragPayload.contentType],
+                    delegate: SliderReorderDropDelegate(
+                        targetID: slider.id,
+                        sliders: $sliders,
+                        draggedID: $draggedSliderID
+                    )
+                )
             }
+        }
+        // A slider dropped in the tray's padding still ends the drag cleanly.
+        .onDrop(of: [SliderDragPayload.contentType], isTargeted: nil) { _ in
+            draggedSliderID = nil
+            return true
         }
         .padding(.leading, Self.horizontalInset(clearing: cornerInsets.bottomLeading))
         .padding(.trailing, Self.horizontalInset(clearing: cornerInsets.bottomTrailing))
@@ -8526,11 +8657,41 @@ private struct RPCSliderTray: View {
     }
 }
 
+/// Reorders the tray as a dragged slider passes over each row, so the rows
+/// make room where it would land.
+private struct SliderReorderDropDelegate: DropDelegate {
+    let targetID: String
+    @Binding var sliders: [RPCSliderConfiguration]
+    @Binding var draggedID: String?
+
+    func dropEntered(info: DropInfo) {
+        guard let draggedID, draggedID != targetID,
+              let from = sliders.firstIndex(where: { $0.id == draggedID }),
+              let to = sliders.firstIndex(where: { $0.id == targetID }) else {
+            return
+        }
+        withAnimation(.easeInOut(duration: 0.18)) {
+            sliders.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggedID = nil
+        return true
+    }
+}
+
 private struct RPCSliderControlRow: View {
     @ObservedObject var bridge: BridgeClient
     @Binding var slider: RPCSliderConfiguration
     let onRemove: (() -> Void)?
     let onOpenWindow: (() -> Void)?
+    /// Set when the row can be dragged by its title to reorder it.
+    var dragProvider: (() -> NSItemProvider)? = nil
     let focusedField: FocusState<RpcFocusField?>.Binding
 
     @AppStorage(ViewPreferenceKeys.rpcFloatPrecisionPPM) private var rpcFloatPrecisionPPM = NumericDisplayPolicy.defaultRPCFloatPrecisionPPM
@@ -8562,14 +8723,7 @@ private struct RPCSliderControlRow: View {
         if let rpc = bridge.rpc(id: slider.id) {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
-                    Text(rpc.name)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .contextMenu {
-                            sliderNameMenu
-                        }
-
-                    Spacer(minLength: 12)
+                    sliderTitle(for: rpc)
 
                     if let onRemove {
                         Button(action: onRemove) {
@@ -8653,6 +8807,37 @@ private struct RPCSliderControlRow: View {
                       !isValueFieldFocused else { return }
                 syncValueDraft(for: latest)
             }
+        }
+    }
+
+    /// The row's title strip: the setting's name and the empty space beside
+    /// it. When the row can be reordered it doubles as the drag handle.
+    @ViewBuilder
+    private func sliderTitle(for rpc: RpcInfo) -> some View {
+        let title = HStack(spacing: 8) {
+            if dragProvider != nil {
+                Image(systemName: "line.3.horizontal")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(rpc.name)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Spacer(minLength: 12)
+        }
+        .contentShape(Rectangle())
+        .contextMenu {
+            sliderNameMenu
+        }
+
+        if let dragProvider {
+            title
+                .onDrag(dragProvider)
+                .help("Drag to reorder")
+        } else {
+            title
         }
     }
 
