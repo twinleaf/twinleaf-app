@@ -32,6 +32,7 @@ private struct PlotCanvasFrameHost: View {
     var onTimeseriesZoom: (Double, Double) -> Void = { _, _ in }
     var onPlotColumnsDropped: (PlotColumnDragPayload) -> Void = { _ in }
     var onPlotColumnsDroppedAtEdge: ((PlotColumnDragPayload, VerticalEdge) -> Void)? = nil
+    var onDropEdgeChange: (VerticalEdge?) -> Void = { _ in }
     var otherDropTypes: [UTType] = []
     var onOtherItemsDropped: ([NSItemProvider]) -> Bool = { _ in false }
     var legendMenu: (PlotSeries) -> AnyView = { _ in AnyView(EmptyView()) }
@@ -65,6 +66,7 @@ private struct PlotCanvasFrameHost: View {
             onTimeseriesZoom: onTimeseriesZoom,
             onPlotColumnsDropped: onPlotColumnsDropped,
             onPlotColumnsDroppedAtEdge: onPlotColumnsDroppedAtEdge,
+            onDropEdgeChange: onDropEdgeChange,
             otherDropTypes: otherDropTypes,
             onOtherItemsDropped: onOtherItemsDropped,
             legendMenu: legendMenu
@@ -107,6 +109,8 @@ struct DocumentWindow: View {
     @State private var verticalAxisModes: [Int: VerticalAxisMode] = [:]
     @State private var independentAxisLabelVisibility: [Int: Bool] = [:]
     @State private var rpcSliders: [RPCSliderConfiguration] = []
+    /// The graph border a column drag is hovering, where a drop opens a new graph.
+    @State private var newGraphDropTarget: NewGraphDropTarget?
     @StateObject private var captureStore = CapturePaneStore()
     @State private var isDataLoggingEnabled = true
     @State private var clearDocumentEditedRequest = 0
@@ -1472,6 +1476,27 @@ struct DocumentWindow: View {
                 }
             }
             .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
+            .overlay {
+                // Drawn here rather than inside a graph so the bar sits on the
+                // border itself, above both neighbours and clear of the toolbar.
+                if let target = newGraphDropTarget,
+                   let index = panes.firstIndex(where: { $0.id == target.paneID }) {
+                    let borderIndex = target.above ? index : index + 1
+                    let borderY = axisInsets.prefix(borderIndex).reduce(0, +)
+                        + graphFrameHeight * CGFloat(borderIndex)
+                    let minY = geometry.safeAreaInsets.top + 12
+                    let maxY = max(minY, geometry.size.height - 12)
+                    NewGraphDropIndicator()
+                        .frame(width: geometry.size.width)
+                        .position(
+                            x: geometry.size.width / 2,
+                            y: min(max(borderY, minY), maxY)
+                        )
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.12), value: newGraphDropTarget)
         }
         .frame(minWidth: 520, minHeight: 360)
     }
@@ -1526,6 +1551,13 @@ struct DocumentWindow: View {
                     onPlotColumnsDroppedAtEdge: bridge.canAddPlotPane ? { payload, edge in
                         bridge.insertPlotPane(payload, adjacentTo: pane.id, above: edge == .top)
                     } : nil,
+                    onDropEdgeChange: { edge in
+                        if let edge {
+                            newGraphDropTarget = NewGraphDropTarget(paneID: pane.id, above: edge == .top)
+                        } else if newGraphDropTarget?.paneID == pane.id {
+                            newGraphDropTarget = nil
+                        }
+                    },
                     otherDropTypes: [SettingDragPayload.contentType],
                     onOtherItemsDropped: handleSettingsDrop,
                     legendMenu: { series in
@@ -8423,6 +8455,11 @@ private struct RestoredBoardPlotPane {
     var request: PlotPaneRestoreRequest
     var axisMode: VerticalAxisMode
     var showsIndependentAxisLabels: Bool
+}
+
+private struct NewGraphDropTarget: Equatable {
+    let paneID: Int
+    let above: Bool
 }
 
 private struct RPCSliderConfiguration: Identifiable, Hashable {

@@ -275,6 +275,9 @@ struct PlotCanvas: View {
     /// it. When set, those bands show an insertion bar and the host opens a
     /// new graph there; when nil, the whole graph takes the drop itself.
     var onPlotColumnsDroppedAtEdge: ((PlotColumnDragPayload, VerticalEdge) -> Void)? = nil
+    /// Reports which edge band a column drag is hovering, so the host can
+    /// mark where the new graph would open; nil once the drag leaves it.
+    var onDropEdgeChange: (VerticalEdge?) -> Void = { _ in }
     /// Other drag types the host wants to receive over the graph, such as
     /// settings dragged out of the sidebar.
     var otherDropTypes: [UTType] = []
@@ -394,12 +397,8 @@ struct PlotCanvas: View {
                     }
                     .disabled(series.isEmpty)
                 }
-                .overlay(alignment: plotDropEdge == .top ? .top : .bottom) {
-                    if plotDropEdge != nil {
-                        newGraphDropIndicator
-                            .padding(.leading, legendSafeAreaInsets.leading)
-                            .allowsHitTesting(false)
-                    }
+                .onChange(of: plotDropEdge) { _, edge in
+                    onDropEdgeChange(edge)
                 }
                 .onDrop(
                     of: [PlotColumnDragPayload.contentType] + otherDropTypes,
@@ -752,24 +751,6 @@ struct PlotCanvas: View {
             }
         }
         .animation(.easeInOut(duration: 0.16), value: isPlotDropTargeted)
-    }
-
-    /// Marks where a new graph opens when columns are dropped between graphs.
-    private var newGraphDropIndicator: some View {
-        ZStack {
-            Capsule()
-                .fill(Color.accentColor)
-                .frame(height: 3)
-            Text("New Graph")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 2)
-                .background(Capsule().fill(Color.accentColor))
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.horizontal, 8)
-        .transition(.opacity)
     }
 
     private static let legendSafeAreaMargin: CGFloat = 8
@@ -1366,9 +1347,7 @@ private struct PlotCanvasDropDelegate: DropDelegate {
     private func updateTarget(_ info: DropInfo) {
         guard info.hasItemsConforming(to: Self.columnTypes) else { return }
         let newEdge = targetEdge(info)
-        if edge != newEdge {
-            withAnimation(.easeInOut(duration: 0.12)) { edge = newEdge }
-        }
+        if edge != newEdge { edge = newEdge }
         let targetsBody = newEdge == nil
         if isTargeted != targetsBody { isTargeted = targetsBody }
     }
@@ -1760,6 +1739,24 @@ func plotFormatCursorValue(_ value: Double, units: String) -> String {
 // Lightweight cursor renderer. Re-renders on every hover tick (since the
 // marks change), but does only a handful of line + ellipse strokes — never
 // iterates the trace point arrays. Shared by the stream and capture plots.
+/// Marks where a new graph opens when columns are dropped between graphs.
+struct NewGraphDropIndicator: View {
+    var body: some View {
+        ZStack {
+            Capsule()
+                .fill(Color.accentColor)
+                .frame(height: 3)
+            Text("New Graph")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(Capsule().fill(Color.accentColor))
+        }
+        .padding(.horizontal, 8)
+    }
+}
+
 struct PlotCursorMark {
     let color: Color
     let screenPoint: CGPoint
