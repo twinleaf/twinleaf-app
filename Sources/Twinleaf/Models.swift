@@ -36,6 +36,7 @@ extension UTType {
     static var twinleafCSV: UTType { UTType(filenameExtension: "csv") ?? .plainText }
     static let twinleafHDF5 = UTType(importedAs: "org.hdfgroup.hdf5", conformingTo: .data)
     static let twinleafPlotColumns = UTType(exportedAs: "com.twarge.twinleaf.plot-columns", conformingTo: .json)
+    static let twinleafSettings = UTType(exportedAs: "com.twarge.twinleaf.settings", conformingTo: .json)
 }
 
 struct AvailableDevice: Codable, Hashable, Identifiable {
@@ -393,6 +394,46 @@ struct PlotColumnDragPayload: Codable, Hashable, Sendable {
 
         provider.loadDataRepresentation(forTypeIdentifier: Self.contentType.identifier) { data, _ in
             let payload = data.flatMap { try? JSONDecoder().decode(PlotColumnDragPayload.self, from: $0) }
+            Task { @MainActor in
+                completion(payload)
+            }
+        }
+        return true
+    }
+}
+
+/// Settings dragged out of the sidebar, identified by `RpcInfo.id`. Dropped on
+/// the plot area, each becomes a slider (or a capture plot for a capture RPC).
+struct SettingDragPayload: Codable, Hashable, Sendable {
+    let rpcIDs: [String]
+
+    static let contentType = UTType.twinleafSettings
+
+    var itemProvider: NSItemProvider {
+        let provider = NSItemProvider()
+        guard let data = try? JSONEncoder().encode(self) else { return provider }
+        provider.registerDataRepresentation(
+            forTypeIdentifier: Self.contentType.identifier,
+            visibility: .ownProcess
+        ) { completion in
+            completion(data, nil)
+            return nil
+        }
+        return provider
+    }
+
+    static func loadFirst(
+        from providers: [NSItemProvider],
+        completion: @escaping @MainActor @Sendable (SettingDragPayload?) -> Void
+    ) -> Bool {
+        guard let provider = providers.first(where: {
+            $0.hasItemConformingToTypeIdentifier(Self.contentType.identifier)
+        }) else {
+            return false
+        }
+
+        provider.loadDataRepresentation(forTypeIdentifier: Self.contentType.identifier) { data, _ in
+            let payload = data.flatMap { try? JSONDecoder().decode(SettingDragPayload.self, from: $0) }
             Task { @MainActor in
                 completion(payload)
             }

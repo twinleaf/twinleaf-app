@@ -271,6 +271,14 @@ struct PlotCanvas: View {
     var onTimeseriesPan: (Double) -> Void = { _ in }
     var onTimeseriesZoom: (Double, Double) -> Void = { _, _ in }
     var onPlotColumnsDropped: (PlotColumnDragPayload) -> Void = { _ in }
+    /// Columns dropped near the top or bottom edge of the graph rather than on
+    /// it. When set, those bands show an insertion bar and the host opens a
+    /// new graph there; when nil, the whole graph takes the drop itself.
+    var onPlotColumnsDroppedAtEdge: ((PlotColumnDragPayload, VerticalEdge) -> Void)? = nil
+    /// Other drag types the host wants to receive over the graph, such as
+    /// settings dragged out of the sidebar.
+    var otherDropTypes: [UTType] = []
+    var onOtherItemsDropped: ([NSItemProvider]) -> Bool = { _ in false }
     /// Context-menu content for one legend entry. Supplied by the host so the
     /// canvas stays free of bridge and menu-building concerns.
     var legendMenu: (PlotSeries) -> AnyView = { _ in AnyView(EmptyView()) }
@@ -286,6 +294,7 @@ struct PlotCanvas: View {
     @State private var cursorLocation: CGPoint?
     @ObservedObject private var cursorModifiers = PlotCursorModifiers.shared
     @State private var isPlotDropTargeted = false
+    @State private var plotDropEdge: VerticalEdge?
     @State private var snappedAxisRangeMemory = SnappedAxisRangeMemory()
     @State private var timeseriesAxisRangeMemory = LinearAxisRangeMemory()
     @State private var axisRangeScanCache = PlotAxisRangeScanCache()
@@ -385,15 +394,35 @@ struct PlotCanvas: View {
                     }
                     .disabled(series.isEmpty)
                 }
-                .onDrop(
-                    of: [PlotColumnDragPayload.contentType],
-                    isTargeted: $isPlotDropTargeted
-                ) { providers in
-                    PlotColumnDragPayload.loadFirst(from: providers) { payload in
-                        guard let payload else { return }
-                        onPlotColumnsDropped(payload)
+                .overlay(alignment: plotDropEdge == .top ? .top : .bottom) {
+                    if plotDropEdge != nil {
+                        newGraphDropIndicator
+                            .padding(.leading, legendSafeAreaInsets.leading)
+                            .allowsHitTesting(false)
                     }
                 }
+                .onDrop(
+                    of: [PlotColumnDragPayload.contentType] + otherDropTypes,
+                    delegate: PlotCanvasDropDelegate(
+                        // The bottom band runs from the lower part of the plot
+                        // down through the axis labels to the graph's edge.
+                        edgeBands: onPlotColumnsDroppedAtEdge == nil ? nil : (
+                            top: rect.minY + min(28, rect.height * 0.2),
+                            bottom: rect.maxY - min(28, rect.height * 0.2)
+                        ),
+                        otherTypes: otherDropTypes,
+                        isTargeted: $isPlotDropTargeted,
+                        edge: $plotDropEdge,
+                        onColumnsDropped: { payload, edge in
+                            if let edge, let onPlotColumnsDroppedAtEdge {
+                                onPlotColumnsDroppedAtEdge(payload, edge)
+                            } else {
+                                onPlotColumnsDropped(payload)
+                            }
+                        },
+                        onOtherItemsDropped: onOtherItemsDropped
+                    )
+                )
                 .onContinuousHover { phase in
                     switch phase {
                     case .active(let location):
@@ -723,6 +752,24 @@ struct PlotCanvas: View {
             }
         }
         .animation(.easeInOut(duration: 0.16), value: isPlotDropTargeted)
+    }
+
+    /// Marks where a new graph opens when columns are dropped between graphs.
+    private var newGraphDropIndicator: some View {
+        ZStack {
+            Capsule()
+                .fill(Color.accentColor)
+                .frame(height: 3)
+            Text("New Graph")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 2)
+                .background(Capsule().fill(Color.accentColor))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 8)
+        .transition(.opacity)
     }
 
     private static let legendSafeAreaMargin: CGFloat = 8
@@ -1262,6 +1309,73 @@ struct PlotCanvas: View {
 
     private func formatCursorY(_ value: Double, units: String) -> String {
         plotFormatCursorValue(value, units: units)
+    }
+}
+
+/// Routes drags over a graph: columns dropped on its body join it, columns
+/// dropped in its top or bottom band ask the host for a new graph there, and
+/// any other accepted type is handed straight to the host.
+private struct PlotCanvasDropDelegate: DropDelegate {
+    /// Y positions bounding the body of the graph; nil disables edge drops.
+    let edgeBands: (top: CGFloat, bottom: CGFloat)?
+    let otherTypes: [UTType]
+    @Binding var isTargeted: Bool
+    @Binding var edge: VerticalEdge?
+    let onColumnsDropped: (PlotColumnDragPayload, VerticalEdge?) -> Void
+    let onOtherItemsDropped: ([NSItemProvider]) -> Bool
+
+    private static let columnTypes = [PlotColumnDragPayload.contentType]
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: Self.columnTypes + otherTypes)
+    }
+
+    func dropEntered(info: DropInfo) {
+        updateTarget(info)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        updateTarget(info)
+        return DropProposal(operation: .copy)
+    }
+
+    func dropExited(info: DropInfo) {
+        clearTarget()
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        let dropEdge = targetEdge(info)
+        clearTarget()
+        guard info.hasItemsConforming(to: Self.columnTypes) else {
+            return onOtherItemsDropped(info.itemProviders(for: otherTypes))
+        }
+        let onColumnsDropped = onColumnsDropped
+        return PlotColumnDragPayload.loadFirst(from: info.itemProviders(for: Self.columnTypes)) { payload in
+            guard let payload else { return }
+            onColumnsDropped(payload, dropEdge)
+        }
+    }
+
+    private func targetEdge(_ info: DropInfo) -> VerticalEdge? {
+        guard let edgeBands, info.hasItemsConforming(to: Self.columnTypes) else { return nil }
+        if info.location.y < edgeBands.top { return .top }
+        if info.location.y > edgeBands.bottom { return .bottom }
+        return nil
+    }
+
+    private func updateTarget(_ info: DropInfo) {
+        guard info.hasItemsConforming(to: Self.columnTypes) else { return }
+        let newEdge = targetEdge(info)
+        if edge != newEdge {
+            withAnimation(.easeInOut(duration: 0.12)) { edge = newEdge }
+        }
+        let targetsBody = newEdge == nil
+        if isTargeted != targetsBody { isTargeted = targetsBody }
+    }
+
+    private func clearTarget() {
+        if isTargeted { isTargeted = false }
+        if edge != nil { edge = nil }
     }
 }
 

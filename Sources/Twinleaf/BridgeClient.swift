@@ -549,6 +549,53 @@ final class BridgeClient: ObservableObject {
         updateRuntimePlotPanes()
     }
 
+    /// Open a new graph for dropped columns directly above or below an
+    /// existing one. Columns dragged out of another graph's legend move: they
+    /// keep that graph's view settings, and a graph left empty by the move
+    /// closes.
+    @discardableResult
+    func insertPlotPane(
+        _ payload: PlotColumnDragPayload,
+        adjacentTo neighborPaneID: Int,
+        above: Bool
+    ) -> Int? {
+        let keys = normalizedPlotKeys(payload.keys)
+        guard !keys.isEmpty, canAddPlotPane,
+              plotPanes.contains(where: { $0.id == neighborPaneID }) else {
+            return nil
+        }
+        let columns = limitedColumnSet(from: keys)
+        var paneViewConfig = viewConfig
+        var emptiedSourcePaneID: Int?
+        if let sourcePaneID = payload.sourcePaneID,
+           let sourceIndex = plotPanes.firstIndex(where: { $0.id == sourcePaneID }) {
+            let remaining = plotPanes[sourceIndex].columns.subtracting(columns)
+            if remaining.isEmpty, sourcePaneID == neighborPaneID {
+                // Moving a graph's only traces next to itself changes nothing.
+                return nil
+            }
+            paneViewConfig = plotPanes[sourceIndex].viewConfig
+            plotPanes[sourceIndex].columns = remaining
+            if remaining.isEmpty {
+                emptiedSourcePaneID = sourcePaneID
+            }
+        }
+
+        let id = nextPlotPaneID
+        nextPlotPaneID += 1
+        let neighborIndex = plotPanes.firstIndex(where: { $0.id == neighborPaneID }) ?? plotPanes.count - 1
+        plotPanes.insert(
+            PlotPaneSelection(id: id, viewConfig: paneViewConfig, columns: columns),
+            at: above ? neighborIndex : neighborIndex + 1
+        )
+        if let emptiedSourcePaneID {
+            removePlotPane(id: emptiedSourcePaneID)
+        } else {
+            updateRuntimePlotPanes()
+        }
+        return id
+    }
+
     @discardableResult
     func addPlotPane() -> Int? {
         guard plotPanes.count < Self.maxPlotPaneCount else { return nil }

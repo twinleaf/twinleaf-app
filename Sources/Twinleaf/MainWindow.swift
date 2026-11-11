@@ -31,6 +31,9 @@ private struct PlotCanvasFrameHost: View {
     var onTimeseriesPan: (Double) -> Void = { _ in }
     var onTimeseriesZoom: (Double, Double) -> Void = { _, _ in }
     var onPlotColumnsDropped: (PlotColumnDragPayload) -> Void = { _ in }
+    var onPlotColumnsDroppedAtEdge: ((PlotColumnDragPayload, VerticalEdge) -> Void)? = nil
+    var otherDropTypes: [UTType] = []
+    var onOtherItemsDropped: ([NSItemProvider]) -> Bool = { _ in false }
     var legendMenu: (PlotSeries) -> AnyView = { _ in AnyView(EmptyView()) }
 
     var body: some View {
@@ -61,6 +64,9 @@ private struct PlotCanvasFrameHost: View {
             onTimeseriesPan: onTimeseriesPan,
             onTimeseriesZoom: onTimeseriesZoom,
             onPlotColumnsDropped: onPlotColumnsDropped,
+            onPlotColumnsDroppedAtEdge: onPlotColumnsDroppedAtEdge,
+            otherDropTypes: otherDropTypes,
+            onOtherItemsDropped: onOtherItemsDropped,
             legendMenu: legendMenu
         )
     }
@@ -1375,6 +1381,47 @@ struct DocumentWindow: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Catches drops the graphs themselves don't take: anything landing on
+        // the sliders, the capture plots or empty space.
+        .onDrop(
+            of: [SettingDragPayload.contentType, PlotColumnDragPayload.contentType],
+            isTargeted: nil
+        ) { providers in
+            handleSettingsDrop(providers) || handleColumnsDropOutsideGraphs(providers)
+        }
+    }
+
+    /// Settings dragged out of the sidebar: each one that can drive a slider
+    /// gets one, and a capture RPC gets its capture plot.
+    private func handleSettingsDrop(_ providers: [NSItemProvider]) -> Bool {
+        SettingDragPayload.loadFirst(from: providers) { payload in
+            guard let payload else { return }
+            for rpcID in payload.rpcIDs {
+                guard let rpc = bridge.rpc(id: rpcID) else { continue }
+                if rpc.isCaptureRPC {
+                    openCaptureView(for: rpc)
+                } else if rpc.isSliderSuitable,
+                          !rpcSliders.contains(where: { $0.id == rpc.id }) {
+                    addRPCSlider(for: rpc)
+                }
+            }
+        }
+    }
+
+    /// Columns dropped in the plot area but not on a graph fill the empty
+    /// placeholder graph if there is one, and otherwise open a new graph at
+    /// the bottom.
+    private func handleColumnsDropOutsideGraphs(_ providers: [NSItemProvider]) -> Bool {
+        PlotColumnDragPayload.loadFirst(from: providers) { payload in
+            guard let payload else { return }
+            if let emptyPane = visiblePlotPanes.last(where: { $0.columns.isEmpty }) {
+                bridge.dropPlotColumns(payload, into: emptyPane.id)
+            } else if let lastPane = bridge.plotPanes.last {
+                bridge.insertPlotPane(payload, adjacentTo: lastPane.id, above: false)
+            } else {
+                bridge.addPlotPane(columns: payload.keys)
+            }
+        }
     }
 
     /// One graph-sized slot for each capture plot: the available height
@@ -1476,6 +1523,11 @@ struct DocumentWindow: View {
                     onPlotColumnsDropped: { payload in
                         bridge.dropPlotColumns(payload, into: pane.id)
                     },
+                    onPlotColumnsDroppedAtEdge: bridge.canAddPlotPane ? { payload, edge in
+                        bridge.insertPlotPane(payload, adjacentTo: pane.id, above: edge == .top)
+                    } : nil,
+                    otherDropTypes: [SettingDragPayload.contentType],
+                    onOtherItemsDropped: handleSettingsDrop,
                     legendMenu: { series in
                         AnyView(PlotLegendMenu(bridge: bridge, series: series, paneID: pane.id))
                     }
@@ -2917,6 +2969,20 @@ private extension View {
         } else {
             onDrag {
                 PlotColumnDragPayload(keys: keys, sourcePaneID: sourcePaneID).itemProvider
+            }
+        }
+    }
+
+    /// Lets settings be dragged out to the plot area, where they become
+    /// sliders or capture plots. Settings that can be neither are not draggable.
+    @ViewBuilder
+    func settingDragSource(_ rpcs: [RpcInfo]) -> some View {
+        let rpcIDs = rpcs.filter { $0.isSliderSuitable || $0.isCaptureRPC }.map(\.id)
+        if rpcIDs.isEmpty {
+            self
+        } else {
+            onDrag {
+                SettingDragPayload(rpcIDs: rpcIDs).itemProvider
             }
         }
     }
@@ -9810,12 +9876,14 @@ private struct RpcRow: View, @MainActor Equatable {
                 settingNameText
             }
             .buttonStyle(.plain)
-            .help(isSliderActive ? "Remove setting slider" : "Add setting slider")
+            .settingDragSource([rpc])
+            .help(isSliderActive ? "Remove setting slider" : "Add setting slider — or drag it to the graphs")
             .contextMenu {
                 settingNameMenu
             }
         } else {
             settingNameText
+                .settingDragSource([rpc])
                 .contextMenu {
                     settingNameMenu
                 }
@@ -10134,6 +10202,7 @@ private struct UnifiedRpcRow: View {
                 .font(.body)
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .settingDragSource(rpcs)
                 .contextMenu {
                     Button {
                         reloadAll()

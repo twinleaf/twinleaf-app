@@ -92,6 +92,16 @@
 			<key>UTTypeIdentifier</key>
 			<string>com.twarge.twinleaf.plot-columns</string>
 		</dict>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.json</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Twinleaf Settings</string>
+			<key>UTTypeIdentifier</key>
+			<string>com.twarge.twinleaf.settings</string>
+		</dict>
 	</array>
 	<key>UTImportedTypeDeclarations</key>
 	<array>
