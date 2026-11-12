@@ -70,6 +70,13 @@ dylib path can be overridden with `TWINLEAF_CORE_PATH`. The iPad app declares
 local-network usage because live connections use nearby Twinleaf devices or
 local TIO proxies.
 
+Both apps carry iCloud entitlements (`Packaging/Twinleaf.entitlements`,
+`Packaging/TwinleafPad.entitlements`): the `iCloud.com.twinleaf.Twinleaf`
+container, which shows as a public "Twinleaf" folder in iCloud Drive, and the
+iCloud key-value store, through which `SettingsSync` mirrors general
+preferences (not per-machine or per-device state) between a user's devices.
+Signing therefore needs the iCloud capability and that container on the App ID.
+
 ## Distribution
 
 Release goes through App Store Connect. Either archive and upload from Xcode's

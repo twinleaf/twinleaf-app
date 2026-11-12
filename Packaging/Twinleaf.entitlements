@@ -16,5 +16,23 @@
 	<true/>
 	<key>com.apple.security.print</key>
 	<true/>
+	<!-- iCloud Drive documents: the public "Twinleaf" folder that
+	     DocumentGroup and the open/save panels read and write. -->
+	<key>com.apple.developer.icloud-container-identifiers</key>
+	<array>
+		<string>iCloud.com.twinleaf.Twinleaf</string>
+	</array>
+	<key>com.apple.developer.icloud-services</key>
+	<array>
+		<string>CloudDocuments</string>
+	</array>
+	<key>com.apple.developer.ubiquity-container-identifiers</key>
+	<array>
+		<string>iCloud.com.twinleaf.Twinleaf</string>
+	</array>
+	<!-- iCloud key-value store: general preferences mirrored between the
+	     user's devices by SettingsSync. -->
+	<key>com.apple.developer.ubiquity-kvstore-identifier</key>
+	<string>$(TeamIdentifierPrefix)$(CFBundleIdentifier)</string>
 </dict>
 </plist>

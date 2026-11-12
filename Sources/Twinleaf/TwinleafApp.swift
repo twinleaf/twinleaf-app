@@ -16,6 +16,7 @@ struct TwinleafApp: App {
 
     init() {
         try? Tips.configure()
+        SettingsSync.shared.start()
     }
 
     var body: some Scene {

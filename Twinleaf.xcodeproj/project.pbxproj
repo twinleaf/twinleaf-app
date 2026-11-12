@@ -29,6 +29,7 @@
 		A00000000000000000000541 /* TwinleafQuickLook.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = A00000000000000000000203 /* TwinleafQuickLook.appex */; platformFilters = (macos, ); settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		A00000000000000000000525 /* Sources/Twinleaf/LoggingSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000426 /* Sources/Twinleaf/LoggingSession.swift */; };
 		A00000000000000000000526 /* Sources/Twinleaf/Tips.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000427 /* Sources/Twinleaf/Tips.swift */; };
+		A00000000000000000000528 /* Sources/Twinleaf/SettingsSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000430 /* Sources/Twinleaf/SettingsSync.swift */; };
 		A00000000000000000000527 /* Sources/TwinleafLiveActivity/LoggingActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000428 /* Sources/TwinleafLiveActivity/LoggingActivityAttributes.swift */; };
 		A00000000000000000000542 /* Sources/TwinleafLiveActivity/LoggingActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000428 /* Sources/TwinleafLiveActivity/LoggingActivityAttributes.swift */; };
 		A00000000000000000000543 /* Sources/TwinleafLiveActivity/LoggingLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000429 /* Sources/TwinleafLiveActivity/LoggingLiveActivity.swift */; };
@@ -82,6 +83,7 @@
 		A00000000000000000000204 /* TwinleafLiveActivity.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = TwinleafLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		A00000000000000000000426 /* Sources/Twinleaf/LoggingSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/LoggingSession.swift; sourceTree = "<group>"; };
 		A00000000000000000000427 /* Sources/Twinleaf/Tips.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/Tips.swift; sourceTree = "<group>"; };
+		A00000000000000000000430 /* Sources/Twinleaf/SettingsSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/SettingsSync.swift; sourceTree = "<group>"; };
 		A00000000000000000000428 /* Sources/TwinleafLiveActivity/LoggingActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/TwinleafLiveActivity/LoggingActivityAttributes.swift; sourceTree = "<group>"; };
 		A00000000000000000000429 /* Sources/TwinleafLiveActivity/LoggingLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/TwinleafLiveActivity/LoggingLiveActivity.swift; sourceTree = "<group>"; };
 		A00000000000000000000445 /* Packaging/TwinleafLiveActivity-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Packaging/TwinleafLiveActivity-Info.plist"; sourceTree = "<group>"; };
@@ -109,6 +111,7 @@
 		A00000000000000000000442 /* Packaging/TwinleafPad-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Packaging/TwinleafPad-Info.plist"; sourceTree = "<group>"; };
 		A00000000000000000000443 /* Packaging/TwinleafQuickLook-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Packaging/TwinleafQuickLook-Info.plist"; sourceTree = "<group>"; };
 		A00000000000000000000444 /* Packaging/TwinleafQuickLook.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Packaging/TwinleafQuickLook.entitlements; sourceTree = "<group>"; };
+		A00000000000000000000446 /* Packaging/TwinleafPad.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Packaging/TwinleafPad.entitlements; sourceTree = "<group>"; };
 		A00000000000000000000451 /* scripts/xcode-build-rust.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "scripts/xcode-build-rust.sh"; sourceTree = "<group>"; };
 		A00000000000000000000452 /* scripts/build-ios-rust.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "scripts/build-ios-rust.sh"; sourceTree = "<group>"; };
 		A00000000000000000000461 /* rust/tio-bridge/Cargo.toml */ = {isa = PBXFileReference; lastKnownFileType = text; path = "rust/tio-bridge/Cargo.toml"; sourceTree = "<group>"; };
@@ -226,6 +229,7 @@
 				A00000000000000000000421 /* Sources/Twinleaf/BridgeSessionRegistry.swift */,
 				A00000000000000000000426 /* Sources/Twinleaf/LoggingSession.swift */,
 				A00000000000000000000427 /* Sources/Twinleaf/Tips.swift */,
+				A00000000000000000000430 /* Sources/Twinleaf/SettingsSync.swift */,
 				A00000000000000000000418 /* Sources/Twinleaf/BridgeClient.swift */,
 				A00000000000000000000419 /* Sources/Twinleaf/RustRuntime.swift */,
 				A00000000000000000000474 /* Sources/Twinleaf/LabcastSession.swift */,
@@ -240,6 +244,7 @@
 			children = (
 				A00000000000000000000441 /* Packaging/Twinleaf-Info.plist */,
 				A00000000000000000000442 /* Packaging/TwinleafPad-Info.plist */,
+				A00000000000000000000446 /* Packaging/TwinleafPad.entitlements */,
 				A00000000000000000000443 /* Packaging/TwinleafQuickLook-Info.plist */,
 				A00000000000000000000444 /* Packaging/TwinleafQuickLook.entitlements */,
 				A00000000000000000000445 /* Packaging/TwinleafLiveActivity-Info.plist */,
@@ -501,6 +506,7 @@
 				A00000000000000000000521 /* Sources/Twinleaf/BridgeSessionRegistry.swift in Sources */,
 				A00000000000000000000525 /* Sources/Twinleaf/LoggingSession.swift in Sources */,
 				A00000000000000000000526 /* Sources/Twinleaf/Tips.swift in Sources */,
+				A00000000000000000000528 /* Sources/Twinleaf/SettingsSync.swift in Sources */,
 				A00000000000000000000527 /* Sources/TwinleafLiveActivity/LoggingActivityAttributes.swift in Sources */,
 				A00000000000000000000518 /* Sources/Twinleaf/BridgeClient.swift in Sources */,
 				A00000000000000000000519 /* Sources/Twinleaf/RustRuntime.swift in Sources */,
@@ -688,11 +694,13 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				"CODE_SIGN_ENTITLEMENTS[sdk=iphoneos*]" = Packaging/TwinleafPad.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=iphonesimulator*]" = Packaging/TwinleafPad.entitlements;
 				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = Packaging/Twinleaf.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
@@ -798,11 +806,13 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				"CODE_SIGN_ENTITLEMENTS[sdk=iphoneos*]" = Packaging/TwinleafPad.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=iphonesimulator*]" = Packaging/TwinleafPad.entitlements;
 				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = Packaging/Twinleaf.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
@@ -911,7 +921,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -942,7 +952,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -971,7 +981,7 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Packaging/TwinleafLiveActivity-Info.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
@@ -1000,7 +1010,7 @@
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "Packaging/TwinleafLiveActivity-Info.plist";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
