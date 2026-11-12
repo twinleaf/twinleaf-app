@@ -5,7 +5,7 @@ import Foundation
 
 #if os(macOS)
 import AppKit
-#elseif os(iOS)
+#elseif os(iOS) || os(visionOS)
 import UIKit
 #endif
 
@@ -16,6 +16,9 @@ private protocol BridgeRuntime: AnyObject {
     func openLog(path: String)
     func exportLog(requestId: String, sourcePath: String, outputPath: String, format: ExportFormat)
     func disconnect()
+    func connectRemote(label: String, logPath: String?)
+    func remoteIngest(_ packets: Data)
+    func setPublishing(_ sink: (@Sendable (Data) -> Void)?)
     func setPlayback(position: Double)
     func copyViewData(requestId: String, paneID: Int, viewportEnd: Double?)
     func setPlotPanes(_ panes: [PlotPaneSelection])
@@ -38,6 +41,9 @@ private final class UnavailableBridgeRuntime: BridgeRuntime {
     func openLog(path: String) {}
     func exportLog(requestId: String, sourcePath: String, outputPath: String, format: ExportFormat) {}
     func disconnect() {}
+    func connectRemote(label: String, logPath: String?) {}
+    func remoteIngest(_ packets: Data) {}
+    func setPublishing(_ sink: (@Sendable (Data) -> Void)?) {}
     func setPlayback(position: Double) {}
     func copyViewData(requestId: String, paneID: Int, viewportEnd: Double?) {}
     func setPlotPanes(_ panes: [PlotPaneSelection]) {}
@@ -247,6 +253,21 @@ final class BridgeClient: ObservableObject {
     private var nextConnectionAttemptID: UInt64 = 1
     private var connectionRPCReadbackRequestIDs: Set<String> = []
     private var reloadRPCRequestIDs: Set<String> = []
+    /// Sessions other Macs share on the local network, as picker rows, and
+    /// the Labcast peer behind each row's URL.
+    private var sharedSessionDevices: [AvailableDevice] = []
+    private var sharedSessionPeers: [String: LabcastPeer] = [:]
+    private var sharedSessionBrowseTask: Task<Void, Never>?
+    /// The shared session this window is viewing, if its source is one.
+    private var remoteSource: RemoteSessionSource?
+    private var remoteSessionTask: Task<Void, Never>?
+    #if os(macOS)
+    /// Shares this window's live device session while sharing is switched on.
+    private var sessionPublisher: SharedSessionPublisher?
+    private var isDeviceSession = false
+    private var lastPublishedSessionInfo: SharedSessionInfo?
+    private var sharingSettingsObserver: AnyCancellable?
+    #endif
     /// Raw RPC calls awaiting their `rawRpcResult`, keyed by request id.
     private var pendingRawRpcContinuations: [String: CheckedContinuation<Data, Error>] = [:]
     /// Writes whose issuing control wants the device's answer (the settings
@@ -277,9 +298,22 @@ final class BridgeClient: ObservableObject {
         refreshAvailableDevices()
         logDeviceDiscovery("BridgeClient initialized rememberedURLs=\(rememberedDeviceURLs.count) available=\(availableDevices.count) sessionID=\(sessionID)")
         BridgeSessionRegistry.shared.register(self)
+        #if os(macOS)
+        // Sharing follows its switch in Settings while a session is live.
+        sharingSettingsObserver = NotificationCenter.default
+            .publisher(for: UserDefaults.didChangeNotification)
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.updatePublishing() }
+            }
+        #endif
     }
 
     deinit {
+        sharedSessionBrowseTask?.cancel()
+        remoteSessionTask?.cancel()
+        #if os(macOS)
+        sessionPublisher?.stop()
+        #endif
         BridgeSessionRegistry.shared.unregister(sessionID: sessionID)
         LoggingSessionMonitor.sessionClosed(sessionID)
     }
@@ -348,6 +382,7 @@ final class BridgeClient: ObservableObject {
             bonjourBrowser.start()
         }
         #endif
+        setSharedSessionBrowsing(active: active)
         if active {
             refreshAvailableDevices()
         }
@@ -392,7 +427,16 @@ final class BridgeClient: ObservableObject {
             markConnectionFailed(status.isEmpty ? "Twinleaf runtime is unavailable" : status)
             return
         }
-        runtime?.connect(url: device.url, route: "/", logPath: logURL?.path)
+        stopRemoteSession()
+        stopPublishing()
+        if device.kind == TwinleafLabcast.deviceKind {
+            startRemoteSession(device, logPath: logURL?.path)
+        } else {
+            runtime?.connect(url: device.url, route: "/", logPath: logURL?.path)
+            #if os(macOS)
+            isDeviceSession = true
+            #endif
+        }
         sendPlotPanes()
     }
 
@@ -421,11 +465,15 @@ final class BridgeClient: ObservableObject {
         plotFrames.resetViewportEnd()
         statusState = "loading"
         status = "Loading \(url.lastPathComponent)"
+        stopRemoteSession()
+        stopPublishing()
         runtime?.openLog(path: url.path)
         sendPlotPanes()
     }
 
     func disconnect() {
+        stopRemoteSession()
+        stopPublishing()
         runtime?.disconnect()
         isInspectionMode = false
         rpcCacheNeedsReload = false
@@ -477,6 +525,8 @@ final class BridgeClient: ObservableObject {
 
     func cancelConnection() {
         guard connectionProgress.canCancel else { return }
+        stopRemoteSession()
+        stopPublishing()
         runtime?.disconnect()
         clearRPCReadbackState()
         clearStreamDisplayValues()
@@ -1844,6 +1894,7 @@ final class BridgeClient: ObservableObject {
             removeAllPlotPanes()
         }
         loadReadableRPCs()
+        updatePublishing()
     }
 
     /// Only the device list itself can change this; live readouts and RPC
@@ -1864,7 +1915,7 @@ final class BridgeClient: ObservableObject {
     }
 
     private func handleDeviceList(_ devices: [AvailableDevice]) {
-        #if os(iOS)
+        #if !os(macOS)
         // The Rust side seeds `tcp://localhost` as a convenience for desktop
         // users running `tio-proxy`. On iOS there's no local proxy to reach,
         // so filter it out of the picker.
@@ -1905,6 +1956,7 @@ final class BridgeClient: ObservableObject {
         if event.state == "logging" {
             markLogActivity(force: true)
         }
+        publishSessionInfo()
     }
 
     private func handleErrorEvent(_ event: ErrorEvent) {
@@ -2153,7 +2205,7 @@ final class BridgeClient: ObservableObject {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
-#elseif os(iOS)
+#elseif os(iOS) || os(visionOS)
         UIPasteboard.general.string = text
 #endif
     }
@@ -2184,6 +2236,9 @@ final class BridgeClient: ObservableObject {
         var seenURLs = Set<String>()
         var devices: [AvailableDevice] = []
 
+        // A Vision Pro has no port to plug a sensor into: its live sources
+        // are the sessions Macs share.
+        #if !os(visionOS)
         for url in rememberedDeviceURLs where seenURLs.insert(url).inserted {
             devices.append(Self.rememberedDevice(for: url))
         }
@@ -2191,12 +2246,17 @@ final class BridgeClient: ObservableObject {
         for device in discoveredDevices where seenURLs.insert(device.url).inserted {
             devices.append(device)
         }
+        #endif
 
         #if os(iOS)
         for device in mdnsDevices where seenURLs.insert(device.url).inserted {
             devices.append(device)
         }
         #endif
+
+        for device in sharedSessionDevices where seenURLs.insert(device.url).inserted {
+            devices.append(device)
+        }
 
         availableDevices = devices
         let rendered = devices.map { "\($0.kind)|\($0.url)" }.joined(separator: " ; ")
@@ -2848,6 +2908,197 @@ final class BridgeClient: ObservableObject {
             return "Remembered URL"
         }
         return "Remembered \(scheme.uppercased()) URL"
+    }
+}
+
+// MARK: - Shared sessions (Labcast)
+
+extension BridgeClient {
+    /// Browses for sessions other Macs share while the device picker is open.
+    /// They join the picker's list as one more kind of source.
+    private func setSharedSessionBrowsing(active: Bool) {
+        sharedSessionBrowseTask?.cancel()
+        sharedSessionBrowseTask = nil
+        guard active else { return }
+        sharedSessionBrowseTask = Task { [weak self] in
+            for await peers in LabcastBrowser.peers(appID: TwinleafLabcast.appID) {
+                guard let self, !Task.isCancelled else { return }
+                self.applySharedSessionPeers(peers)
+            }
+        }
+    }
+
+    private func applySharedSessionPeers(_ peers: [LabcastPeer]) {
+        var devices: [AvailableDevice] = []
+        var peersByURL: [String: LabcastPeer] = [:]
+        for peer in peers {
+            let host = peer.name.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed) ?? peer.name
+            let url = "\(TwinleafLabcast.urlScheme)://\(host)"
+            guard peersByURL.updateValue(peer, forKey: url) == nil else { continue }
+            var detail = [peer.info["device"], "Shared session"]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+                .joined(separator: " \u{00B7} ")
+            if peer.requiresPasscode {
+                detail += " \u{00B7} passcode required"
+            }
+            devices.append(AvailableDevice(
+                url: url,
+                label: peer.name,
+                kind: TwinleafLabcast.deviceKind,
+                detail: detail
+            ))
+        }
+        sharedSessionDevices = devices
+        sharedSessionPeers = peersByURL
+        refreshAvailableDevices()
+    }
+
+    /// Views the session `device` stands for. The Rust core runs a session fed
+    /// with the publisher's packets, so plotting and logging are the ones a
+    /// device session uses. Nothing is sent back: a shared session is
+    /// read-only, and the core refuses RPCs on it.
+    private func startRemoteSession(_ device: AvailableDevice, logPath: String?) {
+        guard let peer = sharedSessionPeers[device.url] else {
+            markConnectionFailed("\(device.label) is no longer sharing a session")
+            return
+        }
+        let passcode = TwinleafLabcast.storedPasscode
+        if peer.requiresPasscode, passcode == nil {
+            markConnectionFailed("\(peer.name) requires a passcode. Enter it under Sharing in Settings.")
+            return
+        }
+        runtime?.connectRemote(label: peer.name, logPath: logPath)
+        let source = RemoteSessionSource(peer: peer, passcode: peer.requiresPasscode ? passcode : nil)
+        remoteSource = source
+        let label = peer.name
+        remoteSessionTask = Task { [weak self] in
+            for await event in source.events() {
+                guard let self, !Task.isCancelled else { return }
+                self.handleRemoteSessionEvent(event, label: label)
+            }
+        }
+    }
+
+    private func stopRemoteSession() {
+        remoteSessionTask?.cancel()
+        remoteSessionTask = nil
+        remoteSource?.stop()
+        remoteSource = nil
+    }
+
+    private func handleRemoteSessionEvent(_ event: RemoteSessionSource.Event, label: String) {
+        switch event {
+        case .packets(let packets):
+            runtime?.remoteIngest(packets)
+        case .info(let info):
+            // The publisher's trouble with its sensor is the viewer's too.
+            if info.state == "error" {
+                status = "\(label): \(info.message)"
+            }
+        case .state(.waiting(let reason)):
+            statusState = "connecting"
+            status = "Waiting for \(label): \(reason)"
+            let message = status
+            updateConnectionProgress { $0.message = message }
+        case .state(.connected):
+            if !devices.isEmpty {
+                statusState = "streaming"
+                status = "Streaming from \(label)"
+            }
+        case .state:
+            break
+        }
+    }
+
+    /// Starts, stops or reconfigures sharing of this window's device session
+    /// to match the Sharing settings. Only a Mac shares, and only a session
+    /// with its own devices: a viewed session is not passed on.
+    private func updatePublishing() {
+        #if os(macOS)
+        let defaults = UserDefaults.standard
+        guard defaults.bool(forKey: TwinleafLabcast.publishEnabledKey),
+              isDeviceSession, !isInspectionMode, !devices.isEmpty else {
+            stopPublishing(keepingSession: true)
+            return
+        }
+        let configuration = SharedSessionPublisher.Configuration(
+            name: Host.current().localizedName ?? ProcessInfo.processInfo.hostName,
+            passcode: TwinleafLabcast.storedPasscode,
+            deviceSummary: devices.map(\.meta.name).filter { !$0.isEmpty }.joined(separator: ", ")
+        )
+        if sessionPublisher?.configuration != configuration {
+            sessionPublisher?.stop()
+            let publisher = SharedSessionPublisher(configuration: configuration)
+            sessionPublisher = publisher
+            lastPublishedSessionInfo = nil
+            Task { [weak self] in
+                do {
+                    try await publisher.start()
+                } catch {
+                    self?.appendError("Could not share this session: \(error.localizedDescription)")
+                }
+            }
+            // The core answers with the session's metadata, which the
+            // publisher keeps for viewers whenever they join, then hands over
+            // every packet the session receives.
+            runtime?.setPublishing { data in
+                if let frame = SharedSessionFrame(data) {
+                    publisher.publish(frame)
+                }
+            }
+        }
+        publishSessionInfo()
+        #endif
+    }
+
+    private func stopPublishing(keepingSession: Bool = false) {
+        #if os(macOS)
+        if !keepingSession {
+            isDeviceSession = false
+        }
+        guard let publisher = sessionPublisher else { return }
+        sessionPublisher = nil
+        lastPublishedSessionInfo = nil
+        publisher.stop()
+        runtime?.setPublishing(nil)
+        #endif
+    }
+
+    private func publishSessionInfo() {
+        #if os(macOS)
+        guard let sessionPublisher else { return }
+        let info = SharedSessionInfo(
+            state: statusState,
+            message: status,
+            devices: devices.map { device in
+                .init(
+                    route: device.route,
+                    name: device.meta.name,
+                    serialNumber: device.meta.serialNumber,
+                    firmware: device.meta.firmwareHash,
+                    streams: device.streams.map { stream in
+                        .init(
+                            id: stream.streamId,
+                            name: stream.name,
+                            sampleRate: stream.effectiveSamplingRate,
+                            columns: stream.columns.map { column in
+                                .init(
+                                    name: column.name,
+                                    units: column.units,
+                                    description: column.description,
+                                    dataType: column.dataType
+                                )
+                            }
+                        )
+                    }
+                )
+            }
+        )
+        guard info != lastPublishedSessionInfo else { return }
+        lastPublishedSessionInfo = info
+        sessionPublisher.publish(info)
+        #endif
     }
 }
 

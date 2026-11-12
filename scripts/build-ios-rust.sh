@@ -15,7 +15,9 @@ CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$DEFAULT_CARGO_TARGET_DIR}"
 OUT_DIR="${OUT_DIR:-$DEFAULT_OUT_DIR}"
 HEADER_DIR="${HEADER_DIR:-$ROOT_DIR/rust/tio-bridge/include}"
 XCFRAMEWORK_PATH="${XCFRAMEWORK_PATH:-$OUT_DIR/TwinleafCore.xcframework}"
-TARGETS="${IOS_RUST_TARGETS:-aarch64-apple-ios aarch64-apple-ios-sim}"
+# The same static library serves iPadOS and visionOS: neither has serial ports,
+# so both build without the `serial` and `mdns` features.
+TARGETS="${IOS_RUST_TARGETS:-aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-visionos aarch64-apple-visionos-sim}"
 FEATURES="${IOS_RUST_FEATURES:-firmware}"
 
 append_target() {
@@ -62,11 +64,18 @@ if [[ "$MODE" == "staticlib" && -z "${IOS_RUST_TARGETS:-}" ]]; then
 		iphoneos*)
 			append_target aarch64-apple-ios
 			;;
-		iphonesimulator*)
+		xros*)
+			append_target aarch64-apple-visionos
+			;;
+		iphonesimulator*|xrsimulator*)
+			sim_target=aarch64-apple-ios-sim
+			if [[ "$SDK_NAME" == xrsimulator* ]]; then
+				sim_target=aarch64-apple-visionos-sim
+			fi
 			for arch in ${ARCHS:-arm64}; do
 				case "$arch" in
 					arm64)
-						append_target aarch64-apple-ios-sim
+						append_target "$sim_target"
 						;;
 					*)
 						# Intel (x86_64) builds are not supported; the project

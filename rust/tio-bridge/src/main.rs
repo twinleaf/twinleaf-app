@@ -39,6 +39,8 @@ use twinleaf::tio::packet::{LinkStatus, Payload, ProxyRx};
 const EVENT_JSON: u32 = 0;
 const EVENT_PLOT: u32 = 1;
 const EVENT_TYPED: u32 = 2;
+/// Raw packets of a live session the app shares; see `remote.rs`.
+const EVENT_PUBLISH: u32 = 3;
 
 const TYPED_STATUS: u16 = 1;
 const TYPED_ERROR: u16 = 2;
@@ -168,6 +170,15 @@ impl Emitter {
                 callback(EVENT_PLOT, payload.as_ptr(), payload.len(), *context);
                 Ok(())
             }
+        }
+    }
+
+    /// Hands the app one frame of a shared session's packets. The command-line
+    /// bridge shares nothing.
+    fn emit_publish(&self, frame: &[u8]) {
+        if let EmitterSink::Callback { callback, context } = &*self.sink {
+            let _guard = self.write_lock.lock().unwrap();
+            callback(EVENT_PUBLISH, frame.as_ptr(), frame.len(), *context);
         }
     }
 
@@ -751,6 +762,22 @@ enum ClientCommand {
     },
     /// Zero every stream's dropped-sample counter in the health monitor.
     ResetHealthCounters,
+    /// Start or stop handing the live session's packets to the app, which
+    /// shares them with viewers on other machines.
+    SetPublishing {
+        enabled: bool,
+    },
+    /// View a session another machine shares. Its packets arrive through
+    /// `RemoteIngest` rather than from a device.
+    ConnectRemote {
+        label: String,
+        log_path: Option<String>,
+    },
+    /// Packets of the shared session being viewed, in wire form.
+    #[serde(skip)]
+    RemoteIngest {
+        data: Vec<u8>,
+    },
     Shutdown,
 }
 
@@ -787,6 +814,8 @@ enum SessionCommand {
         route: String,
     },
     ResetHealthCounters,
+    SetPublishing(bool),
+    RemoteIngest(Vec<u8>),
 }
 
 /// A channel computed from another column rather than received from a device.
@@ -2770,6 +2799,11 @@ fn main() {
                     let _ = tx.send(SessionCommand::PerformUpgrade { route });
                 }
             }
+            ClientCommand::SetPublishing { .. }
+            | ClientCommand::ConnectRemote { .. }
+            | ClientCommand::RemoteIngest { .. } => {
+                emitter.debug("session sharing is available in the app only");
+            }
             ClientCommand::Shutdown => {
                 emitter.debug("shutdown command received");
                 if let Some(tx) = session_tx.take() {
@@ -3716,6 +3750,7 @@ fn run_session(
     let mut derived_worker = DerivedWorker::new();
     let mut logger = PacketLogger::new(log_path, &emitter);
     logger.write_startup_metadata(&discovery.devices, &emitter);
+    let mut publish_tap = PublishTap::default();
     let mut plot_profiler = PlotCadenceProfiler::new();
     let mut ingest_profiler = StreamIngestProfiler::new();
     let mut stream_value_profiler = StreamValueEmitProfiler::new();
@@ -3889,6 +3924,7 @@ fn run_session(
                                             &mut rpc_index,
                                         ) {
                                             emit_metadata_devices(&emitter, &discovery.devices);
+                                            publish_tap.publish_metadata(&discovery.devices, &emitter);
                                             health.update_stream_sample_sizes(&discovery.devices);
                                         }
                                         emitter
@@ -3935,6 +3971,7 @@ fn run_session(
                                     &mut rpc_index,
                                 ) {
                                     emit_metadata_devices(&emitter, &discovery.devices);
+                                    publish_tap.publish_metadata(&discovery.devices, &emitter);
                                     health.update_stream_sample_sizes(&discovery.devices);
                                 }
                             }
@@ -4004,6 +4041,7 @@ fn run_session(
                             let fetched = fetched_rpcs(&route, &registry);
                             if apply_rpc_table(&route, fetched, &mut discovery, &mut rpc_index) {
                                 emit_metadata_devices(&emitter, &discovery.devices);
+                                publish_tap.publish_metadata(&discovery.devices, &emitter);
                             }
                         }
                         Ok(Err(err)) => emitter.debug(format!(
@@ -4044,6 +4082,7 @@ fn run_session(
                                 &latest_stream_timestamp_by_route,
                                 health.stream_sample_sizes(),
                                 &rpc_index,
+                                &mut publish_tap,
                                 &emitter,
                             );
                             loop_profile.raw_packets += drain.counts.packets as usize;
@@ -4052,6 +4091,7 @@ fn run_session(
                             health.observe_incoming(drain.counts, Instant::now());
                         }
                     }
+                    publish_tap.flush_if_due(&emitter);
 
                     let due_reconnects: Vec<(DeviceRoute, Instant)> = reconnected_routes
                         .iter()
@@ -4094,6 +4134,7 @@ fn run_session(
                             &mut rpc_index,
                         ) {
                             emit_metadata_devices(&emitter, &discovery.devices);
+                            publish_tap.publish_metadata(&discovery.devices, &emitter);
                             health.update_stream_sample_sizes(&discovery.devices);
                         }
                         emitter.status("streaming", format!("Streaming from {url}"));
@@ -4105,6 +4146,7 @@ fn run_session(
                         if recover_incomplete_rpc_metadata(&connection, &mut discovery, &emitter) {
                             rpc_index = build_rpc_index(&discovery.devices);
                             emit_metadata_devices(&emitter, &discovery.devices);
+                            publish_tap.publish_metadata(&discovery.devices, &emitter);
                             health.update_stream_sample_sizes(&discovery.devices);
                         }
                         last_rpc_metadata_recovery = Instant::now();
@@ -4304,6 +4346,11 @@ fn run_session(
                 SessionCommand::PerformUpgrade { route } => {
                     spawn_upgrade_flash(connection.clone(), route, emitter.clone());
                 }
+                SessionCommand::SetPublishing(enabled) => {
+                    publish_tap.set_enabled(enabled, &discovery.devices, &emitter);
+                }
+                // Only a remote session takes packets from the app.
+                SessionCommand::RemoteIngest(_) => {}
             }
         }
         loop_profile.command_elapsed += command_start.elapsed();
@@ -4767,6 +4814,7 @@ fn handle_monitor_packet(
     latest_stream_timestamp_by_route: &HashMap<DeviceRoute, f64>,
     stream_sample_sizes: &HashMap<(DeviceRoute, u8), usize>,
     rpc_index: &HashMap<(String, String), RpcDto>,
+    publish_tap: &mut PublishTap,
     emitter: &Emitter,
 ) -> IncomingCounts {
     emit_tio_log_message(
@@ -4787,6 +4835,7 @@ fn handle_monitor_packet(
     }
     let counts = incoming_counts_for_packet(&packet, stream_sample_sizes);
     logger.write_packet(&packet);
+    publish_tap.observe(&packet, emitter);
     counts
 }
 
@@ -4855,6 +4904,7 @@ fn drain_packet_monitor_port(
     latest_stream_timestamp_by_route: &HashMap<DeviceRoute, f64>,
     stream_sample_sizes: &HashMap<(DeviceRoute, u8), usize>,
     rpc_index: &HashMap<(String, String), RpcDto>,
+    publish_tap: &mut PublishTap,
     emitter: &Emitter,
 ) -> MonitorDrain {
     let mut drain = MonitorDrain {
@@ -4870,6 +4920,7 @@ fn drain_packet_monitor_port(
                     latest_stream_timestamp_by_route,
                     stream_sample_sizes,
                     rpc_index,
+                    publish_tap,
                     emitter,
                 ));
             }
@@ -8020,6 +8071,9 @@ fn json_to_bytes(arg: Option<Value>, rpc_type: &str) -> Result<Vec<u8>, String> 
     };
     value_type.encode(&value).map_err(|err| err.to_string())
 }
+
+// Sharing a live session, and viewing a shared one.
+include!("remote.rs");
 
 #[cfg(test)]
 mod tests {

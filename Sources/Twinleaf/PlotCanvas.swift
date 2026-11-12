@@ -6,7 +6,7 @@ import UniformTypeIdentifiers
 
 #if os(macOS)
 import AppKit
-#elseif os(iOS)
+#elseif os(iOS) || os(visionOS)
 import UIKit
 #endif
 
@@ -34,7 +34,12 @@ struct PlotSidebarMaterialBackground: View {
 
         shape
             .fill(Color.clear)
+            // Liquid Glass is not on visionOS; its own glass material stands in.
+            #if os(visionOS)
+            .glassBackgroundEffect(in: shape)
+            #else
             .glassEffect(.regular.tint(glassTint), in: shape)
+            #endif
             .overlay {
                 shape
                     .fill(Color.white.opacity(colorScheme == .dark ? 0.045 : 0.10))
