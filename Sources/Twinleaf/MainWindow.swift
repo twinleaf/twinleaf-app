@@ -39,6 +39,7 @@ private struct PlotCanvasFrameHost: View {
     var registerPlotDragContent: (NSItemProvider) -> Void = { _ in }
     var otherDropTypes: [UTType] = []
     var onOtherItemsDropped: ([NSItemProvider]) -> Bool = { _ in false }
+    var onOtherItemsHover: (CGFloat?) -> Void = { _ in }
     var legendMenu: (PlotSeries) -> AnyView = { _ in AnyView(EmptyView()) }
 
     var body: some View {
@@ -76,6 +77,7 @@ private struct PlotCanvasFrameHost: View {
             registerPlotDragContent: registerPlotDragContent,
             otherDropTypes: otherDropTypes,
             onOtherItemsDropped: onOtherItemsDropped,
+            onOtherItemsHover: onOtherItemsHover,
             legendMenu: legendMenu
         )
     }
@@ -119,6 +121,20 @@ struct DocumentWindow: View {
     @ObservedObject private var plotRefreshGovernor = PlotRefreshGovernor.shared
     /// The graph border a column drag is hovering, where a drop opens a new graph.
     @State private var newGraphDropTarget: NewGraphDropTarget?
+    /// The graphs, captures and sliders in the order they stack in the plot
+    /// area. Read it through `resolvedPanelOrder`, which folds in whatever
+    /// has been added or closed since.
+    @State private var panelOrder: [StackPanelID] = []
+    /// Where each panel last settled, in the stack's coordinate space.
+    @State private var panelFrames: [StackPanelID: CGRect] = [:]
+    /// The panel being dragged by its grip to a new place in the stack.
+    @State private var panelDrag: PanelDragState?
+    /// The stack's place in the window, to tell when a drag has left it.
+    @State private var panelStackGlobalFrame: CGRect = .zero
+    /// Panels a setting drag has put in the stack as a preview. They become
+    /// permanent on a drop and go away if the drag leaves.
+    @State private var pendingDropPanels: [StackPanelID] = []
+    @State private var settingsHoverGeneration = 0
     @StateObject private var captureStore = CapturePaneStore()
     @State private var isDataLoggingEnabled = true
     @State private var clearDocumentEditedRequest = 0
@@ -355,6 +371,10 @@ struct DocumentWindow: View {
             }
             .onChange(of: rpcSliders) { _, _ in
                 saveBoardViewLayoutsForCurrentDevices()
+            }
+            .onChange(of: resolvedPanelOrder, initial: true) { _, order in
+                // Remembers the order things were added in.
+                if panelOrder != order { panelOrder = order }
             }
             .onChange(of: verticalAxisModes) { _, _ in
                 saveBoardViewLayoutsForCurrentDevices()
@@ -1132,6 +1152,7 @@ struct DocumentWindow: View {
 
         isApplyingBoardViewLayout = true
         restoredBoardViewLayoutDeviceSignature = signature
+        panelOrder = []
         let restoredIDs = bridge.replacePlotPanes(with: paneRestores.map(\.request))
         verticalAxisModes.removeAll()
         independentAxisLabelVisibility.removeAll()
@@ -1327,84 +1348,414 @@ struct DocumentWindow: View {
                 Divider()
             }
 
-            let capturePanes = visibleCapturePanes
-            if shouldUseSliderOnlyPlotArea {
-                if capturePanes.isEmpty {
-                    Spacer(minLength: 0)
-                } else {
-                    // With no graphs visible, the capture plots share all the
-                    // free vertical space, like graphs would.
-                    ForEach(Array(capturePanes.enumerated()), id: \.element.id) { index, pane in
-                        if index > 0 {
-                            Divider()
-                        }
-                        capturePane(pane)
-                            .frame(maxHeight: .infinity)
-                    }
-                }
-                if !rpcSliders.isEmpty {
-                    if !capturePanes.isEmpty { Divider() }
-                    RPCSliderTray(
-                        bridge: bridge,
-                        sliders: $rpcSliders,
-                        onOpenSliderWindow: openSliderConfigurationWindowAction,
-                        focusedField: $focusedField
-                    )
-                }
-                if capturePanes.isEmpty {
-                    Spacer(minLength: 0)
-                }
-            } else {
-                GeometryReader { plotAreaGeometry in
-                    VStack(spacing: 0) {
-                        if !visiblePlotPanes.isEmpty {
-                            stackedPlots
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        }
-
-                        // Share the vertical space evenly with the graphs:
-                        // each capture plot takes one graph-sized slot.
-                        ForEach(Array(capturePanes.enumerated()), id: \.element.id) { index, pane in
-                            if index > 0 || !visiblePlotPanes.isEmpty {
-                                Divider()
-                            }
-                            capturePane(pane)
-                                .frame(height: captureShareHeight(
-                                    in: plotAreaGeometry,
-                                    captureCount: capturePanes.count
-                                ))
-                        }
-
-                        if !rpcSliders.isEmpty {
-                            if !visiblePlotPanes.isEmpty || !capturePanes.isEmpty {
-                                Divider()
-                            }
-                            RPCSliderTray(
-                                bridge: bridge,
-                                sliders: $rpcSliders,
-                                onOpenSliderWindow: openSliderConfigurationWindowAction,
-                                focusedField: $focusedField
-                            )
-                        } else if visiblePlotPanes.isEmpty {
-                            Spacer(minLength: 0)
-                        }
-                    }
-                }
-            }
+            panelStack
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        // Catches drops the graphs themselves don't take: anything landing on
-        // the sliders, the capture plots or empty space.
-        .onDrop(
-            of: [SettingDragPayload.contentType, PlotColumnDragPayload.contentType],
-            isTargeted: nil
-        ) { providers in
-            handleSettingsDrop(providers) || handleColumnsDropOutsideGraphs(providers)
+    }
+
+    // MARK: Panel stack
+
+    private static let panelStackCoordinateSpaceName = "PanelStack"
+    private static let panelMoveAnimation = Animation.snappy(duration: 0.22)
+
+    /// Every graph, capture and slider the document has, in stacking order:
+    /// the remembered order, less what has closed, plus what is new. New
+    /// things go to the end, except a graph opened beside another one.
+    private var resolvedPanelOrder: [StackPanelID] {
+        let plots = bridge.plotPanes.map { StackPanelID.plot($0.id) }
+        let captures = captureStore.panes.map { StackPanelID.capture($0.id) }
+        let sliders = rpcSliders.map { StackPanelID.slider($0.id) }
+        let live = Set(plots + captures + sliders)
+        var order = panelOrder.filter(live.contains)
+        let known = Set(order)
+
+        for (index, id) in plots.enumerated() where !known.contains(id) {
+            if let next = plots[(index + 1)...].first(where: known.contains),
+               let nextIndex = order.firstIndex(of: next) {
+                order.insert(id, at: nextIndex)
+            } else {
+                order.append(id)
+            }
+        }
+        for id in captures + sliders where !known.contains(id) {
+            order.append(id)
+        }
+
+        // The bridge owns the order of the graphs among themselves and
+        // `rpcSliders` that of the sliders; keep the stack agreeing with both.
+        var nextPlot = plots.makeIterator()
+        var nextSlider = sliders.makeIterator()
+        return order.map { id in
+            switch id {
+            case .plot: nextPlot.next() ?? id
+            case .slider: nextSlider.next() ?? id
+            case .capture: id
+            }
         }
     }
 
-    private func plotPaneDragPayload(for pane: PlotPaneSelection) -> PlotPaneDragPayload {
-        PlotPaneDragPayload(sessionID: bridge.sessionID, paneID: pane.id)
+    /// The panels this window is showing: not the ones in windows of their
+    /// own, and not the empty graph when sliders or captures stand alone.
+    private var visiblePanels: [StackPanelID] {
+        let hidesPlots = shouldUseSliderOnlyPlotArea
+        let plotIDs = Set(visiblePlotPanes.map(\.id))
+        let captureIDs = Set(visibleCapturePanes.map(\.id))
+        return resolvedPanelOrder.filter { id in
+            switch id {
+            case .plot(let paneID): !hidesPlots && plotIDs.contains(paneID)
+            case .capture(let rpcID): captureIDs.contains(rpcID)
+            case .slider: true
+            }
+        }
+    }
+
+    private func commitPanelOrder(_ order: [StackPanelID]) {
+        panelOrder = order
+        bridge.reorderPlotPanes(order.compactMap { id in
+            if case .plot(let paneID) = id { paneID } else { nil }
+        })
+        let sliders = order.compactMap { id -> RPCSliderConfiguration? in
+            guard case .slider(let sliderID) = id else { return nil }
+            return rpcSliders.first { $0.id == sliderID }
+        }
+        if sliders.count == rpcSliders.count, sliders.map(\.id) != rpcSliders.map(\.id) {
+            rpcSliders = sliders
+        }
+    }
+
+    private func movePanel(_ id: StackPanelID, adjacentTo target: StackPanelID, after: Bool) {
+        var order = resolvedPanelOrder
+        guard id != target, let sourceIndex = order.firstIndex(of: id) else { return }
+        order.remove(at: sourceIndex)
+        guard let targetIndex = order.firstIndex(of: target) else { return }
+        order.insert(id, at: after ? targetIndex + 1 : targetIndex)
+        commitPanelOrder(order)
+    }
+
+    private func stepPanel(_ id: StackPanelID, by offset: Int) {
+        let panels = visiblePanels
+        guard let index = panels.firstIndex(of: id),
+              panels.indices.contains(index + offset) else {
+            return
+        }
+        withAnimation(Self.panelMoveAnimation) {
+            movePanel(id, adjacentTo: panels[index + offset], after: offset > 0)
+        }
+    }
+
+    /// Follows a grip drag: the panel rides with the pointer, and each time
+    /// it passes the middle of a neighbour the two trade places.
+    private func dragPanel(_ id: StackPanelID, translation: CGFloat) {
+        if panelDrag?.id != id {
+            guard let frame = panelFrames[id] else { return }
+            panelDrag = PanelDragState(
+                id: id,
+                startMinY: frame.minY,
+                slotMinY: frame.minY,
+                translation: translation
+            )
+        } else {
+            panelDrag?.translation = translation
+        }
+        guard let drag = panelDrag else { return }
+
+        let panels = visiblePanels
+        guard let index = panels.firstIndex(of: id) else { return }
+        let height = panelFrames[id]?.height ?? 0
+        let minY = drag.startMinY + drag.translation
+        let maxY = minY + height
+
+        if index + 1 < panels.count,
+           let nextHeight = panelFrames[panels[index + 1]]?.height,
+           maxY > drag.slotMinY + height + nextHeight / 2 {
+            panelDrag?.slotMinY += nextHeight
+            withAnimation(Self.panelMoveAnimation) {
+                movePanel(id, adjacentTo: panels[index + 1], after: true)
+            }
+        } else if index > 0,
+                  let previousHeight = panelFrames[panels[index - 1]]?.height,
+                  minY < drag.slotMinY - previousHeight / 2 {
+            panelDrag?.slotMinY -= previousHeight
+            withAnimation(Self.panelMoveAnimation) {
+                movePanel(id, adjacentTo: panels[index - 1], after: false)
+            }
+        }
+    }
+
+    private func endPanelDrag() {
+        guard panelDrag != nil else { return }
+        withAnimation(Self.panelMoveAnimation) {
+            panelDrag = nil
+        }
+        ReorderPanelsTip().invalidate(reason: .actionPerformed)
+    }
+
+    private func reorderHandle(for id: StackPanelID, in panels: [StackPanelID]) -> PanelReorderHandle? {
+        guard panels.count > 1, let index = panels.firstIndex(of: id) else { return nil }
+        return PanelReorderHandle(
+            canMoveUp: index > 0,
+            canMoveDown: index < panels.count - 1,
+            moveUp: { stepPanel(id, by: -1) },
+            moveDown: { stepPanel(id, by: 1) },
+            dragChanged: { dragPanel(id, translation: $0) },
+            dragEnded: endPanelDrag,
+            containsDrag: { panelStackGlobalFrame.contains($0) }
+        )
+    }
+
+    private func sliderBinding(_ sliderID: String) -> Binding<RPCSliderConfiguration>? {
+        guard let current = rpcSliders.first(where: { $0.id == sliderID }) else { return nil }
+        return Binding(
+            get: { rpcSliders.first { $0.id == sliderID } ?? current },
+            set: { newValue in
+                if let index = rpcSliders.firstIndex(where: { $0.id == sliderID }) {
+                    rpcSliders[index] = newValue
+                }
+            }
+        )
+    }
+
+    private var panelStack: some View {
+        GeometryReader { geometry in
+            let panels = visiblePanels
+            let plotPanes = visiblePlotPanes
+            let axisInsets = paneAxisInsets(for: plotPanes)
+            let rightAxisReservationCount = sharedRightAxisReservationCount(for: plotPanes)
+            // Graphs and captures run up under the toolbar; a slider cannot.
+            let startsWithSlider = panels.first.map { id in
+                if case .slider = id { true } else { false }
+            } ?? false
+            let draggedIndex = panelDrag.flatMap { drag in panels.firstIndex(of: drag.id) }
+
+            PanelStackLayout(
+                topInset: startsWithSlider ? geometry.safeAreaInsets.top : 0,
+                draggedIndex: draggedIndex,
+                draggedMinY: panelDrag.map { $0.startMinY + $0.translation } ?? 0
+            ) {
+                ForEach(panels, id: \.self) { id in
+                    let index = panels.firstIndex(of: id) ?? 0
+                    stackPanelContent(
+                        id,
+                        plotPanes: plotPanes,
+                        rightAxisReservationCount: rightAxisReservationCount
+                    )
+                    .frame(maxWidth: .infinity)
+                    .overlay(alignment: .top) {
+                        if index > 0, !(id.isPlot && panels[index - 1].isPlot) {
+                            Divider()
+                        }
+                    }
+                    .opacity(pendingDropPanels.contains(id) ? 0.7 : 1)
+                    .environment(\.panelReorderHandle, reorderHandle(for: id, in: panels))
+                    .onGeometryChange(for: CGRect.self) { proxy in
+                        proxy.frame(in: .named(Self.panelStackCoordinateSpaceName))
+                    } action: { frame in
+                        // The slot is what matters; a dragged panel's frame
+                        // is wherever the pointer has it.
+                        if panelDrag?.id != id {
+                            panelFrames[id] = frame
+                        }
+                    }
+                    .zIndex(panelDrag?.id == id ? 1 : 0)
+                    .layoutValue(
+                        key: PanelFlexibleExtraKey.self,
+                        value: flexibleExtraHeight(for: id, plotPanes: plotPanes, axisInsets: axisInsets)
+                    )
+                }
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
+            .coordinateSpace(name: Self.panelStackCoordinateSpaceName)
+            .onGeometryChange(for: CGRect.self) { proxy in
+                proxy.frame(in: .global)
+            } action: { frame in
+                panelStackGlobalFrame = frame
+            }
+            .overlay {
+                // Drawn here rather than inside a graph so the bar sits on the
+                // border itself, above both neighbours and clear of the toolbar.
+                if let target = newGraphDropTarget,
+                   let frame = panelFrames[.plot(target.paneID)] {
+                    let minY = geometry.safeAreaInsets.top + 12
+                    let maxY = max(minY, geometry.size.height - 12)
+                    NewGraphDropIndicator(title: "New Graph")
+                        .frame(width: geometry.size.width)
+                        .position(
+                            x: geometry.size.width / 2,
+                            y: min(max(target.above ? frame.minY : frame.maxY, minY), maxY)
+                        )
+                        .allowsHitTesting(false)
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.12), value: newGraphDropTarget)
+            .overlay(alignment: .bottom) {
+                if panels.count > 1 {
+                    TipView(ReorderPanelsTip())
+                        .frame(maxWidth: 380)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 44)
+                }
+            }
+            // Catches what the graphs themselves don't take: anything landing
+            // on a slider, a capture plot or empty space.
+            .onDrop(
+                of: [SettingDragPayload.contentType, PlotColumnDragPayload.contentType],
+                delegate: PanelStackDropDelegate(
+                    onSettingsHover: { settingsDragHover(atStackY: $0) },
+                    onSettingsExit: settingsDragExited,
+                    onSettingsDrop: settingsDropPerformed,
+                    onColumnsDrop: handleColumnsDropOutsideGraphs
+                )
+            )
+        }
+        .frame(
+            minWidth: shouldUseSliderOnlyPlotArea ? nil : 520,
+            minHeight: shouldUseSliderOnlyPlotArea ? nil : 360
+        )
+    }
+
+    /// Nil for a panel that keeps its own height; otherwise what a panel
+    /// sharing the free space takes on top of its share.
+    private func flexibleExtraHeight(
+        for id: StackPanelID,
+        plotPanes: [PlotPaneSelection],
+        axisInsets: [CGFloat]
+    ) -> CGFloat? {
+        switch id {
+        case .plot(let paneID):
+            guard let index = plotPanes.firstIndex(where: { $0.id == paneID }) else { return 0 }
+            return axisInsets[index]
+        case .capture:
+            return 0
+        case .slider:
+            return nil
+        }
+    }
+
+    @ViewBuilder
+    private func stackPanelContent(
+        _ id: StackPanelID,
+        plotPanes: [PlotPaneSelection],
+        rightAxisReservationCount: Int
+    ) -> some View {
+        switch id {
+        case .plot(let paneID):
+            if let index = plotPanes.firstIndex(where: { $0.id == paneID }) {
+                plotPane(
+                    plotPanes[index],
+                    index: index,
+                    paneCount: plotPanes.count,
+                    rightAxisReservationCount: rightAxisReservationCount
+                )
+            } else {
+                Color.clear
+            }
+        case .capture(let rpcID):
+            if let pane = captureStore.pane(for: rpcID) {
+                capturePane(pane)
+            } else {
+                Color.clear
+            }
+        case .slider(let sliderID):
+            if let slider = sliderBinding(sliderID) {
+                RPCSliderPanel(
+                    bridge: bridge,
+                    slider: slider,
+                    onRemove: { rpcSliders.removeAll { $0.id == sliderID } },
+                    onOpenWindow: openSliderConfigurationWindowAction.map { open in
+                        { open(slider.wrappedValue) }
+                    },
+                    focusedField: $focusedField
+                )
+            } else {
+                Color.clear.frame(height: 0)
+            }
+        }
+    }
+
+    // MARK: Settings dragged into the stack
+
+    /// A setting drag is over the stack: put a preview of what it would add
+    /// where the pointer is, and keep it there as the pointer moves.
+    private func settingsDragHover(atStackY y: CGFloat) {
+        settingsHoverGeneration += 1
+
+        if pendingDropPanels.isEmpty {
+            var added: [StackPanelID] = []
+            for rpcID in SettingDragSession.rpcIDs {
+                guard let rpc = bridge.rpc(id: rpcID) else { continue }
+                if rpc.isCaptureRPC {
+                    if captureStore.pane(for: rpc.id) == nil {
+                        captureStore.open(rpc.id)
+                        added.append(.capture(rpc.id))
+                    }
+                } else if rpc.isSliderSuitable,
+                          !rpcSliders.contains(where: { $0.id == rpc.id }) {
+                    addRPCSlider(for: rpc)
+                    added.append(.slider(rpc.id))
+                }
+            }
+            guard !added.isEmpty else { return }
+            pendingDropPanels = added
+        }
+
+        let pending = Set(pendingDropPanels)
+        let settled = visiblePanels.filter { !pending.contains($0) }
+        let insertionIndex = settled.filter { (panelFrames[$0]?.midY ?? .infinity) < y }.count
+        var order = resolvedPanelOrder.filter { !pending.contains($0) }
+        let orderIndex = insertionIndex < settled.count
+            ? order.firstIndex(of: settled[insertionIndex]) ?? order.count
+            : order.count
+        order.insert(contentsOf: pendingDropPanels, at: orderIndex)
+        if order != panelOrder {
+            withAnimation(Self.panelMoveAnimation) {
+                commitPanelOrder(order)
+            }
+        }
+    }
+
+    /// The drag left one drop target. It may only have crossed onto the next
+    /// panel, so the preview stays unless nothing picks the drag up again.
+    private func settingsDragExited() {
+        let generation = settingsHoverGeneration
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(120))
+            guard generation == settingsHoverGeneration else { return }
+            discardPendingDropPanels()
+        }
+    }
+
+    private func discardPendingDropPanels() {
+        guard !pendingDropPanels.isEmpty else { return }
+        let pending = pendingDropPanels
+        withAnimation(Self.panelMoveAnimation) {
+            pendingDropPanels = []
+            for id in pending {
+                switch id {
+                case .slider(let sliderID): rpcSliders.removeAll { $0.id == sliderID }
+                case .capture(let rpcID): captureStore.close(rpcID)
+                case .plot: break
+                }
+            }
+        }
+    }
+
+    /// The drop keeps the preview where it is. With no preview up — a drag
+    /// from another window, say — the settings are added at the end.
+    private func settingsDropPerformed(_ providers: [NSItemProvider]) -> Bool {
+        settingsHoverGeneration += 1
+        guard !pendingDropPanels.isEmpty else {
+            return handleSettingsDrop(providers)
+        }
+        pendingDropPanels = []
+        DragSettingsTip().invalidate(reason: .actionPerformed)
+        for rpcID in SettingDragSession.rpcIDs {
+            if let rpc = bridge.rpc(id: rpcID), rpc.isCaptureRPC {
+                captureStore.trigger(rpc.id, bridge: bridge)
+            }
+        }
+        SettingDragSession.rpcIDs = []
+        return true
     }
 
     /// Settings dragged out of the sidebar: each one that can drive a slider
@@ -1441,21 +1792,17 @@ struct DocumentWindow: View {
         }
     }
 
-    /// One graph-sized slot for each capture plot: the available height
-    /// divided evenly among the visible graphs plus the capture panes.
-    private func captureShareHeight(in geometry: GeometryProxy, captureCount: Int) -> CGFloat? {
-        let paneCount = visiblePlotPanes.count
-        guard paneCount > 0 else { return nil }
-        return max(180, geometry.size.height / CGFloat(paneCount + captureCount))
-    }
-
     /// True when the user has a slider or capture active but no plot pane is
     /// actually displaying anything (all panes have empty `columns`). Lets the
     /// layout collapse the empty "Select one or more streams" placeholder and
     /// vertically center the slider / capture surface in the available area.
     private var shouldUseSliderOnlyPlotArea: Bool {
         let hasNonEmptyPane = visiblePlotPanes.contains { !$0.columns.isEmpty }
-        let hasOverlayContent = !rpcSliders.isEmpty || !visibleCapturePanes.isEmpty
+        // A preview of a setting being dragged in doesn't count: the graph it
+        // is hovering has to stay put until the drop.
+        let pending = Set(pendingDropPanels)
+        let hasOverlayContent = rpcSliders.contains { !pending.contains(.slider($0.id)) }
+            || visibleCapturePanes.contains { !pending.contains(.capture($0.id)) }
         return hasOverlayContent && !hasNonEmptyPane
     }
 
@@ -1468,65 +1815,10 @@ struct DocumentWindow: View {
 #endif
     }
 
-    private var stackedPlots: some View {
-        GeometryReader { geometry in
-            let panes = visiblePlotPanes
-            let paneCount = max(1, panes.count)
-            let axisInsets = paneAxisInsets(for: panes)
-            let totalAxisInset = axisInsets.reduce(0, +)
-            let graphFrameHeight = max(1, (geometry.size.height - totalAxisInset) / CGFloat(paneCount))
-            let rightAxisReservationCount = sharedRightAxisReservationCount(for: panes)
-
-            VStack(spacing: 0) {
-                ForEach(Array(panes.enumerated()), id: \.element.id) { index, pane in
-                    plotPane(
-                        pane,
-                        index: index,
-                        paneCount: panes.count,
-                        paneHeight: graphFrameHeight + axisInsets[index],
-                        rightAxisReservationCount: rightAxisReservationCount
-                    )
-                }
-            }
-            .frame(width: geometry.size.width, height: geometry.size.height, alignment: .top)
-            .overlay {
-                // Drawn here rather than inside a graph so the bar sits on the
-                // border itself, above both neighbours and clear of the toolbar.
-                if let target = newGraphDropTarget,
-                   let index = panes.firstIndex(where: { $0.id == target.paneID }) {
-                    let borderIndex = target.above ? index : index + 1
-                    let borderY = axisInsets.prefix(borderIndex).reduce(0, +)
-                        + graphFrameHeight * CGFloat(borderIndex)
-                    let minY = geometry.safeAreaInsets.top + 12
-                    let maxY = max(minY, geometry.size.height - 12)
-                    NewGraphDropIndicator(title: target.movesGraph ? "Move Here" : "New Graph")
-                        .frame(width: geometry.size.width)
-                        .position(
-                            x: geometry.size.width / 2,
-                            y: min(max(borderY, minY), maxY)
-                        )
-                        .allowsHitTesting(false)
-                        .transition(.opacity)
-                }
-            }
-            .animation(.easeInOut(duration: 0.12), value: newGraphDropTarget)
-            .overlay(alignment: .bottom) {
-                if panes.count > 1 {
-                    TipView(ReorderGraphsTip())
-                        .frame(maxWidth: 380)
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 44)
-                }
-            }
-        }
-        .frame(minWidth: 520, minHeight: 360)
-    }
-
     private func plotPane(
         _ pane: PlotPaneSelection,
         index: Int,
         paneCount: Int,
-        paneHeight: CGFloat,
         rightAxisReservationCount: Int
     ) -> some View {
         ZStack(alignment: .top) {
@@ -1572,32 +1864,26 @@ struct DocumentWindow: View {
                     },
                     onPlotColumnsDroppedAtEdge: bridge.canAddPlotPane ? { payload, edge in
                         DragStreamsTip().invalidate(reason: .actionPerformed)
-                        bridge.insertPlotPane(payload, adjacentTo: pane.id, above: edge == .top)
+                        if let newPaneID = bridge.insertPlotPane(payload, adjacentTo: pane.id, above: edge == .top) {
+                            movePanel(.plot(newPaneID), adjacentTo: .plot(pane.id), after: edge == .bottom)
+                        }
                     } : nil,
-                    onDropEdgeChange: { edge, movesGraph in
+                    onDropEdgeChange: { edge, _ in
                         if let edge {
-                            newGraphDropTarget = NewGraphDropTarget(
-                                paneID: pane.id,
-                                above: edge == .top,
-                                movesGraph: movesGraph
-                            )
+                            newGraphDropTarget = NewGraphDropTarget(paneID: pane.id, above: edge == .top)
                         } else if newGraphDropTarget?.paneID == pane.id {
                             newGraphDropTarget = nil
                         }
                     },
-                    edgeOnlyDropTypes: [PlotPaneDragPayload.contentType],
-                    onEdgeItemsDropped: { providers, edge in
-                        PlotPaneDragPayload.loadFirst(from: providers) { payload in
-                            guard let payload, payload.sessionID == bridge.sessionID else { return }
-                            bridge.movePlotPane(id: payload.paneID, adjacentTo: pane.id, above: edge == .top)
-                            ReorderGraphsTip().invalidate(reason: .actionPerformed)
+                    otherDropTypes: [SettingDragPayload.contentType],
+                    onOtherItemsDropped: settingsDropPerformed,
+                    onOtherItemsHover: { y in
+                        if let y {
+                            settingsDragHover(atStackY: (panelFrames[.plot(pane.id)]?.minY ?? 0) + y)
+                        } else {
+                            settingsDragExited()
                         }
                     },
-                    registerPlotDragContent: { provider in
-                        plotPaneDragPayload(for: pane).register(in: provider)
-                    },
-                    otherDropTypes: [SettingDragPayload.contentType],
-                    onOtherItemsDropped: handleSettingsDrop,
                     legendMenu: { series in
                         AnyView(PlotLegendMenu(bridge: bridge, series: series, paneID: pane.id))
                     }
@@ -1622,7 +1908,6 @@ struct DocumentWindow: View {
                 .zIndex(1)
             }
         }
-        .frame(height: paneHeight)
     }
 
     private func graphLeadingBleed(forDetailMinX detailMinX: CGFloat) -> CGFloat {
@@ -1691,14 +1976,6 @@ struct DocumentWindow: View {
 
     private func topPlotInset(for pane: PlotPaneSelection, index: Int) -> CGFloat {
         bridge.plotMode(for: pane) == .fft && index > 0 ? 6 : 0
-    }
-
-    private func canMovePlotPane(_ pane: PlotPaneSelection, by offset: Int) -> Bool {
-        guard let index = bridge.plotPanes.firstIndex(where: { $0.id == pane.id }) else {
-            return false
-        }
-        let targetIndex = index + offset
-        return targetIndex >= 0 && targetIndex < bridge.plotPanes.count
     }
 
     private func plotOpenWindowAction(for pane: PlotPaneSelection) -> (() -> Void)? {
@@ -1786,18 +2063,7 @@ struct DocumentWindow: View {
 
             GraphRailGripMenu(
                 title: "Plot",
-                canMoveUp: canMovePlotPane(pane, by: -1),
-                canMoveDown: canMovePlotPane(pane, by: 1),
-                onMoveUp: {
-                    bridge.movePlotPane(id: pane.id, by: -1)
-                },
-                onMoveDown: {
-                    bridge.movePlotPane(id: pane.id, by: 1)
-                },
-                onOpenWindow: plotOpenWindowAction(for: pane),
-                dragProvider: {
-                    plotPaneDragPayload(for: pane).itemProvider
-                }
+                onOpenWindow: plotOpenWindowAction(for: pane)
             )
 
             Divider()
@@ -2802,19 +3068,6 @@ private struct PlotPopoutWindowView: View {
                 }
             )
 
-            GraphRailGripMenu(
-                title: "Plot",
-                canMoveUp: canMovePlotPane(pane, by: -1),
-                canMoveDown: canMovePlotPane(pane, by: 1),
-                onMoveUp: {
-                    bridge.movePlotPane(id: pane.id, by: -1)
-                },
-                onMoveDown: {
-                    bridge.movePlotPane(id: pane.id, by: 1)
-                },
-                onOpenWindow: nil
-            )
-
             Divider()
                 .frame(height: 22)
 
@@ -3061,7 +3314,10 @@ private extension View {
             self
         } else {
             onDrag {
-                SettingDragPayload(rpcIDs: rpcIDs).itemProvider
+                MainActor.assumeIsolated {
+                    SettingDragSession.rpcIDs = rpcIDs
+                }
+                return SettingDragPayload(rpcIDs: rpcIDs).itemProvider
             }
         }
     }
@@ -3673,60 +3929,250 @@ private struct GraphControlActionButton: View {
     }
 }
 
-private struct GraphRailGripMenu: View {
-    let title: String
-    let canMoveUp: Bool
-    let canMoveDown: Bool
-    let onMoveUp: () -> Void
-    let onMoveDown: () -> Void
-    let onOpenWindow: (() -> Void)?
-    /// Lets the grip be dragged to reorder what it belongs to.
-    var dragProvider: (() -> NSItemProvider)? = nil
+/// What a panel in the plot area's stack is: a graph, a capture plot or a
+/// setting's slider.
+private enum StackPanelID: Hashable {
+    case plot(Int)
+    case capture(String)
+    case slider(String)
 
-    var body: some View {
-        if let dragProvider {
-            menu.onDrag(dragProvider)
-        } else {
-            menu
-        }
+    var isPlot: Bool {
+        if case .plot = self { true } else { false }
+    }
+}
+
+private struct PanelDragState: Equatable {
+    let id: StackPanelID
+    /// Where the panel's top edge was when the drag began.
+    let startMinY: CGFloat
+    /// The top of the place the panel would settle in if let go now.
+    var slotMinY: CGFloat
+    var translation: CGFloat
+}
+
+/// How a panel's grip moves the panel within the stack it sits in.
+struct PanelReorderHandle {
+    var canMoveUp = false
+    var canMoveDown = false
+    var moveUp: () -> Void
+    var moveDown: () -> Void
+    /// The grip has been dragged this far down from where it started.
+    var dragChanged: (CGFloat) -> Void
+    var dragEnded: () -> Void
+    /// Whether a point in the window is still over the stack. A drag of a
+    /// panel's body that leaves it stops rearranging and carries the panel
+    /// out as a drag other apps can take.
+    var containsDrag: (CGPoint) -> Bool = { _ in true }
+}
+
+extension EnvironmentValues {
+    /// Set for panels that can be rearranged; nil anywhere else, such as in a
+    /// window of the panel's own.
+    @Entry var panelReorderHandle: PanelReorderHandle? = nil
+}
+
+/// Makes a view the handle its panel is dragged by.
+private struct PanelReorderGrip: ViewModifier {
+    @Environment(\.panelReorderHandle) private var handle
+    @GestureState private var isDragging = false
+
+    func body(content: Content) -> some View {
+        content
+            .gesture(handle.map { handle in
+                // Measured against the window: the grip itself moves with the
+                // panel, so its own coordinates would chase the pointer.
+                DragGesture(minimumDistance: 4, coordinateSpace: .global)
+                    .updating($isDragging) { _, isDragging, _ in
+                        isDragging = true
+                    }
+                    .onChanged { value in
+                        handle.dragChanged(value.translation.height)
+                    }
+            })
+            // Fires when the drag is cancelled as well as when it ends.
+            .onChange(of: isDragging) { _, isDragging in
+                if !isDragging { handle?.dragEnded() }
+            }
+    }
+}
+
+private extension View {
+    func panelReorderGrip() -> some View {
+        modifier(PanelReorderGrip())
+    }
+}
+
+private struct PanelFlexibleExtraKey: LayoutValueKey {
+    static let defaultValue: CGFloat? = nil
+}
+
+/// Stacks the plot area's panels top to bottom. Sliders keep their own
+/// height; graphs and captures share what is left. A panel being dragged
+/// leaves its place open and is put where the pointer has it.
+private struct PanelStackLayout: Layout {
+    var topInset: CGFloat = 0
+    var draggedIndex: Int?
+    var draggedMinY: CGFloat = 0
+
+    private static let minimumFlexibleHeight: CGFloat = 120
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        proposal.replacingUnspecifiedDimensions()
     }
 
-    private var menu: some View {
-        Menu {
-            Button {
-                onMoveUp()
-            } label: {
-                Label("Move Up", systemImage: "arrow.up")
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var heights = [CGFloat](repeating: 0, count: subviews.count)
+        var fixedHeight: CGFloat = 0
+        var flexibleCount = 0
+        for (index, subview) in subviews.enumerated() {
+            if let extra = subview[PanelFlexibleExtraKey.self] {
+                flexibleCount += 1
+                fixedHeight += extra
+            } else {
+                heights[index] = subview.sizeThatFits(
+                    ProposedViewSize(width: bounds.width, height: nil)
+                ).height
+                fixedHeight += heights[index]
             }
-            .disabled(!canMoveUp)
+        }
 
-            Button {
-                onMoveDown()
-            } label: {
-                Label("Move Down", systemImage: "arrow.down")
-            }
-            .disabled(!canMoveDown)
-
-            if let onOpenWindow {
-                Divider()
-
-                Button {
-                    onOpenWindow()
-                } label: {
-                    Label("Open in Window", systemImage: "arrow.up.right.square")
+        var y = bounds.minY + topInset
+        if flexibleCount > 0 {
+            let share = max(
+                Self.minimumFlexibleHeight,
+                (bounds.height - topInset - fixedHeight) / CGFloat(flexibleCount)
+            )
+            for (index, subview) in subviews.enumerated() {
+                if let extra = subview[PanelFlexibleExtraKey.self] {
+                    heights[index] = share + extra
                 }
             }
-        } label: {
+        } else {
+            // Sliders alone sit in the middle of the area.
+            y = bounds.minY + max(topInset, (bounds.height - fixedHeight) / 2)
+        }
+
+        for (index, subview) in subviews.enumerated() {
+            var placedY = y
+            if index == draggedIndex {
+                let lowest = max(bounds.minY, bounds.maxY - heights[index])
+                placedY = min(max(bounds.minY + draggedMinY, bounds.minY), lowest)
+            }
+            subview.place(
+                at: CGPoint(x: bounds.minX, y: placedY),
+                anchor: .topLeading,
+                proposal: ProposedViewSize(width: bounds.width, height: heights[index])
+            )
+            y += heights[index]
+        }
+    }
+}
+
+/// Takes the drags that land in the plot area but not on a graph.
+private struct PanelStackDropDelegate: DropDelegate {
+    let onSettingsHover: (CGFloat) -> Void
+    let onSettingsExit: () -> Void
+    let onSettingsDrop: ([NSItemProvider]) -> Bool
+    let onColumnsDrop: ([NSItemProvider]) -> Bool
+
+    private static let settingTypes = [SettingDragPayload.contentType]
+    private static let columnTypes = [PlotColumnDragPayload.contentType]
+
+    private func carriesSettings(_ info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: Self.settingTypes)
+    }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: Self.settingTypes + Self.columnTypes)
+    }
+
+    func dropEntered(info: DropInfo) {
+        if carriesSettings(info) { onSettingsHover(info.location.y) }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        if carriesSettings(info) { onSettingsHover(info.location.y) }
+        return DropProposal(operation: .copy)
+    }
+
+    func dropExited(info: DropInfo) {
+        if carriesSettings(info) { onSettingsExit() }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        if carriesSettings(info) {
+            return onSettingsDrop(info.itemProviders(for: Self.settingTypes))
+        }
+        return onColumnsDrop(info.itemProviders(for: Self.columnTypes))
+    }
+}
+
+/// The grip on a panel's control rail. Dragging it moves the panel through
+/// the stack; clicking it offers the same moves, and a window of its own.
+private struct GraphRailGripMenu: View {
+    let title: String
+    let onOpenWindow: (() -> Void)?
+
+    @Environment(\.panelReorderHandle) private var reorderHandle
+    @State private var showsMenu = false
+
+    var body: some View {
+        if reorderHandle != nil || onOpenWindow != nil {
             Image(systemName: "line.3.horizontal")
                 .font(.caption.weight(.semibold))
                 .frame(width: 28, height: 28)
                 .foregroundStyle(Color.secondary)
                 .contentShape(Rectangle())
+                .onTapGesture {
+                    showsMenu = true
+                }
+                .panelReorderGrip()
+                .popover(isPresented: $showsMenu, arrowEdge: .bottom) {
+                    menu
+                        .presentationCompactAdaptation(.popover)
+                }
+                .help(reorderHandle == nil ? "\(title) options" : "Drag to move \(title)")
+                .accessibilityElement()
+                .accessibilityLabel("Move \(title)")
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction {
+                    showsMenu = true
+                }
         }
-        .menuStyle(.button)
+    }
+
+    private var menu: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if let reorderHandle {
+                menuButton("Move Up", systemImage: "arrow.up", action: reorderHandle.moveUp)
+                    .disabled(!reorderHandle.canMoveUp)
+                menuButton("Move Down", systemImage: "arrow.down", action: reorderHandle.moveDown)
+                    .disabled(!reorderHandle.canMoveDown)
+            }
+
+            if let onOpenWindow {
+                if reorderHandle != nil {
+                    Divider()
+                }
+                menuButton("Open in Window", systemImage: "arrow.up.right.square", action: onOpenWindow)
+            }
+        }
+        .padding(8)
+        .frame(minWidth: 180)
+    }
+
+    private func menuButton(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
+        Button {
+            showsMenu = false
+            action()
+        } label: {
+            Label(title, systemImage: systemImage)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 4)
+                .padding(.horizontal, 6)
+                .contentShape(Rectangle())
+        }
         .buttonStyle(.plain)
-        .help("Move \(title)")
-        .accessibilityLabel("Move \(title)")
     }
 }
 
@@ -3986,16 +4432,7 @@ private struct CaptureResultPane: View {
                 .disabled(rpc == nil)
             }
 
-            if onPopOut != nil {
-                GraphRailGripMenu(
-                    title: "Capture",
-                    canMoveUp: false,
-                    canMoveDown: false,
-                    onMoveUp: {},
-                    onMoveDown: {},
-                    onOpenWindow: onPopOut
-                )
-            }
+            GraphRailGripMenu(title: "Capture", onOpenWindow: onPopOut)
 
             if let onClose {
                 Divider()
@@ -8593,8 +9030,6 @@ private struct RestoredBoardPlotPane {
 private struct NewGraphDropTarget: Equatable {
     let paneID: Int
     let above: Bool
-    /// The drag is an existing graph changing place, not columns opening one.
-    let movesGraph: Bool
 }
 
 private struct RPCSliderConfiguration: Identifiable, Hashable {
@@ -8608,57 +9043,29 @@ private struct RPCSliderConfiguration: Identifiable, Hashable {
     var isExpanded = true
 }
 
-private struct RPCSliderTray: View {
+/// One setting's slider as a panel in the plot area's stack.
+private struct RPCSliderPanel: View {
     @ObservedObject var bridge: BridgeClient
-    @Binding var sliders: [RPCSliderConfiguration]
-    let onOpenSliderWindow: ((RPCSliderConfiguration) -> Void)?
+    @Binding var slider: RPCSliderConfiguration
+    let onRemove: () -> Void
+    let onOpenWindow: (() -> Void)?
     let focusedField: FocusState<RpcFocusField?>.Binding
-    /// Where the tray meets the rounded corners of what holds it: along the
+    /// Where the panel meets the rounded corners of what holds it: along the
     /// bottom of the window it runs into the display's corners on iPhone and
     /// the window's on Mac and iPad.
     @State private var cornerInsets = RectangleCornerInsets()
-    /// The slider being dragged to a new place; rows reorder live under it.
-    @State private var draggedSliderID: String?
 
     private static let horizontalPadding: CGFloat = 12
-    private static let verticalPadding: CGFloat = 8
+    private static let verticalPadding: CGFloat = 6
 
     var body: some View {
-        VStack(spacing: 6) {
-            if sliders.count > 1 {
-                TipView(ReorderSlidersTip())
-            }
-
-            ForEach($sliders) { $slider in
-                RPCSliderControlRow(
-                    bridge: bridge,
-                    slider: $slider,
-                    onRemove: { removeSlider(id: slider.id) },
-                    onOpenWindow: onOpenSliderWindow.map { open in
-                        { open(slider) }
-                    },
-                    dragProvider: sliders.count > 1 ? {
-                        draggedSliderID = slider.id
-                        return SliderDragPayload(sliderID: slider.id).itemProvider
-                    } : nil,
-                    focusedField: focusedField
-                )
-                .opacity(draggedSliderID == slider.id ? 0.5 : 1)
-                .onDrop(
-                    of: [SliderDragPayload.contentType],
-                    delegate: SliderReorderDropDelegate(
-                        targetID: slider.id,
-                        sliders: $sliders,
-                        draggedID: $draggedSliderID
-                    )
-                )
-            }
-        }
-        // A slider dropped in the tray's padding still ends the drag cleanly.
-        .onDrop(of: [SliderDragPayload.contentType], isTargeted: nil) { _ in
-            draggedSliderID = nil
-            return true
-        }
+        RPCSliderControlRow(
+            bridge: bridge,
+            slider: $slider,
+            onRemove: onRemove,
+            onOpenWindow: onOpenWindow,
+            focusedField: focusedField
+        )
         .padding(.leading, Self.horizontalInset(clearing: cornerInsets.bottomLeading))
         .padding(.trailing, Self.horizontalInset(clearing: cornerInsets.bottomTrailing))
         .padding(.vertical, Self.verticalPadding)
@@ -8671,46 +9078,13 @@ private struct RPCSliderTray: View {
         }
     }
 
-    /// The rows sit `verticalPadding` above the tray's bottom edge, so they
-    /// clear a corner unless they would fall inside it on both axes; then they
-    /// move in past it.
+    /// The row sits `verticalPadding` above the panel's bottom edge, so it
+    /// clears a corner unless it would fall inside it on both axes; then it
+    /// moves in past it.
     private static func horizontalInset(clearing corner: CGSize) -> CGFloat {
         corner.width > horizontalPadding && corner.height > verticalPadding
             ? corner.width
             : horizontalPadding
-    }
-
-    private func removeSlider(id: String) {
-        sliders.removeAll { $0.id == id }
-    }
-}
-
-/// Reorders the tray as a dragged slider passes over each row, so the rows
-/// make room where it would land.
-private struct SliderReorderDropDelegate: DropDelegate {
-    let targetID: String
-    @Binding var sliders: [RPCSliderConfiguration]
-    @Binding var draggedID: String?
-
-    func dropEntered(info: DropInfo) {
-        guard let draggedID, draggedID != targetID,
-              let from = sliders.firstIndex(where: { $0.id == draggedID }),
-              let to = sliders.firstIndex(where: { $0.id == targetID }) else {
-            return
-        }
-        withAnimation(.easeInOut(duration: 0.18)) {
-            sliders.move(fromOffsets: IndexSet(integer: from), toOffset: to > from ? to + 1 : to)
-        }
-        ReorderSlidersTip().invalidate(reason: .actionPerformed)
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        DropProposal(operation: .move)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        draggedID = nil
-        return true
     }
 }
 
@@ -8719,9 +9093,10 @@ private struct RPCSliderControlRow: View {
     @Binding var slider: RPCSliderConfiguration
     let onRemove: (() -> Void)?
     let onOpenWindow: (() -> Void)?
-    /// Set when the row can be dragged by its title to reorder it.
-    var dragProvider: (() -> NSItemProvider)? = nil
     let focusedField: FocusState<RpcFocusField?>.Binding
+
+    /// Set when the row is a panel that can be dragged by its title.
+    @Environment(\.panelReorderHandle) private var reorderHandle
 
     @AppStorage(ViewPreferenceKeys.rpcFloatPrecisionPPM) private var rpcFloatPrecisionPPM = NumericDisplayPolicy.defaultRPCFloatPrecisionPPM
     @AppStorage(ViewPreferenceKeys.rpcSliderRateLimitHz) private var rpcSliderRateLimitHz = RPCSliderRateLimit.defaultHz
@@ -8841,10 +9216,9 @@ private struct RPCSliderControlRow: View {
 
     /// The row's title strip: the setting's name and the empty space beside
     /// it. When the row can be reordered it doubles as the drag handle.
-    @ViewBuilder
     private func sliderTitle(for rpc: RpcInfo) -> some View {
-        let title = HStack(spacing: 8) {
-            if dragProvider != nil {
+        HStack(spacing: 8) {
+            if reorderHandle != nil {
                 Image(systemName: "line.3.horizontal")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
@@ -8860,18 +9234,29 @@ private struct RPCSliderControlRow: View {
         .contextMenu {
             sliderNameMenu
         }
-
-        if let dragProvider {
-            title
-                .onDrag(dragProvider)
-                .help("Drag to reorder")
-        } else {
-            title
-        }
+        .panelReorderGrip()
     }
 
     @ViewBuilder
     private var sliderNameMenu: some View {
+        if let reorderHandle {
+            Button {
+                reorderHandle.moveUp()
+            } label: {
+                Label("Move Up", systemImage: "arrow.up")
+            }
+            .disabled(!reorderHandle.canMoveUp)
+
+            Button {
+                reorderHandle.moveDown()
+            } label: {
+                Label("Move Down", systemImage: "arrow.down")
+            }
+            .disabled(!reorderHandle.canMoveDown)
+
+            Divider()
+        }
+
         if let onOpenWindow {
             Button {
                 onOpenWindow()

@@ -33,25 +33,14 @@ struct DragSettingsTip: Tip {
     }
 }
 
-/// Shown once there are several graphs to arrange.
-struct ReorderGraphsTip: Tip {
+/// Shown once the plot area holds several things to arrange.
+struct ReorderPanelsTip: Tip {
     var title: Text {
-        Text("Drag a graph to move it")
+        Text("Drag to rearrange")
     }
 
     var message: Text? {
-        Text("Drop it on another graph to place it above or below.")
-    }
-
-    var image: Image? {
-        Image(systemName: "arrow.up.arrow.down")
-    }
-}
-
-/// Shown once there are several sliders to arrange.
-struct ReorderSlidersTip: Tip {
-    var title: Text {
-        Text("Drag a slider by its name to reorder")
+        Text("Graphs, sliders and captures can sit in any order. Drag a graph itself, or anything by its \(Image(systemName: "line.3.horizontal")) grip.")
     }
 
     var image: Image? {

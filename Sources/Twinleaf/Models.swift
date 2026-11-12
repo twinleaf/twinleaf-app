@@ -37,8 +37,6 @@ extension UTType {
     static let twinleafHDF5 = UTType(importedAs: "org.hdfgroup.hdf5", conformingTo: .data)
     static let twinleafPlotColumns = UTType(exportedAs: "com.twarge.twinleaf.plot-columns", conformingTo: .json)
     static let twinleafSettings = UTType(exportedAs: "com.twarge.twinleaf.settings", conformingTo: .json)
-    static let twinleafPlotPane = UTType(exportedAs: "com.twarge.twinleaf.plot-pane", conformingTo: .json)
-    static let twinleafSlider = UTType(exportedAs: "com.twarge.twinleaf.slider", conformingTo: .json)
 }
 
 struct AvailableDevice: Codable, Hashable, Identifiable {
@@ -456,20 +454,12 @@ struct SettingDragPayload: InAppDragPayload, Hashable {
     static let contentType = UTType.twinleafSettings
 }
 
-/// A graph being dragged to a new place in its window's stack. The session
-/// keeps a drag from one document window from rearranging another's graphs.
-struct PlotPaneDragPayload: InAppDragPayload, Hashable {
-    let sessionID: UUID
-    let paneID: Int
-
-    static let contentType = UTType.twinleafPlotPane
-}
-
-/// A slider being dragged to a new place in the slider tray.
-struct SliderDragPayload: InAppDragPayload, Hashable {
-    let sliderID: String
-
-    static let contentType = UTType.twinleafSlider
+/// The settings being dragged out of a sidebar right now. A drop target
+/// cannot read a drag's contents until the drop, so the preview that follows
+/// the pointer learns what is coming from here.
+@MainActor
+enum SettingDragSession {
+    static var rpcIDs: [String] = []
 }
 
 enum PlotWindowDuration {

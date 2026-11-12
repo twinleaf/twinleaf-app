@@ -291,6 +291,9 @@ struct PlotCanvas: View {
     /// settings dragged out of the sidebar.
     var otherDropTypes: [UTType] = []
     var onOtherItemsDropped: ([NSItemProvider]) -> Bool = { _ in false }
+    /// Where one of those other drags is hovering, as a distance down from the
+    /// top of the graph; nil once it leaves.
+    var onOtherItemsHover: (CGFloat?) -> Void = { _ in }
     /// Context-menu content for one legend entry. Supplied by the host so the
     /// canvas stays free of bridge and menu-building concerns.
     var legendMenu: (PlotSeries) -> AnyView = { _ in AnyView(EmptyView()) }
@@ -306,6 +309,15 @@ struct PlotCanvas: View {
     @State private var cursorLocation: CGPoint?
     @ObservedObject private var cursorModifiers = PlotCursorModifiers.shared
     @State private var isPlotDropTargeted = false
+#if os(macOS)
+    /// Set where the graph sits in a stack it can be rearranged in.
+    @Environment(\.panelReorderHandle) private var reorderHandle
+    @GestureState private var isBodyDragging = false
+    /// Where the drag that has left the stack began. The same gesture keeps
+    /// reporting after the system drag takes over; this tells it apart from
+    /// the next one.
+    @State private var brokenOutDragStart: CGPoint?
+#endif
     @State private var plotDropEdge: VerticalEdge?
     @State private var plotDropMovesGraph = false
     @State private var snappedAxisRangeMemory = SnappedAxisRangeMemory()
@@ -386,11 +398,22 @@ struct PlotCanvas: View {
                 // The plot's own drag has to be attached below the legend: an
                 // .onDrag layered over the legend swallows every drag that
                 // starts inside it, including the legend's per-series drags.
+#if os(macOS)
+                .gesture(bodyDragGesture(size: geometry.size, plan: plan, rect: rect))
+                // Fires when the drag is cancelled as well as when it ends.
+                .onChange(of: isBodyDragging) { _, isDragging in
+                    if !isDragging {
+                        reorderHandle?.dragEnded()
+                        brokenOutDragStart = nil
+                    }
+                }
+#else
                 .onDrag {
                     let provider = plotPDFItemProvider(size: geometry.size, plan: plan, rect: rect)
                     registerPlotDragContent(provider)
                     return provider
                 }
+#endif
                 .overlay(alignment: .topLeading) {
                     if (showKey || activeCursorSelection != nil) && (!series.isEmpty || isPlotDropTargeted) {
                         legend(selection: activeCursorSelection)
@@ -435,7 +458,8 @@ struct PlotCanvas: View {
                             }
                         },
                         onEdgeItemsDropped: onEdgeItemsDropped,
-                        onOtherItemsDropped: onOtherItemsDropped
+                        onOtherItemsDropped: onOtherItemsDropped,
+                        onOtherItemsHover: onOtherItemsHover
                     )
                 )
                 .onContinuousHover { phase in
@@ -675,6 +699,33 @@ struct PlotCanvas: View {
         }
         return max(0, time - recordingStartSeconds)
     }
+
+#if os(macOS)
+    /// Dragging the graph moves it through the stack it is in. Once the
+    /// pointer leaves the stack, or when there is no stack to rearrange, the
+    /// drag becomes a real one carrying the graph as a PDF.
+    private func bodyDragGesture(size: CGSize, plan: PlotDataPlan?, rect: CGRect) -> some Gesture {
+        // Measured against the window: the graph moves with the drag, so its
+        // own coordinates would chase the pointer.
+        DragGesture(minimumDistance: 4, coordinateSpace: .global)
+            .updating($isBodyDragging) { _, isDragging, _ in
+                isDragging = true
+            }
+            .onChanged { value in
+                guard brokenOutDragStart != value.startLocation else { return }
+                if let reorderHandle, reorderHandle.containsDrag(value.location) {
+                    reorderHandle.dragChanged(value.translation.height)
+                } else {
+                    brokenOutDragStart = value.startLocation
+                    reorderHandle?.dragEnded()
+                    PlotSystemDrag.begin(
+                        pdfData: plotPDFData(size: size, plan: plan, rect: rect),
+                        fileName: plotPDFSuggestedName
+                    )
+                }
+            }
+    }
+#endif
 
     private func plotPDFItemProvider(size: CGSize, plan: PlotDataPlan?, rect: CGRect) -> NSItemProvider {
         let provider = NSItemProvider()
@@ -1312,6 +1363,92 @@ struct PlotCanvas: View {
 /// Routes drags over a graph: columns dropped on its body join it, columns
 /// dropped in its top or bottom band ask the host for a new graph there, and
 /// any other accepted type is handed straight to the host.
+#if os(macOS)
+/// Starts an AppKit drag of a graph's PDF from inside a gesture that is
+/// already under way, which SwiftUI's own `.onDrag` cannot do.
+@MainActor
+private enum PlotSystemDrag {
+    private static let source = Source()
+    private static let promiseDelegate = PromiseDelegate()
+
+    static func begin(pdfData: Data?, fileName: String) {
+        guard let pdfData, !pdfData.isEmpty,
+              let event = NSApp.currentEvent,
+              event.type == .leftMouseDragged || event.type == .leftMouseDown,
+              let view = event.window?.contentView else {
+            return
+        }
+
+        let provider = PDFPromiseProvider(fileType: UTType.pdf.identifier, delegate: promiseDelegate)
+        provider.pdfData = pdfData
+        provider.fileName = fileName
+
+        let item = NSDraggingItem(pasteboardWriter: provider)
+        let image = NSImage(data: pdfData)
+        let imageSize = image?.size ?? CGSize(width: 240, height: 150)
+        let scale = min(1, 260 / max(imageSize.width, 1))
+        let dragSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+        let location = view.convert(event.locationInWindow, from: nil)
+        item.setDraggingFrame(
+            CGRect(
+                x: location.x - dragSize.width / 2,
+                y: location.y - dragSize.height / 2,
+                width: dragSize.width,
+                height: dragSize.height
+            ),
+            contents: image
+        )
+        view.beginDraggingSession(with: [item], event: event, source: source)
+    }
+
+    private final class Source: NSObject, NSDraggingSource {
+        func draggingSession(
+            _ session: NSDraggingSession,
+            sourceOperationMaskFor context: NSDraggingContext
+        ) -> NSDragOperation {
+            .copy
+        }
+    }
+
+    /// Offers the PDF both as a file to be written where it is dropped and as
+    /// PDF data for apps that paste it in place.
+    private final class PDFPromiseProvider: NSFilePromiseProvider, @unchecked Sendable {
+        var pdfData = Data()
+        var fileName = "Twinleaf Plot.pdf"
+
+        override func writableTypes(for pasteboard: NSPasteboard) -> [NSPasteboard.PasteboardType] {
+            super.writableTypes(for: pasteboard) + [.pdf]
+        }
+
+        override func pasteboardPropertyList(forType type: NSPasteboard.PasteboardType) -> Any? {
+            type == .pdf ? pdfData : super.pasteboardPropertyList(forType: type)
+        }
+    }
+
+    private final class PromiseDelegate: NSObject, NSFilePromiseProviderDelegate {
+        nonisolated func filePromiseProvider(
+            _ filePromiseProvider: NSFilePromiseProvider,
+            fileNameForType fileType: String
+        ) -> String {
+            (filePromiseProvider as? PDFPromiseProvider)?.fileName ?? "Twinleaf Plot.pdf"
+        }
+
+        nonisolated func filePromiseProvider(
+            _ filePromiseProvider: NSFilePromiseProvider,
+            writePromiseTo url: URL,
+            completionHandler: @escaping (Error?) -> Void
+        ) {
+            do {
+                try (filePromiseProvider as? PDFPromiseProvider)?.pdfData.write(to: url)
+                completionHandler(nil)
+            } catch {
+                completionHandler(error)
+            }
+        }
+    }
+}
+#endif
+
 private struct PlotCanvasDropDelegate: DropDelegate {
     /// Y positions bounding the body of the graph; nil disables edge drops
     /// for columns.
@@ -1325,6 +1462,7 @@ private struct PlotCanvasDropDelegate: DropDelegate {
     let onColumnsDropped: (PlotColumnDragPayload, VerticalEdge?) -> Void
     let onEdgeItemsDropped: ([NSItemProvider], VerticalEdge) -> Bool
     let onOtherItemsDropped: ([NSItemProvider]) -> Bool
+    let onOtherItemsHover: (CGFloat?) -> Void
 
     private static let columnTypes = [PlotColumnDragPayload.contentType]
 
@@ -1355,6 +1493,7 @@ private struct PlotCanvasDropDelegate: DropDelegate {
 
     func dropExited(info: DropInfo) {
         clearTarget()
+        if content(of: info) == .other { onOtherItemsHover(nil) }
     }
 
     func performDrop(info: DropInfo) -> Bool {
@@ -1391,7 +1530,10 @@ private struct PlotCanvasDropDelegate: DropDelegate {
 
     private func updateTarget(_ info: DropInfo) {
         let content = content(of: info)
-        guard content != .other else { return }
+        guard content != .other else {
+            onOtherItemsHover(info.location.y)
+            return
+        }
         let newEdge = targetEdge(info)
         // Set before the edge, whose change is what the host is told about.
         let movesGraph = content == .edgeOnly

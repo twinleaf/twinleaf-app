@@ -816,18 +816,17 @@ final class BridgeClient: ObservableObject {
         updateRuntimePlotPanes()
     }
 
-    /// Move a graph so it sits directly above or below another one.
-    func movePlotPane(id: Int, adjacentTo neighborPaneID: Int, above: Bool) {
-        guard id != neighborPaneID,
-              let sourceIndex = plotPanes.firstIndex(where: { $0.id == id }) else {
-            return
-        }
-        var panes = plotPanes
-        let pane = panes.remove(at: sourceIndex)
-        guard let neighborIndex = panes.firstIndex(where: { $0.id == neighborPaneID }) else { return }
-        panes.insert(pane, at: above ? neighborIndex : neighborIndex + 1)
-        guard panes.map(\.id) != plotPanes.map(\.id) else { return }
-        plotPanes = panes
+    /// Put the graphs in the given order. Graphs the list leaves out keep
+    /// their relative order after the ones it names.
+    func reorderPlotPanes(_ ids: [Int]) {
+        let rank = Dictionary(ids.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        let reordered = plotPanes.enumerated().sorted { lhs, rhs in
+            let lhsRank = rank[lhs.element.id] ?? ids.count + lhs.offset
+            let rhsRank = rank[rhs.element.id] ?? ids.count + rhs.offset
+            return lhsRank < rhsRank
+        }.map(\.element)
+        guard reordered.map(\.id) != plotPanes.map(\.id) else { return }
+        plotPanes = reordered
         updateRuntimePlotPanes()
     }
 
