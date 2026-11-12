@@ -13,8 +13,6 @@
 			<array>
 				<string>tio</string>
 			</array>
-			<key>CFBundleTypeIconFile</key>
-			<string>TwinleafDocument.icns</string>
 			<key>CFBundleTypeName</key>
 			<string>Twinleaf TIO Log</string>
 			<key>CFBundleTypeRole</key>
@@ -29,8 +27,6 @@
 	</array>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
-	<key>CFBundleIconFile</key>
-	<string>TwinleafApp</string>
 	<key>CFBundleIdentifier</key>
 	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	<key>CFBundleInfoDictionaryVersion</key>
@@ -88,8 +84,13 @@
 			</array>
 			<key>UTTypeDescription</key>
 			<string>Twinleaf TIO Log</string>
-			<key>UTTypeIconFile</key>
-			<string>TwinleafDocument.icns</string>
+			<!-- The system draws the document icon: the app icon on a folded
+			     page, labelled TIO. It follows AppIcon.icon by itself. -->
+			<key>UTTypeIcons</key>
+			<dict>
+				<key>UTTypeIconText</key>
+				<string>tio</string>
+			</dict>
 			<key>UTTypeIdentifier</key>
 			<string>com.twinleaf.tio</string>
 			<key>UTTypeTagSpecification</key>

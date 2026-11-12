@@ -112,6 +112,13 @@
 			</array>
 			<key>UTTypeDescription</key>
 			<string>Twinleaf TIO Log</string>
+			<!-- As on macOS: the system draws the app icon on a folded page,
+			     labelled TIO. -->
+			<key>UTTypeIcons</key>
+			<dict>
+				<key>UTTypeIconText</key>
+				<string>tio</string>
+			</dict>
 			<key>UTTypeIdentifier</key>
 			<string>com.twinleaf.tio</string>
 			<key>UTTypeTagSpecification</key>

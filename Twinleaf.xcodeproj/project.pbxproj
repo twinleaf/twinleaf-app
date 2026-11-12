@@ -23,8 +23,6 @@
 		A00000000000000000000521 /* Sources/Twinleaf/BridgeSessionRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000421 /* Sources/Twinleaf/BridgeSessionRegistry.swift */; };
 		A00000000000000000000531 /* Sources/Twinleaf/Resources/Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000431 /* Sources/Twinleaf/Resources/Assets.xcassets */; };
 		A00000000000000000000532 /* Sources/Twinleaf/Resources/AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000432 /* Sources/Twinleaf/Resources/AppIcon.icon */; };
-		A00000000000000000000533 /* Sources/Twinleaf/Resources/TwinleafApp.icns in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000433 /* Sources/Twinleaf/Resources/TwinleafApp.icns */; platformFilters = (macos, ); };
-		A00000000000000000000534 /* Sources/Twinleaf/Resources/TwinleafDocument.icns in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000434 /* Sources/Twinleaf/Resources/TwinleafDocument.icns */; platformFilters = (macos, ); };
 		A00000000000000000000540 /* Sources/TwinleafQuickLook/PreviewProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000422 /* Sources/TwinleafQuickLook/PreviewProvider.swift */; };
 		A00000000000000000000541 /* TwinleafQuickLook.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = A00000000000000000000203 /* TwinleafQuickLook.appex */; platformFilters = (macos, ); settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		A00000000000000000000525 /* Sources/Twinleaf/LoggingSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000426 /* Sources/Twinleaf/LoggingSession.swift */; };
@@ -105,8 +103,6 @@
 		A00000000000000000000422 /* Sources/TwinleafQuickLook/PreviewProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/TwinleafQuickLook/PreviewProvider.swift; sourceTree = "<group>"; };
 		A00000000000000000000431 /* Sources/Twinleaf/Resources/Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Sources/Twinleaf/Resources/Assets.xcassets; sourceTree = "<group>"; };
 		A00000000000000000000432 /* Sources/Twinleaf/Resources/AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = Sources/Twinleaf/Resources/AppIcon.icon; sourceTree = "<group>"; };
-		A00000000000000000000433 /* Sources/Twinleaf/Resources/TwinleafApp.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = Sources/Twinleaf/Resources/TwinleafApp.icns; sourceTree = "<group>"; };
-		A00000000000000000000434 /* Sources/Twinleaf/Resources/TwinleafDocument.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = Sources/Twinleaf/Resources/TwinleafDocument.icns; sourceTree = "<group>"; };
 		A00000000000000000000441 /* Packaging/Twinleaf-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Packaging/Twinleaf-Info.plist"; sourceTree = "<group>"; };
 		A00000000000000000000442 /* Packaging/TwinleafPad-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Packaging/TwinleafPad-Info.plist"; sourceTree = "<group>"; };
 		A00000000000000000000443 /* Packaging/TwinleafQuickLook-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Packaging/TwinleafQuickLook-Info.plist"; sourceTree = "<group>"; };
@@ -295,8 +291,6 @@
 			children = (
 				A00000000000000000000431 /* Sources/Twinleaf/Resources/Assets.xcassets */,
 				A00000000000000000000432 /* Sources/Twinleaf/Resources/AppIcon.icon */,
-				A00000000000000000000433 /* Sources/Twinleaf/Resources/TwinleafApp.icns */,
-				A00000000000000000000434 /* Sources/Twinleaf/Resources/TwinleafDocument.icns */,
 			);
 			name = Resources;
 			sourceTree = "<group>";
@@ -444,8 +438,6 @@
 			files = (
 				A00000000000000000000531 /* Sources/Twinleaf/Resources/Assets.xcassets in Resources */,
 				A00000000000000000000532 /* Sources/Twinleaf/Resources/AppIcon.icon in Resources */,
-				A00000000000000000000533 /* Sources/Twinleaf/Resources/TwinleafApp.icns in Resources */,
-				A00000000000000000000534 /* Sources/Twinleaf/Resources/TwinleafDocument.icns in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
