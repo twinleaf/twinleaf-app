@@ -28,6 +28,7 @@ This keeps the app native while keeping the hardware boundary in Rust, without a
 - Opening an existing `.tio` file starts in inspection mode: Rust parses the saved packets, stream ID 1 is selected by default, plotting is paused-only, and the toolbar scrubber moves the displayed time window through the log.
 - File > Export writes the raw `.tio` log to CSV or HDF5 through Rust. CSV is available in the default Rust build; HDF5 is available when the Rust core is built with `--features hdf5`.
 - File > Print (⌘P) prints the graphs the window is showing, laid out on one page in the chosen paper size and orientation. The page is always light on white, whatever theme the window uses; a popped-out graph window prints just its own graph.
+- With "Share live sessions on the local network" switched on in Settings, a Mac publishes each live device session over Labcast (Bonjour `_labcast._tcp`, the sources under `Sources/Twinleaf/Labcast`): the session's metadata and every packet it receives, sample packets batched per stream. Another Mac, an iPad or a Vision Pro lists the session in Connect Device and plots and logs it through the same Rust core, fed with the received packets instead of a device. A viewed session is read-only: no RPCs are forwarded. The Vision Pro build has no device transports in its picker; it opens `.tio` documents and shared sessions.
 - After connecting, the app lazily checks whether newer published firmware exists for each connected device. When an update is available, a green update button appears in the toolbar; its popover shows the installed and new versions and flashes the device with live progress. See the Notes section for the network access this involves.
 
 ## Build
@@ -52,7 +53,8 @@ Prerequisites (the same ones Xcode needs):
 - The vendored Rust core submodule: `git submodule update --init --recursive`.
 - A Rust toolchain (`cargo`) — install from <https://rustup.rs>. For iPad builds
   also add the device/simulator targets once:
-  `rustup target add aarch64-apple-ios aarch64-apple-ios-sim`.
+  `rustup target add aarch64-apple-ios aarch64-apple-ios-sim`, and for
+  Vision Pro builds `rustup target add aarch64-apple-visionos aarch64-apple-visionos-sim`.
 - `cmake` on the PATH for the statically linked HDF5 build (`brew install
   cmake`). The macOS build compiles HDF5 from source through the `hdf5-metno`
   crate; no system HDF5 install is needed. Without HDF5 the app still streams,

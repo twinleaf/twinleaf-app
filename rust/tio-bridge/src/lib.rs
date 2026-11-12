@@ -336,6 +336,22 @@ mod direct {
         );
     }
 
+    /// Hands the runtime packets of the shared session it is viewing, as whole
+    /// packets in wire form. They are ignored unless a remote session, started
+    /// with the `connectRemote` command, is running.
+    #[no_mangle]
+    pub unsafe extern "C" fn twinleaf_runtime_remote_ingest(
+        runtime: *mut TwinleafRuntime,
+        data: *const u8,
+        len: usize,
+    ) {
+        if data.is_null() || len == 0 {
+            return;
+        }
+        let data = std::slice::from_raw_parts(data, len).to_vec();
+        send_runtime_command(runtime, ClientCommand::RemoteIngest { data });
+    }
+
     fn run_direct_runtime(command_rx: Receiver<ClientCommand>, emitter: Emitter) {
         let mut session: Option<(Sender<SessionCommand>, thread::JoinHandle<()>)> = None;
         let mut playback: Option<PlaybackSession> = None;
@@ -556,6 +572,33 @@ mod direct {
                 ClientCommand::PerformUpgrade { route } => {
                     if let Some((tx, _)) = &session {
                         let _ = tx.send(SessionCommand::PerformUpgrade { route });
+                    }
+                }
+                ClientCommand::SetPublishing { enabled } => {
+                    if let Some((tx, _)) = &session {
+                        let _ = tx.send(SessionCommand::SetPublishing(enabled));
+                    }
+                }
+                ClientCommand::ConnectRemote { label, log_path } => {
+                    stop_direct_session(&mut session);
+                    playback = None;
+                    let (tx, rx) = flume::unbounded();
+                    let session_emitter = emitter.clone();
+                    let handle = match thread::Builder::new()
+                        .name("twinleaf-remote-session".into())
+                        .spawn(move || run_remote_session(label, log_path, rx, session_emitter))
+                    {
+                        Ok(handle) => handle,
+                        Err(err) => {
+                            emitter.error(format!("Failed to start session thread: {err}"));
+                            continue;
+                        }
+                    };
+                    session = Some((tx, handle));
+                }
+                ClientCommand::RemoteIngest { data } => {
+                    if let Some((tx, _)) = &session {
+                        let _ = tx.send(SessionCommand::RemoteIngest(data));
                     }
                 }
                 ClientCommand::Shutdown => {

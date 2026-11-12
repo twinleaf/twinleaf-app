@@ -46,11 +46,12 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Twinleaf connects to nearby Twinleaf devices and local TIO proxies on your network.</string>
+	<string>Twinleaf connects to nearby Twinleaf devices and local TIO proxies on your network, and to sessions other Macs share.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_twinleaf._tcp</string>
 		<string>_twinleaf._udp</string>
+		<string>_labcast._tcp</string>
 	</array>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>

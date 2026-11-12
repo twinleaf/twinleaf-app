@@ -13,7 +13,8 @@ extern "C" {
 
 typedef struct TwinleafRuntime TwinleafRuntime;
 
-/* kind: 0 = JSON event, 1 = binary plot frame, 2 = binary typed event. */
+/* kind: 0 = JSON event, 1 = binary plot frame, 2 = binary typed event,
+   3 = publish frame of a shared session (see tio-bridge/src/remote.rs). */
 typedef void (*TwinleafEventCallback)(
     uint32_t kind,
     const uint8_t *data,
@@ -77,6 +78,9 @@ void twinleaf_runtime_copy_view_data(
 /* json is a serialized ClientCommand (see tio-bridge). Returns false if the
    pointer is null or the payload does not parse as a known command. */
 bool twinleaf_runtime_send_command_json(TwinleafRuntime *runtime, const char *json);
+/* Whole packets, in wire form, of the shared session a remote session (the
+   connectRemote command) is viewing. */
+void twinleaf_runtime_remote_ingest(TwinleafRuntime *runtime, const uint8_t *data, size_t len);
 void twinleaf_runtime_call_rpc(
     TwinleafRuntime *runtime,
     const char *request_id,

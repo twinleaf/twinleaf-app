@@ -464,7 +464,7 @@ final class RpcTerminal: ObservableObject {
 struct RpcTerminalPane: View {
     @ObservedObject var bridge: BridgeClient
     @ObservedObject var terminal: RpcTerminal
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     @FocusState private var isInputFocused: Bool
     #endif
 

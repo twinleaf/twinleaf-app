@@ -8,7 +8,7 @@ import UniformTypeIdentifiers
 
 #if os(macOS)
 import AppKit
-#elseif os(iOS)
+#elseif os(iOS) || os(visionOS)
 import UIKit
 #endif
 
@@ -98,7 +98,7 @@ struct DocumentWindow: View {
     @State private var lastExportFormat: ExportFormat = .csv
     @State private var streamSplitVisibility: NavigationSplitViewVisibility = .all
     @State private var isApplyingStreamSplitVisibility = false
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// On iPhone (compact), `NavigationSplitView` shows one column at a time.
     /// The sidebar's "View Graph" row flips this to `.detail` to surface the plot.
     @State private var preferredCompactColumn: NavigationSplitViewColumn = .sidebar
@@ -239,7 +239,7 @@ struct DocumentWindow: View {
 #endif
                 captureStore.closeAll()
                 bridge.disconnect()
-#if os(iOS)
+#if os(iOS) || os(visionOS)
                 deleteUntouchedDocumentFileIfNeeded()
 #endif
             }
@@ -420,7 +420,7 @@ struct DocumentWindow: View {
     }
 
     private var splitDocumentContent: some View {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         NavigationSplitView(
             columnVisibility: streamColumnVisibility,
             preferredCompactColumn: $preferredCompactColumn
@@ -489,7 +489,7 @@ struct DocumentWindow: View {
     /// the size class is authoritative (reading it inside the split view's
     /// sidebar column can report the wrong value).
     private var showsGraphShortcut: Bool {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         horizontalSizeClass == .compact && preferredCompactColumn == .sidebar
         #else
         false
@@ -510,7 +510,7 @@ struct DocumentWindow: View {
             focusedField: $focusedField,
             showsGraphShortcut: showsGraphShortcut,
             onShowGraph: {
-                #if os(iOS)
+                #if os(iOS) || os(visionOS)
                 preferredCompactColumn = .detail
                 #endif
             }
@@ -532,7 +532,7 @@ struct DocumentWindow: View {
         return { keys in
             popOutNewPlot(columns: keys)
         }
-#elseif os(iOS)
+#elseif os(iOS) || os(visionOS)
         return { keys in
             openIPadPlotPopout(columns: keys)
         }
@@ -541,7 +541,7 @@ struct DocumentWindow: View {
 #endif
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     @Environment(\.openWindow) private var openIPadWindow
 
     private func openIPadPlotPopout(columns keys: [ColumnKey]) {
@@ -582,13 +582,16 @@ struct DocumentWindow: View {
 
     @ViewBuilder
     private var detailContent: some View {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         // Returning to Streams is left to the system: the sidebar toggle in
         // regular width, the collapsed split view's back button in compact.
         detailPane
+            // visionOS has no inspector column; the panes use the sheet there.
+            #if !os(visionOS)
             .inspector(isPresented: $trailingPaneInspectorPresented) {
                 trailingPaneInspector
             }
+            #endif
             .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -602,7 +605,7 @@ struct DocumentWindow: View {
 #endif
     }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
     /// On iOS the log and terminal panes live in a native inspector in
     /// regular width, and in a sheet in compact.
     /// The inspector would become a sheet by itself there, but on iOS 27 that
@@ -612,7 +615,11 @@ struct DocumentWindow: View {
     private func syncTrailingPanePresentation() {
         guard isTrailingPaneSettled else { return }
         let isShown = effectiveShowLogPanel || effectiveShowTerminalPanel
+        #if os(visionOS)
+        let isCompact = true
+        #else
         let isCompact = horizontalSizeClass == .compact
+        #endif
         if trailingPaneInspectorPresented != (isShown && !isCompact) {
             trailingPaneInspectorPresented = isShown && !isCompact
         }
@@ -653,11 +660,13 @@ struct DocumentWindow: View {
                 LogSidebar(bridge: bridge)
             }
         }
+        #if !os(visionOS)
         .inspectorColumnWidth(
             min: CGFloat(SidebarLayout.rpcWidthRange.lowerBound),
             ideal: CGFloat(clampedRPCPanelWidth),
             max: CGFloat(SidebarLayout.rpcWidthRange.upperBound)
         )
+        #endif
         // The sheet's medium detent keeps the top of the plot in view and
         // live behind it.
         .presentationDetents([.medium, .large])
@@ -685,7 +694,7 @@ struct DocumentWindow: View {
 #endif
 
     private var detailPane: some View {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         plotArea
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .onGeometryChange(for: CGSize.self) { proxy in
@@ -741,7 +750,12 @@ struct DocumentWindow: View {
                 .background {
                     panelShape
                         .fill(.clear)
+                        // Liquid Glass is not on visionOS; its own glass material stands in.
+                        #if os(visionOS)
+                        .glassBackgroundEffect(in: panelShape)
+                        #else
                         .glassEffect(.regular, in: panelShape)
+                        #endif
                 }
                 .shadow(color: .black.opacity(effectiveWindowColorScheme == .dark ? 0.45 : 0.18), radius: 22, x: 0, y: 12)
                 .padding(.vertical, 40)
@@ -851,7 +865,7 @@ struct DocumentWindow: View {
     }
 
     private var effectiveShowPlotControls: Bool {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         true
 #else
         !distractionFree
@@ -859,7 +873,7 @@ struct DocumentWindow: View {
     }
 
     private var shouldAlwaysShowPlotControls: Bool {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         true
 #else
         false
@@ -1032,7 +1046,7 @@ struct DocumentWindow: View {
     }
 
     private func updateStreamSidebarWidth(_ width: CGFloat?) {
-        #if os(iOS)
+        #if os(iOS) || os(visionOS)
         // Collapsed, the sidebar fills the window, which says nothing about
         // the column's width.
         guard horizontalSizeClass != .compact else { return }
@@ -1049,7 +1063,7 @@ struct DocumentWindow: View {
         streamSidebarWidth = clampedWidth
     }
 
-    #if os(iOS)
+    #if os(iOS) || os(visionOS)
     /// iOS `DocumentGroup` creates the file at "Connect" time, before the user
     /// has had a chance to log anything. If the file on disk is still empty
     /// at close, it's just litter from the connect flow — silently delete it.
@@ -2332,7 +2346,7 @@ struct DocumentWindow: View {
     /// these items) so the system can carry them into iPhone's vertical bar;
     /// macOS keeps `.automatic`.
     private var windowToolbarPlacement: ToolbarItemPlacement {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         .topBarTrailing
 #else
         .automatic
@@ -2447,7 +2461,7 @@ struct DocumentWindow: View {
         }
     }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
     @ToolbarContentBuilder
     private var iosDocumentToolbar: some ToolbarContent {
         ToolbarItem(placement: .topBarLeading) {
@@ -3094,7 +3108,7 @@ private struct PlotPopoutWindowView: View {
     }
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 /// Host view for an iPad pop-out plot scene. Resolves the parent document's
 /// bridge from `BridgeSessionRegistry` using the descriptor's `sessionID`, then
 /// renders the same `PlotPopoutWindowView` the macOS popout window uses. The
@@ -3231,7 +3245,7 @@ private struct ExportDestinationDocument: FileDocument {
     }
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 /// Hides the system back button only on regular size classes (iPad split view,
 /// large iPhones in landscape). On compact (iPhone portrait), keep the back
 /// button so users can return from the plot detail to the streams sidebar.
@@ -3278,7 +3292,7 @@ private extension View {
 
     @ViewBuilder
     func twinleafIOSNavigationBackButtonHidden() -> some View {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         modifier(SizeClassAwareBackButtonHidden())
 #else
         self
@@ -3333,7 +3347,7 @@ private extension View {
 
     @ViewBuilder
     func twinleafSettingsWindowFrame() -> some View {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 #else
         frame(width: 480)
@@ -3343,7 +3357,7 @@ private extension View {
 
     @ViewBuilder
     func twinleafSettingsPresentation() -> some View {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         presentationDetents([.large])
             .presentationDragIndicator(.visible)
             .presentationContentInteraction(.scrolls)
@@ -3354,7 +3368,7 @@ private extension View {
 
     @ViewBuilder
     func twinleafDevicePickerFrame(isConnectionProgressVisible: Bool) -> some View {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 #else
         // Fixed width, but grow vertically with the window. The overlay adds a
@@ -3367,7 +3381,7 @@ private extension View {
 
     @ViewBuilder
     func twinleafDevicePickerPresentation() -> some View {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         modifier(DevicePickerSheetPresentationModifier())
 #else
         self
@@ -3376,7 +3390,7 @@ private extension View {
 
     @ViewBuilder
     func twinleafDeviceURLTextInput() -> some View {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         textInputAutocapitalization(.never)
             .autocorrectionDisabled(true)
 #else
@@ -3386,7 +3400,7 @@ private extension View {
 
     @ViewBuilder
     func twinleafDevicePickerButtonStyle(_ prominence: DevicePickerButtonProminence = .standard) -> some View {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         buttonStyle(DevicePickerGlassButtonStyle(prominence))
 #else
         self
@@ -3395,7 +3409,7 @@ private extension View {
 
     @ViewBuilder
     func twinleafDevicePickerHeaderIconButtonStyle() -> some View {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         labelStyle(.iconOnly)
             .twinleafDevicePickerButtonStyle(.icon)
 #else
@@ -3406,7 +3420,7 @@ private extension View {
 
     @ViewBuilder
     func twinleafDevicePickerInlineRowStyle() -> some View {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .background {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -3419,7 +3433,7 @@ private extension View {
 
     @ViewBuilder
     func twinleafDevicePickerRowSelectionStyle(isSelected: Bool) -> some View {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .background {
                 if isSelected {
@@ -3433,7 +3447,7 @@ private extension View {
     }
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 private struct DevicePickerSheetPresentationModifier: ViewModifier {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
@@ -5633,6 +5647,8 @@ private struct PlotSettingsWindow: View {
     @AppStorage(ViewPreferenceKeys.traceColorPaletteLight) private var traceColorPaletteLightRaw = PlotTracePalette.defaultLightRawValue
     @AppStorage(ViewPreferenceKeys.traceColorPaletteDark) private var traceColorPaletteDarkRaw = PlotTracePalette.defaultDarkRawValue
     @AppStorage(ViewPreferenceKeys.favoriteRPCs) private var favoriteRPCsRaw = ""
+    @AppStorage(TwinleafLabcast.publishEnabledKey) private var shareLiveSessions = false
+    @AppStorage(TwinleafLabcast.passcodeKey) private var sharingPasscode = ""
     @State private var newRememberedURL = ""
     @State private var newFavoriteRPCID = ""
 
@@ -5672,7 +5688,7 @@ private struct PlotSettingsWindow: View {
 
                     Divider()
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
                     TwinleafInterfaceStateControls(includesToolbar: false)
 
                     Divider()
@@ -5954,6 +5970,30 @@ private struct PlotSettingsWindow: View {
                     Divider()
 
                     VStack(alignment: .leading, spacing: 10) {
+                        Text("Sharing")
+                            .font(.headline)
+
+                        #if os(macOS)
+                        Toggle("Share live sessions on the local network", isOn: $shareLiveSessions)
+                        #endif
+
+                        HStack(spacing: 12) {
+                            Text("Passcode")
+                                .frame(width: 92, alignment: .leading)
+                            SecureField("None", text: $sharingPasscode)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(maxWidth: 220)
+                        }
+
+                        Text("A shared session appears in Connect Device on other Macs, iPads and Vision Pros running Twinleaf, which can plot and log it but not change settings. With a passcode the link is encrypted, and viewers must enter the same one here.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 10) {
                         Text("Log")
                             .font(.headline)
 
@@ -5995,6 +6035,7 @@ private struct PlotSettingsWindow: View {
                         HStack(spacing: 8) {
                             TextField("tcp://localhost", text: $newRememberedURL)
                                 .textFieldStyle(.roundedBorder)
+                                .twinleafDeviceURLTextInput()
                                 .onSubmit(addRememberedURL)
 
                             Button {
@@ -6291,6 +6332,7 @@ private struct RememberedURLRow: View {
         HStack(spacing: 8) {
             TextField("URL", text: $draft)
                 .textFieldStyle(.roundedBorder)
+                .twinleafDeviceURLTextInput()
                 .onSubmit(commit)
 
             Button {
@@ -6383,7 +6425,7 @@ private enum DevicePickerButtonProminence {
     case destructive
 }
 
-#if os(iOS)
+#if os(iOS) || os(visionOS)
 private struct DevicePickerGlassButtonStyle: ButtonStyle {
     let prominence: DevicePickerButtonProminence
 
@@ -6407,7 +6449,12 @@ private struct DevicePickerGlassButtonStyle: ButtonStyle {
             .background {
                 shape
                     .fill(Color.clear)
+                    // Liquid Glass is not on visionOS; its own glass material stands in.
+                    #if os(visionOS)
+                    .glassBackgroundEffect(in: shape)
+                    #else
                     .glassEffect(.regular.tint(glassTint), in: shape)
+                    #endif
                     .overlay {
                         shape.fill(fillOverlay)
                     }
@@ -6520,6 +6567,8 @@ private struct DevicePicker: View {
                 Text("Connect Device")
                     .font(.title2)
                 Spacer()
+                // A Vision Pro's live sources are the sessions Macs share.
+                #if !os(visionOS)
                 Button {
                     startAddingURL()
                 } label: {
@@ -6528,6 +6577,7 @@ private struct DevicePicker: View {
                 .twinleafDevicePickerHeaderIconButtonStyle()
                 .help("Add device URL")
                 .disabled(bridge.connectionProgress.canCancel || isAddingURL)
+                #endif
 
                 Button {
                     refreshDevices()
@@ -9908,7 +9958,7 @@ private struct SliderTrackMetrics {
     static let horizontalInset: CGFloat = 8
     /// Total slider control height. Larger on iOS so the thumb and the
     /// drag/tap area meet Apple's 44pt touch-target guidance comfortably.
-#if os(iOS)
+#if os(iOS) || os(visionOS)
     static let frameHeight: CGFloat = 56
 #else
     static let frameHeight: CGFloat = 42
@@ -9920,7 +9970,7 @@ private struct SliderTrackMetrics {
     }
 
     var thumbDiameter: CGFloat {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         return 28
 #else
         return 14
@@ -9936,7 +9986,7 @@ private struct SliderTrackMetrics {
     }
 
     var trackY: CGFloat {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         return 16
 #else
         return 11
@@ -9944,7 +9994,7 @@ private struct SliderTrackMetrics {
     }
 
     var tickY: CGFloat {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         return 32
 #else
         return 22
@@ -9952,7 +10002,7 @@ private struct SliderTrackMetrics {
     }
 
     var labelY: CGFloat {
-#if os(iOS)
+#if os(iOS) || os(visionOS)
         return 46
 #else
         return 34

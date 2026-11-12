@@ -54,6 +54,11 @@ private typealias RuntimeSendCommandJsonFn = @convention(c) (
     OpaquePointer?,
     UnsafePointer<CChar>?
 ) -> Bool
+private typealias RuntimeRemoteIngestFn = @convention(c) (
+    OpaquePointer?,
+    UnsafePointer<UInt8>?,
+    Int
+) -> Void
 private typealias RuntimeCallRpcFn = @convention(c) (
     OpaquePointer?,
     UnsafePointer<CChar>?,
@@ -140,6 +145,13 @@ private func twinleaf_runtime_send_command_json(
     _ json: UnsafePointer<CChar>?
 ) -> Bool
 
+@_silgen_name("twinleaf_runtime_remote_ingest")
+private func twinleaf_runtime_remote_ingest(
+    _ runtime: OpaquePointer?,
+    _ data: UnsafePointer<UInt8>?,
+    _ count: Int
+)
+
 @_silgen_name("twinleaf_runtime_call_rpc")
 private func twinleaf_runtime_call_rpc(
     _ runtime: OpaquePointer?,
@@ -168,11 +180,28 @@ private func twinleaf_runtime_perform_upgrade(
 )
 #endif
 
+/// Event kind of a shared session's publish frame; see `LabcastSession.swift`.
+private let rustPublishEventKind: UInt32 = 3
+
 private final class RustRuntimeCallbackBox {
     weak var owner: BridgeClient?
 
+    /// Where publish frames (event kind 3) go while the session is shared.
+    /// The Rust session thread calls it directly, so frames keep the order
+    /// they were emitted in, which hopping to the main actor would not promise.
+    private let publishSinkLock = NSLock()
+    private var publishSink: (@Sendable (Data) -> Void)?
+
     init(owner: BridgeClient) {
         self.owner = owner
+    }
+
+    func setPublishSink(_ sink: (@Sendable (Data) -> Void)?) {
+        publishSinkLock.withLock { publishSink = sink }
+    }
+
+    func publish(_ frame: Data) {
+        publishSinkLock.withLock { publishSink }?(frame)
     }
 }
 
@@ -183,7 +212,6 @@ private let twinleafRustEventCallback: RustEventCallback = { kind, bytes, count,
     }
 
     let box = Unmanaged<RustRuntimeCallbackBox>.fromOpaque(boxPointer).takeUnretainedValue()
-    guard let owner = box.owner else { return }
 
     let data: Data
     if let bytes, count > 0 {
@@ -191,6 +219,12 @@ private let twinleafRustEventCallback: RustEventCallback = { kind, bytes, count,
     } else {
         data = Data()
     }
+
+    if kind == rustPublishEventKind {
+        box.publish(data)
+        return
+    }
+    guard let owner = box.owner else { return }
 
     Task { @MainActor in
         owner.handleRustEvent(kind: kind, data: data)
@@ -258,6 +292,7 @@ final class RustRuntime {
     private let setPlaybackFn: RuntimeSetPlaybackFn
     private let copyViewDataFn: RuntimeCopyViewDataFn
     private let sendCommandJsonFn: RuntimeSendCommandJsonFn
+    private let remoteIngestFn: RuntimeRemoteIngestFn
     private let callRpcValueFn: RuntimeCallRpcValueFn
 
     init(owner: BridgeClient) throws {
@@ -279,6 +314,7 @@ final class RustRuntime {
         setPlaybackFn = twinleaf_runtime_set_playback
         copyViewDataFn = twinleaf_runtime_copy_view_data
         sendCommandJsonFn = twinleaf_runtime_send_command_json
+        remoteIngestFn = twinleaf_runtime_remote_ingest
         callRpcValueFn = twinleaf_runtime_call_rpc_value
 #else
         let library: UnsafeMutableRawPointer
@@ -302,6 +338,7 @@ final class RustRuntime {
         setPlaybackFn = try Self.load(library, "twinleaf_runtime_set_playback")
         copyViewDataFn = try Self.load(library, "twinleaf_runtime_copy_view_data")
         sendCommandJsonFn = try Self.load(library, "twinleaf_runtime_send_command_json")
+        remoteIngestFn = try Self.load(library, "twinleaf_runtime_remote_ingest")
         callRpcValueFn = try Self.load(library, "twinleaf_runtime_call_rpc_value")
 #endif
 
@@ -359,6 +396,27 @@ final class RustRuntime {
 
     func disconnect() {
         disconnectFn(runtime)
+    }
+
+    /// Starts a session fed by `remoteIngest` rather than by a device: the
+    /// viewer's side of a session another machine shares.
+    func connectRemote(label: String, logPath: String?) {
+        send(ConnectRemoteCommand(label: label, logPath: logPath))
+    }
+
+    /// Whole TIO packets of the shared session, in the order published.
+    func remoteIngest(_ packets: Data) {
+        packets.withUnsafeBytes { buffer in
+            remoteIngestFn(runtime, buffer.bindMemory(to: UInt8.self).baseAddress, buffer.count)
+        }
+    }
+
+    /// With a sink, makes the live session hand over its packets as publish
+    /// frames, for sharing with viewers; with nil, stops it. The sink is
+    /// called on the session's thread, in order.
+    func setPublishing(_ sink: (@Sendable (Data) -> Void)?) {
+        callbackBox.setPublishSink(sink)
+        send(SetPublishingCommand(enabled: sink != nil))
     }
 
     func checkUpgrade() {
@@ -651,6 +709,17 @@ private struct CallRawRpcCommand: Encodable {
 
 private struct ResetHealthCountersCommand: Encodable {
     let type = "resetHealthCounters"
+}
+
+private struct ConnectRemoteCommand: Encodable {
+    let type = "connectRemote"
+    let label: String
+    let logPath: String?
+}
+
+private struct SetPublishingCommand: Encodable {
+    let type = "setPublishing"
+    let enabled: Bool
 }
 
 private struct PlotPaneConfigPayload: Encodable {
