@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Writes the app icon as an Icon Composer bundle.
+"""Writes the app icon: an Icon Composer bundle, and an image stack for visionOS.
 
     python3 scripts/make-app-icon.py
 
-The output is Sources/Twinleaf/Resources/AppIcon.icon: icon.json plus one SVG
-per layer. Xcode's asset compiler turns it into every size both platforms need
-and applies the system shape and the glass, dark and tinted treatments, so the
-artwork here is full bleed and carries no mask, rim or shadow of its own.
+The main output is Sources/Twinleaf/Resources/AppIcon.icon: icon.json plus one
+SVG per layer. Xcode's asset compiler turns it into every size macOS and iOS
+need and applies the system shape and the glass, dark and tinted treatments, so
+the artwork here is full bleed and carries no mask, rim or shadow of its own.
+
+visionOS takes nothing from an Icon Composer bundle. Its icon is
+Assets.xcassets/AppIcon.solidimagestack: the same picture as three 1024 px
+bitmaps, which the system crops to a circle and spreads apart in depth. The
+asset compiler gives each platform its own of the two, under the one name.
 
 The picture is the original Twinleaf icon, split into layers from back to
 front: a dark instrument screen with field lines (Grid) and the two field vectors
 (Back, Front). The original's border ring and edge tick marks are left out.
 
-The bundle is committed, so this only needs running when the design changes.
+Both are committed, so this only needs running when the design changes.
 To look at the result without building:
 
     "/Applications/Xcode.app/Contents/Applications/Icon Composer.app/Contents/Executables/ictool" \\
@@ -21,9 +26,13 @@ To look at the result without building:
 """
 import json
 import os
+import subprocess
+import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, "Sources", "Twinleaf", "Resources", "AppIcon.icon")
+RESOURCES = os.path.join(ROOT, "Sources", "Twinleaf", "Resources")
+OUT = os.path.join(RESOURCES, "AppIcon.icon")
+STACK = os.path.join(RESOURCES, "Assets.xcassets", "AppIcon.solidimagestack")
 
 # Colours.
 MINT = "#C4FFD6"      # front vector
@@ -34,6 +43,7 @@ CROSS = "#181C1A"     # cross lines
 CHEVRON = "#4A524C"   # arrowheads on the field lines
 # Icon Composer ignores SVG opacity and gradients inside a layer, so these are
 # solid colours and the screen's shading comes from the fill in icon.json.
+SCREEN = ((0.125, 0.150, 0.135), (0.024, 0.031, 0.027))   # top, bottom
 
 # Geometry, on the 1024 x 1024 canvas with y downward.
 
@@ -73,6 +83,16 @@ def grid():
     return body
 
 
+def screen():
+    """The screen's shading as a full-bleed rectangle, for the visionOS back layer."""
+    top, bottom = ("#%02X%02X%02X" % tuple(round(c * 255) for c in rgb) for rgb in SCREEN)
+    return ['<linearGradient id="screen" x2="0" y2="1">',
+            '  <stop offset="0" stop-color="%s"/>' % top,
+            '  <stop offset="1" stop-color="%s"/>' % bottom,
+            "</linearGradient>",
+            '<rect width="1024" height="1024" fill="url(#screen)"/>']
+
+
 # Layers from front to back, the order icon.json lists them. The screen
 # stays flat (no glass); the two vectors are the glass pieces.
 LAYERS = [
@@ -80,6 +100,44 @@ LAYERS = [
     ("Back", arrow(GREY, mirrored=True), True, 0.5),
     ("Grid", grid(), False, 0.0),
 ]
+
+# The visionOS layers, front to back, under the names Xcode gives them. The
+# back one has to be opaque, so it carries the shading as well as the grid.
+VISION_LAYERS = [
+    ("Front", arrow(MINT, mirrored=False)),
+    ("Middle", arrow(GREY, mirrored=True)),
+    ("Back", screen() + grid()),
+]
+
+
+def catalog_json(path, doc):
+    """Writes an asset catalog Contents.json the way Xcode formats it."""
+    doc["info"] = {"author": "xcode", "version": 1}
+    with open(path, "w") as f:
+        json.dump(doc, f, indent=2, sort_keys=True, separators=(",", " : "))
+        f.write("\n")
+
+
+def vision():
+    """Writes the visionOS image stack: one PNG and its catalog entries per layer."""
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, body in VISION_LAYERS:
+            layer = os.path.join(STACK, name + ".solidimagestacklayer")
+            imageset = os.path.join(layer, "Content.imageset")
+            os.makedirs(imageset, exist_ok=True)
+            source = os.path.join(tmp, name + ".svg")
+            with open(source, "w") as f:
+                f.write(svg(body))
+            # A stack layer is a bitmap, so sips draws the SVG as a PNG.
+            subprocess.run(["sips", "-s", "format", "png", source,
+                            "--out", os.path.join(imageset, name + ".png")],
+                           check=True, stdout=subprocess.DEVNULL)
+            catalog_json(os.path.join(imageset, "Contents.json"),
+                         {"images": [{"filename": name + ".png", "idiom": "vision", "scale": "2x"}]})
+            catalog_json(os.path.join(layer, "Contents.json"), {})
+    catalog_json(os.path.join(STACK, "Contents.json"),
+                 {"layers": [{"filename": name + ".solidimagestacklayer"} for name, _ in VISION_LAYERS]})
+    print("wrote", os.path.relpath(STACK, ROOT))
 
 
 def main():
@@ -97,8 +155,7 @@ def main():
             "translucency": {"enabled": False, "value": 0.5},
         })
     doc = {
-        "fill": {"linear-gradient": ["extended-srgb:0.12500,0.15000,0.13500,1.00000",
-                                     "extended-srgb:0.02400,0.03100,0.02700,1.00000"]},
+        "fill": {"linear-gradient": ["extended-srgb:%.5f,%.5f,%.5f,1.00000" % rgb for rgb in SCREEN]},
         "groups": groups,
         "supported-platforms": {"squares": "shared"},
     }
@@ -106,6 +163,7 @@ def main():
         json.dump(doc, f, indent=2, sort_keys=True)
         f.write("\n")
     print("wrote", os.path.relpath(OUT, ROOT))
+    vision()
 
 
 if __name__ == "__main__":
