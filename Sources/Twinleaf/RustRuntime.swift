@@ -74,6 +74,9 @@ private typealias RuntimeCallRpcValueFn = @convention(c) (
     UnsafeRawPointer?
 ) -> Void
 
+private typealias SpecOutlineFn = @convention(c) (UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
+private typealias StringFreeFn = @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
+
 private struct RuntimeRpcArgument {
     var tag: UInt8
     var boolValue: UInt8
@@ -178,6 +181,12 @@ private func twinleaf_runtime_perform_upgrade(
     _ runtime: OpaquePointer?,
     _ route: UnsafePointer<CChar>?
 )
+
+@_silgen_name("twinleaf_spec_outline")
+private func twinleaf_spec_outline(_ text: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("twinleaf_string_free")
+private func twinleaf_string_free(_ text: UnsafeMutablePointer<CChar>?)
 #endif
 
 /// Event kind of a shared session's publish frame; see `LabcastSession.swift`.
@@ -362,7 +371,13 @@ final class RustRuntime {
         setDiscoveryFn(runtime, active ? 1 : 0, includeAll ? 1 : 0)
     }
 
-    func connect(url: String, route: String, logPath: String?) {
+    func connect(url: String, route: String, logPath: String?, spec: String?) {
+        // A session with a signal graph carries the graph's text, which the
+        // C entry point has no argument for.
+        if let spec {
+            send(ConnectCommand(url: url, route: route, logPath: logPath, spec: spec))
+            return
+        }
         url.withCString { urlPointer in
             route.withCString { routePointer in
                 withOptionalCString(logPath) { logPathPointer in
@@ -487,8 +502,44 @@ final class RustRuntime {
         send(CallRawRpcCommand(requestId: requestId, route: route, name: name, argHex: argumentHex))
     }
 
+    /// Reads the text of the signal graph at `route`, or with `text` writes
+    /// it and has the graph run it. Answered like a raw RPC, with the text
+    /// read as its bytes.
+    func transferSpec(requestId: String, route: String, text: String?) {
+        send(TransferSpecCommand(requestId: requestId, route: route, text: text))
+    }
+
     func resetHealthCounters() {
         send(ResetHealthCountersCommand())
+    }
+
+    /// The Rust front end's two entry points for a signal graph's text.
+    /// They need no runtime, so they are found once for the process.
+    private static let specFunctions: (outline: SpecOutlineFn, free: StringFreeFn)? = {
+#if TWINLEAF_STATIC_RUST
+        return (twinleaf_spec_outline, twinleaf_string_free)
+#else
+        guard case .success(let address) = RustDylib.address,
+              let library = UnsafeMutableRawPointer(bitPattern: address),
+              let outline: SpecOutlineFn = try? load(library, "twinleaf_spec_outline"),
+              let free: StringFreeFn = try? load(library, "twinleaf_string_free") else {
+            return nil
+        }
+        return (outline, free)
+#endif
+    }()
+
+    /// What an editor needs to know about a signal graph's text, as the JSON
+    /// of `tio_dsp::lang::outline::Outline`: how to colour it, what is wrong
+    /// with it, the graph it describes and where each node is written. Nil
+    /// where the Rust core is not available.
+    static func specOutlineJSON(_ text: String) -> Data? {
+        guard let functions = specFunctions,
+              let pointer = text.withCString({ functions.outline($0) }) else {
+            return nil
+        }
+        defer { functions.free(pointer) }
+        return Data(bytes: pointer, count: strlen(pointer))
     }
 
     fileprivate static func findLibraryURL() throws -> URL {
@@ -511,12 +562,12 @@ final class RustRuntime {
         }
 
         let root = BridgeClient.packageRoot
-        let debug = root.appendingPathComponent("rust/tio-bridge/target/debug/\(fileName)")
+        let debug = root.appendingPathComponent("rust/target/debug/\(fileName)")
         if FileManager.default.isReadableFile(atPath: debug.path) {
             return debug
         }
 
-        let release = root.appendingPathComponent("rust/tio-bridge/target/release/\(fileName)")
+        let release = root.appendingPathComponent("rust/target/release/\(fileName)")
         if FileManager.default.isReadableFile(atPath: release.path) {
             return release
         }
@@ -707,8 +758,26 @@ private struct CallRawRpcCommand: Encodable {
     let argHex: String?
 }
 
+/// Reads a signal graph's text, or with `text` replaces it. A read leaves
+/// `text` out; an empty text is still a write.
+private struct TransferSpecCommand: Encodable {
+    let type = "transferSpec"
+    let requestId: String
+    let route: String
+    let text: String?
+}
+
 private struct ResetHealthCountersCommand: Encodable {
     let type = "resetHealthCounters"
+}
+
+private struct ConnectCommand: Encodable {
+    let type = "connect"
+    let url: String
+    let route: String
+    let logPath: String?
+    /// The text of the signal graph to run over the session's sensors.
+    let spec: String
 }
 
 private struct ConnectRemoteCommand: Encodable {

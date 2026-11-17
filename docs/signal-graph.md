@@ -6,7 +6,25 @@ TIO device: it mounts the sensors, publishes its own results alongside them, and
 exposes its parameters as RPCs. Whether it runs inside the app or on another
 machine is a URL.
 
-Status: plan. Nothing here is implemented yet. Written 10 September 2026.
+Status: M0 to M6 of §17 are implemented, and M7 but for its last step, the first four in `rust/tio-dsp`. M0 is the engine:
+the signal model, the node, stage and kernel traits, lane expansion, the
+scheduler and the invariance harness. M1 is the language front end: lexer,
+lossless syntax tree, parser, checker and diagnostics, behind `tiodsp check`
+and `tiodsp graph --dot`. M2 joins them: filter design, `decimate`, `resample`
+and `align`, lowering a checked program into a graph, and `tiodsp run --log`.
+M3 is the device: `tiodsp serve` mounts sensors, publishes the outputs beside
+them at `/255`, and answers for the params and the spec over RPC. M4 connects
+the app: every session mounts its sensor at `/0`, and a document can be given
+a spec, which the bridge hosts in process. M5 is the editor: text beside the
+graph it describes, every canvas gesture a splice of the text, each change put
+to the running graph, which restarts only what the change touched. M6 is the
+figure, `tiodsp graph --typst` and `--pdf`, and the private device: a build
+that adds functions of its own to the public ones, worked through in
+`rust/examples/private-dsp` and `docs/private-dsp-device.md`. M7 makes every
+function in the table run, the adaptive decorrelators among them, adds
+zero-phase filtering, `detrend` and `psd` for recordings, and `fn`. What is
+left of it is the move upstream, which has not been made. §18 lists what M2 to
+M7 left out. Written 10 September 2026.
 
 ## Decisions
 
@@ -391,10 +409,44 @@ stream_path := "/" segment ("/" segment)*     # /0/field, /1/field/x
 attr        := "@" ident "(" arg* ")"         # @rate(500), @pos(120, 40)
 ```
 
-Deferred to M7, deliberately: `fn` / lambda sugar so a shared chain is written
-once. It is pure compile-time substitution and adds nothing the engine can see,
-and with domains the case that most wanted it — two arms, same filters — is now
-one node over six channels anyway.
+### As implemented
+
+The grammar the parser accepts is written out at the top of
+`rust/tio-dsp/src/lang/parser.rs`. It settles what the sketch left open:
+
+- **Precedence.** `*` and `/` bind tighter than `+` and `-`, and a pipe binds
+  loosest, so `a - b | f()` filters the difference. A stage cannot be followed
+  by an operator without parentheses.
+- **Definitions come before their uses**, so a spec cannot describe a cycle.
+- **Attributes carry the types offline.** Checked without a device, a source
+  states its own `@rate(…)`, `@channels(…)` and `@unit(…)`. The spec above
+  needs them until `--mount` exists; `examples/gradiometer.tsl` has them.
+- **A path is one run of text.** Its parts touch, and a segment may contain
+  dots, as `ColumnFilter` allows (`/0/vector/sync.vco.x`). Selecting from a
+  path written inline takes parentheses.
+- **Units follow the calcium text calculator.** A unit is a product of
+  symbols, kept as written: `nT/V`, `m/s^2`. Multiplying and dividing collect
+  powers, so volts times `nT/V` is `nT`, and `integrate()` gives `V*s`. SI
+  prefixes are taken off against a small table of units; a symbol the table
+  does not know is a unit of its own. A quantity is `10s` or `10 s`.
+- **A conversion is always written.** `value in unit` is the only thing that
+  changes a number for the sake of its unit, and it binds loosest of all. Two
+  signals in `nT` and `µT` do not subtract until one is converted, and the
+  error says `cannot convert X to Y` when they never could. Where an argument
+  is a frequency or a duration, anything that converts to hertz or seconds is
+  accepted, `1 / 20ms` included.
+
+- **A function is its body written out.** `fn clean(s) = s | notch(line) |
+  bandpass(lo, hi)` leaves names open, and a call fills them in: piped,
+  `a | clean()`, in place, `clean(a)`, or by name. Nothing of it is left in
+  the program but the nodes its body makes, once for each call. Its body
+  sees what it is given and what was defined above it, and is checked where
+  it is called, since until then there is nothing to check it against. `fn`
+  is a keyword, and a function shares the one set of names.
+
+The functions the checker knows are listed in `lang/builtins.rs`, and by
+`tiodsp functions`. The rendered text of every error code is checked in under
+`tests/diagnostics`.
 
 ## 7. Compilation and diagnostics
 
@@ -535,8 +587,8 @@ Coupling is declared, because it decides the parallel decomposition.
 | `notch(f, q)` | independent | RBJ cookbook. `harmonics = n` builds a comb for 60/120/180 in one node. |
 | `bandpass(lo, hi)` | independent | Butterworth via analog prototype + bilinear transform with frequency pre-warping. |
 | `lowpass` / `highpass` | independent | Same design path. Odd orders get a real pole section. |
-| `filtfilt(…)` | independent | Zero phase, offline only. Asking for it in live mode is a compile error, not a surprise. |
-| `detrend(mode)` | independent | mean / linear / quadratic — the modes `DetrendMethod` already defines. |
+| `…, phase = zero` | independent | Any of the filters above, run both ways: zero phase, recordings only. Asking for it live is refused, not a surprise. This is what the `filtfilt(…)` once listed here became. |
+| `detrend(mode)` | independent | mean / linear / quadratic — the modes `DetrendMethod` already defines. Over a whole run, so recordings only. |
 | **Arithmetic — name-keyed** | | |
 | `a - b`, `a + b` | independent | Channel names must pair. `clean.a - clean.b` matches x to x, y to y, z to z. A missing or renamed channel is a diagnostic. |
 | `a * k`, `a / k` | independent | Scalar or per-channel gain. |
@@ -548,7 +600,7 @@ Coupling is declared, because it decides the parallel decomposition.
 | `… method = nlms` | coupled | Multi-tap adaptive filter for coupling that varies with frequency, not just amplitude. M7. |
 | `… method = rls` | coupled | Faster convergence, higher cost, numerically fussier. Same node, same spec line. |
 | **Spectral and statistics** | | |
-| `psd(window)` | coupled | The existing `WelchOp`, moved into this crate so every consumer shares one implementation. |
+| `psd(window)` | independent | The twinleaf library's `Welch`, the one the app's spectrum plots use, over the last `window` of a run. Its output is over frequency, not time. Recordings only. |
 | `noise_floor(window)` | coupled | Today's `Derivation::NoiseFloor`, re-expressed as a node. |
 | `rms(window)` | independent | Sliding RMS, per channel. |
 
@@ -647,7 +699,8 @@ A private module ships as a binary that speaks TIO. It can link `tio-dsp` for th
 public node library and register private nodes alongside, or implement the graph
 however it likes and simply publish streams — the app cannot tell and does not
 care. What stays public is this repository: the language, the engine, and the
-node library of §9.
+node library of §9. `docs/private-dsp-device.md` says how, and
+`rust/examples/private-dsp` does it.
 
 The security property is worth stating plainly, because the earlier design had a
 hole here. A spec can no longer cause a connection: specs name streams, not
@@ -694,28 +747,40 @@ Graphviz-quality hierarchical layout, Typst-quality typography, and a figure tha
 drops straight into a paper or a lab notebook.
 
 ```typst
-// tiodsp graph gradiometer.tsl --typst
+// gradiometer.tsl, drawn by `tiodsp graph --typst`.
 #import "@preview/autograph:0.1.0": diagram, node, edge
+#import "@preview/fletcher:0.5.8": shapes
+
+#let wire = (stroke: 0.6pt + black, mark: (end: ">", fill: black, scale: 0.8))
 
 #diagram(
   bezier: true,
+  node-shape: shapes.rect,
+  node-stroke: 0.6pt + black,
+  node-inset: 6pt,
+  node-corner-radius: 2pt,
 
-  node(<src_a>, [`/0/field`\ #text(0.8em)[3 ch · 1 kHz]]),
-  node(<dec>,   [`decimate(2)`]),
-  node(<src_b>, [`/1/field`\ #text(0.8em)[3 ch · 500 Hz]]),
-  node(<algn>,  [`align`], stroke: 0.8pt + rgb("#0E6E7D")),
-  node(<filt>,  [`notch(60)`\ `bandpass(1, 40)`]),
-  node(<sub>,   [`.a - .b`]),
-  node(<out>,   [*/255/gradient*\ #text(0.8em)[3 ch · nT]]),
+  node(<n0>, align(center)[#raw("/0/field") \ #text(0.8em, "1 kHz · 3 ch · nT")], shape: shapes.pill),
+  node(<n2>, align(center)[#raw("decimate(2)") \ #text(0.8em, "500 Hz · 3 ch · nT")]),
+  node(<n3>, align(center)[#raw("align") \ #text(0.8em, "500 Hz · 6 ch · nT")]),
+  node(<n4>, align(center)[#raw("notch(line, q = 30)")]),
+  // …
+  node(<out0>, align(center)[#strong(raw("/255/gradient")) \ #text(0.8em, "500 Hz · 3 ch · nT")], shape: shapes.pill, stroke: 1pt + black),
 
-  edge(<src_a>, <dec>),
-  edge(<dec>,   <algn>),
-  edge(<src_b>, <algn>),
-  edge(<algn>,  <filt>, [D0 · 500 Hz · 6 ch]),
-  edge(<filt>,  <sub>),
-  edge(<sub>,   <out>),
+  edge(<n0>, <n2>, ..wire),
+  edge(<n2>, <n3>, ..wire),
+  edge(<n3>, <n4>, ..wire),
+  // …
 )
 ```
+
+This is what the emitter writes, and it differs from the sketch this section
+once had in the ways autograph 0.1.0 required when it was read: an edge takes
+no label, so a signal is described on the node that makes it, wherever it
+differs from what came in; drawn as curves, an edge takes its own stroke and
+arrowhead; and the layout runs the way Graphviz runs it, top to bottom, with
+nothing to turn it. Everything that came from the spec is written as a Typst
+string, so that no name or unit is read as markup.
 
 Two ways to reach a PDF, and the plan takes both:
 
@@ -726,7 +791,9 @@ Two ways to reach a PDF, and the plan takes both:
   compiles in-process to SVG or PDF with no external toolchain. The cost is real:
   the crate is large, it needs a `World` implementation for font and package
   resolution, and `diagraph-layout` ships Graphviz as WASM that Typst runs
-  through `wasmi`. Packages must be vendored rather than fetched.
+  through `wasmi`. Packages are found as Typst finds them, and fetched from
+  Typst Universe when they are nowhere else; `--packages` names a directory
+  of vendored ones to look in first (§18 says why none are vendored here).
 
 **Not the interactive canvas.** Typst compiles a document; it does not hand back
 a scene graph you can hit-test, drag, or reflow at 60 fps. The editor's canvas
@@ -734,9 +801,6 @@ stays native SwiftUI with a small layered layout — these DAGs are ten nodes, n
 a thousand. Autograph is the *export* and *print* path, reachable from the File
 menu that already prints plots.
 
-The exact fletcher parameter spelling above, particularly whether an edge label
-is positional or named, should be checked against the pinned autograph version
-before the emitter is written.
 
 ## 14. The editor surface
 
@@ -782,9 +846,14 @@ tiodsp serve gradiometer.tsl \
 tiodsp check gradiometer.tsl
 
 # Publication figure via autograph (§13), or Graphviz DOT for a quick look.
+# --pdf and --svg compile in process with --features typst, and otherwise
+# run the `typst` on the PATH.
 tiodsp graph gradiometer.tsl --typst > fig.typ
-tiodsp graph gradiometer.tsl --pdf fig.pdf      # --features typst
+tiodsp graph gradiometer.tsl --pdf fig.pdf
 tiodsp graph gradiometer.tsl --dot
+
+# What a spec may call. A private build lists its own functions here too.
+tiodsp functions
 
 # Offline, over a recording. This is the golden-test path. --threads is a
 # performance knob and never changes the numbers.
@@ -905,6 +974,362 @@ other, which is precisely the asymmetry a gradiometer is sensitive to. Applying
 the same filter to *every* arm — a zero-delay one to the reference — keeps the
 arms symmetric at the cost of a little latency. Worth deciding in M2, not
 discovering in M4.
+
+Decided in M2. When the arms' grids coincide, `align` shifts by whole samples
+and changes no sample. When they do not, every arm goes through the same
+centred windowed-sinc low-pass, each at its own fraction of a sample, the first
+arm included. The filter is flat to 0.8 of Nyquist and 90 dB down at it, and
+costs 29 samples of latency. `decimate` and `resample` use the same filter
+centred on each output instant, so they delay nothing either: sample `k` of a
+signal decimated by `n` is the instant of input sample `k * n`. A 50 nT common
+field at 7 Hz, through one arm that is decimated and one that is not, cancels
+to better than 80 dB in `tests/run.rs`.
+
+### What M2 left out
+
+- **Functions that check but do not run.** `detrend`, `decorrelate`, `rms`,
+  `integrate` and `derivative` have signatures and no kernels. Running a spec
+  that calls one is refused at that call.
+- **Only CSV.** `tiodsp run` writes `--csv`. The library's HDF5 writer takes
+  its own batch type, which a graph's output is not.
+- **A gap resets what it feeds, in recording order.** A lost packet on one arm
+  resets the `align` and drops what the other arms were holding for it. Which
+  samples those are follows the order of packets in the recording, so the
+  output is the same at any block size and thread count, but it is a few tens
+  of samples shorter around each gap than the data would allow.
+- **Nothing bounds an `align` buffer.** An arm that stops while another runs on
+  is held without limit. §8's bounded input with drop-oldest is M3's.
+- **One rate per stream per recording.** A stream that changes rate partway is
+  refused rather than split into runs with their own domains.
+- **Params are fixed for a run.** `--set` gives them values at the start.
+  A served spec can be retuned, as below.
+
+`tiodsp check` has since been taught to print each output's latency: what the
+graph's `decimate` and `resample` stages make it wait, and what more an `align`
+would if its arms turned out to sample at different instants.
+
+### How M3 was built, and what it left out
+
+`tiodsp serve <spec> --mount <url>…` hosts the twinleaf proxy with the sensors
+mounted at `/0`, `/1`, … and a device of its own at `/255`. That device is
+answered for in `serve.rs`: it sends heartbeats, describes its streams the way
+a sensor does (the reply to `dev.metadata` is built by `twinleaf-device`'s own
+function), and lists its RPCs. Checked against the installed `tio` 2.4.0 and
+`tio simulate`: `tio rpc list` shows the params with their types, reads and
+writes work and refuse what they should, and a recording made by `tio log`,
+run back through `tiodsp run`, shows the published output equal to what it
+should be at every timestamp.
+
+- **The device is over loopback, not in process.** The proxy has no public way
+  to mount a device that lives in its own process, so `/255` listens on a
+  loopback TCP port and the proxy mounts it by URL. The samples to compute
+  from are read back through the proxy as a client would read them. A sample
+  crosses loopback twice inside the process on its way to an output, which is
+  the latency §18 said to measure. Measured on an M-series Mac, release
+  build, with a spec that adds none of its own: an output reaches a client
+  0.07 ms after the sample it was computed from at the median, 0.10 ms at the
+  95th percentile and 0.25 ms at most, over 1,200 samples at 200 Hz
+  (`tests/server.rs`, the ignored test).
+- **A retune restarted the graph.** `dsp.<param>` rewrites the param's literal
+  in the spec, checks the text and runs what that gives, as §10 asks, so
+  `dsp.spec` always reads back what is running. In M3 every stage then started
+  over from rest. M5 carries over the state of what did not change; see below.
+- **The spec is a param's only home.** There is no `--set` when serving.
+- **`dsp.spec` is four RPCs.** `dsp.spec.size`; `dsp.spec.read` with an offset;
+  `dsp.spec.write` with an offset and text, which must follow the last write,
+  and with no argument says how much is held; and `dsp.spec.apply`, which
+  takes the text if it checks. A text that does not check is refused, and its
+  diagnostics go out as log packets, rendered as the CLI prints them.
+- **Provenance is log packets.** There is no metadata record to put a spec's
+  text in, so the device says what it is running in its log when a client
+  connects and when the spec changes. A recorder that keeps log packets keeps
+  it.
+- **Ranges have both ends.** A param with a range gets `dsp.<name>.min` beside
+  `dsp.<name>.max`, the sibling the app's slider tray looks for.
+- **Sensors on different clocks are not merged.** Each of `tio simulate`'s
+  devices names itself as its time reference, so an `align` across two of
+  them is refused, as §5 says it must be. There is still no `xcorr_align`.
+- **Not checked.** `tio monitor`, which wants a terminal this was not run in.
+  The app itself, which is M4. A sensor that goes away and comes back. More
+  than one client at a time. `tests/server.rs` runs the whole path over real
+  sockets with a sensor of its own making: mount, serve, read the outputs,
+  set a param, read the spec back, stop.
+- **Still unbounded.** An arm of an `align` that stops is held without limit,
+  as in M2.
+
+### How M4 was built, and what it left out
+
+- **Every session mounts its sensor at `/0`.** The bridge opens a layout for
+  one URL as it did for several (`spawn_connect` in `tio-bridge`). The one
+  exception is a TCP URL on this machine, which names a proxy, such as
+  `tiodsp serve`, whose tree is already laid out and is opened as it is.
+- **A proxy on another machine is not told apart from a sensor.** It is
+  mounted at `/0` like one, so its own `/0` and `/255` land a level down.
+  Connecting the app to a signal graph running on another host therefore does
+  not work yet, though §2 draws it.
+- **In the app the graph's device is mounted on the app's proxy.** §2 draws
+  `tiodsp` as a listener the app connects to. Hosting a second proxy for it
+  meant two proxies opening one sensor, and a session with a graph could not
+  start until the session without one had let go of the port. So
+  `tio_dsp::serve::Hosted` is only the `/255` device, on a loopback port, and
+  the bridge mounts it beside the sensors in the layout it was opening
+  anyway. Each sensor is opened once, and adding or removing a graph
+  reconnects in a few hundredths of a second. `Server`, behind `tiodsp
+  serve`, is the same device with a proxy of its own.
+- **The app is given a spec from the Device menu.** Open Signal Graph… reads a
+  `.tsl` or text file for the document window; Remove Signal Graph takes it
+  away. The session in progress starts over with it, unless a recording has
+  begun, in which case it waits for the next connection so the recording is
+  not restarted. The outputs then appear as a `tiodsp` device with its
+  streams to plot and its params to set, with no new plotting, logging or
+  export code. The choice lasts as long as the window; it is not saved.
+- **Little saved state carried a route.** Saved plot layouts are keyed by
+  device name, not route, and documents are bare recordings. What did carry
+  one is matched as it was written and as it is now mounted, and nothing is
+  rewritten: a favorite scoped to `/` or a hub's `/1` also matches `/0` and
+  `/0/1`, and a device with no name, once keyed by its URL, still finds its
+  layout.
+- **Old recordings keep their routes.** A log made before this plays back
+  with its sensor at `/`, and one made now with it at `/0`.
+- **Shared sessions change topic.** A lone sensor's Labcast topic was named
+  for the root and is now named for `/0`. Whether a viewer on an older
+  version follows it was not tried.
+- **Checked without the interface.** The app's own bridge library was driven
+  through the C entry points the app uses, with the connect command the app
+  now sends: a session without a spec has its sensor at `/0`, one with a spec
+  has the `tiodsp` device at `/255` with its stream and RPCs, and a spec that
+  does not check comes back as the diagnostics it would print. The app builds
+  for macOS and the iOS simulator. Nobody has yet opened the menu, picked a
+  file and watched an output plot.
+
+### How M5 was built, and what it left out
+
+- **A change restarts only what it changes.** Every stage has a fingerprint
+  of what it computes, and every step of a graph one of its stage, of what
+  feeds it and of the channels it is called by; a source's is its name and
+  its domain. When a text replaces another, `Graph::adopt` hands each step of
+  the new graph the kernels, run and place of the step of the old one with
+  the same fingerprint, and the rest start over with whatever they feed.
+  Sources keep their cursors, so no sample is let go while the graph is
+  rebuilt, and the publisher keeps the segment of a stream that did not
+  change. Setting the gain after a low-pass, over RPC and mid-stream, leaves
+  every later sample exactly the gain times what an undisturbed run computes;
+  setting the filter's own edge starts it from rest (`tests/reload.rs`). A
+  step that starts over numbers its run after every run the old graph made.
+  The fingerprint is a hash in memory and is not kept across processes.
+- **The front end tells an editor what it needs in one call.**
+  `lang::outline` reads a text and returns how to colour it, what is wrong
+  with it, the graph it describes, and where each node is written: all of the
+  text that makes it, the part that is its own, the stretch to delete to take
+  a piped stage out, and the offset where one may be piped on, with the
+  stages that suit a signal at that rate already written. Offsets count
+  UTF-16 code units, as a text view does. The bridge hands it to the app as
+  JSON through `twinleaf_spec_outline`, which needs no runtime and no device,
+  so colouring and checking are instant and the same crate does them as the
+  graph that will run the text.
+- **Every gesture is a splice.** Dragging a param replaces its digits; Remove
+  deletes ` | stage(…)`; Add Stage inserts one. The edit goes through the
+  text view, so it lands in the same undo history as typing, and the graph
+  is then drawn from the text again. Nothing is written back from the
+  canvas, and `tests/outline.rs` checks that each splice offered leaves a
+  text that parses. A stage is offered only where a pipe can go without
+  parentheses; inserting or deleting a node anywhere else is done in the
+  text.
+- **The spec moves in pieces, on the session's own connection.**
+  `tio_dsp::client` is the other end of `dsp.spec`: it reads the size and
+  then the text, starting over if the text changed under it, and writes in
+  448-byte pieces and applies. The bridge's `transferSpec` command runs it on
+  a thread and answers like a raw RPC. Against the simulator a read took
+  0.5 ms and a 1.7 kB write 1.1 ms, so the editor puts the whole text to the
+  graph at every change rather than patching it: a slider drag is a dozen
+  texts a second, each restarting only the filter it tunes.
+- **Checking is local and the graph has the last word.** A text that does not
+  check here is not sent. One that does is, and what the graph then says is
+  shown beside the local problems, from its log: log messages now carry
+  their level to the app, and the editor shows the graph's warnings and
+  errors and none of its routine notes. A source declared at 250 Hz over a
+  500 Hz stream checks, is taken, and comes back as `E0501` with its place.
+- **The editor is a window of the document.** Edit Signal Graph… in the Device
+  menu, and in the document menu on iPad, opens it for the document's
+  session: a window of its own where the platform has windows, so the plots
+  stay in view, and a sheet where it has not. With no graph running it starts
+  from the session's first stream, and Run starts the graph by reconnecting
+  with the text, as M4's menu does; from then on changes go to the running
+  graph with no reconnection. A param set from the main window's sliders
+  rewrites the same text, and the editor is written to read it back when it
+  has no edits of its own to lose; that path was not tried.
+- **The canvas draws the last text that checked.** While a call is half
+  typed the text has errors and describes no graph. The canvas then keeps
+  the graph of the last text that did, dimmed and not to be acted on, since
+  its places in the text are no longer the text's.
+- **Layout is computed, and `@pos` is not written.** Columns by distance from
+  the sources, each node level with what feeds it, scaled down to fit the
+  pane. §12 keeps a node where it was dragged by writing `@pos`; nodes cannot
+  be dragged yet, and the attribute is still read only on a source and
+  ignored. Wires cannot be drawn by hand either: joining two signals is
+  written.
+- **Not done.** Line numbers and completion in the text view. A graph too
+  wide for the pane scrolls rather than zooms. The editor does not save the
+  spec with the document: Save As… writes a file, and the text is otherwise
+  kept only as long as the window, as M4 left it. A spec edited while a
+  remote `tiodsp` is the session's device is untried, for the reason M4
+  gives: such a device is not yet mounted where the app looks for it.
+- **How it was checked.** The engine, front end and transfer are tested in
+  `rust/tio-dsp` and through the bridge binary against `tio simulate`. The
+  editor was driven by hand in the iPad simulator against the same simulated
+  sensor: starting a graph from the starter text, selecting a node from
+  either side, dragging a param, typing a text with an error and then a
+  whole new one, adding and removing a stage, and a text the sensor
+  contradicts. Undoing a canvas edit was not tried, nor the badge that says
+  the graph reports a problem, which was added after the last run. It builds
+  for macOS, where it has not been driven, and was not tried on visionOS or
+  at phone width.
+
+### How M6 was built, and what it left out
+
+- **The figure is written for autograph as it is, not as §13 guessed.** The
+  package was read before the emitter was written: 0.1.0, over fletcher 0.5.8
+  and diagraph-layout 0.0.1. `lang::typst::figure` writes the imports and one
+  diagram and sets nothing about the page, so it can be included in a paper;
+  `document` wraps it in a page cut to the figure, which is what `--pdf` and
+  `--svg` compile. `tests/figure.rs` holds the text to what autograph reads,
+  and, with the feature, has Typst compile it, names full of markup included.
+- **Typst is embedded behind `--features typst`.** `figure::render` is a
+  `World` of one file over `typst-kit`'s fonts and packages: 0.15 of the
+  compiler, its built-in fonts, no date. Without the feature it runs the
+  `typst` on the PATH and says what to do if there is none. The feature
+  doubles the lockfile, from 208 packages to 433, and is in no build of the
+  app: the bridge's dependency tree has none of it.
+- **Packages are fetched, not vendored.** §13 asked for them vendored. The
+  figure pulls five: autograph, fletcher, diagraph-layout and oxifmt under
+  MIT, and cetz under the LGPL, 2.3 MB together with Graphviz as WASM. Taking
+  an LGPL package into this repository is a licensing call and was not made
+  here. So the first figure on a machine fetches them from Typst Universe
+  into the user's Typst package cache, as `typst compile` would, and
+  `--packages <dir>` looks in a directory first for anyone who vendors them.
+  The compile tests are not run by default for the same reason.
+- **Figures run top to bottom.** That is Graphviz's direction and autograph
+  passes none of its own. A signal graph would read better left to right;
+  drawing with fletcher over diagraph-layout directly would allow it.
+- **The app does not export figures yet.** §13 puts export in the File menu
+  beside printing. The emitter is in the crate the bridge links, so the menu
+  item is a small step, but it was not taken: only the command line draws.
+- **A private build is `tiodsp` with a larger library.** `Library` holds the
+  public functions and whatever is added with `with`: how a function is
+  written and typed, which the checker reads, and what makes its node from a
+  call. A program carries the library it was checked against, so lowering,
+  a session's re-check and the device's `dsp.spec.apply` all use the same
+  one. The command line moved into the crate as `cli::run(library)`, so a
+  private binary's `main` is one line and everything a user of `tiodsp` knows
+  holds for it under its own name, `dev.name` included.
+- **Only some functions can be added.** One signal in, the same rate out,
+  typed by `Same`, `Magnitude`, `Integrates` or `Differentiates`. The rules
+  that change the rate or join signals read the public functions' own
+  arguments, and are refused for others rather than half-supported.
+- **A text that cannot be built is now refused.** A private function can
+  object to its arguments when its node is made, which the checker cannot
+  foresee. Such a text used to be taken and then stall the graph. A session
+  now builds the new graph over the streams the old one reads before it lets
+  go of the old one, and hands the text back with the reason, at the call,
+  if it cannot (`tests/reload.rs`).
+- **The editor takes a function it does not know on trust.** The app checks
+  with the public functions only. `lang::outline` therefore reads with a
+  trusting library: an unknown function handed a signal is drawn as passing
+  it on, and remarked on rather than refused, with the nearest known name if
+  it looks like a slip. The text is sent, and the device has the last word.
+  Read strictly, as `tiodsp check` and every device read, the same call is
+  still `E0203`.
+- **The worked example is a Hampel filter.** `labdsp`, in
+  `rust/examples/private-dsp`, adds `despike(n = 5, limit = 3)`. Its tests
+  hold the kernel to an independently written filter, sample for sample and
+  for any block size. Served over the simulated sensor it was read with
+  `tio`, connected to from the app in the iPad simulator, and edited there:
+  the app drew `despike` on trust, dragging the param it follows set it on
+  the device, and an even window came back refused with the function's own
+  reason.
+- **The spec is readable by anyone who can connect.** A private device keeps
+  its algorithms, and shows its wiring. There is no switch for that.
+- **A private device on another machine is still out of the app's reach**,
+  for the reason M4 gives. `tio` and other clients reach it.
+
+### How M7 was built, and what it left out
+
+- **Every function in the table runs.** `integrate` is the trapezoid rule
+  with its sum compensated, `derivative` the central difference, one sample
+  late, and `rms` a sliding window whose sum is taken afresh each time its
+  ring comes round. `tests/functions.rs` holds each to numpy, from its
+  definition, and to the same output for any block size.
+- **`decorrelate` fits each channel to all of the reference's.** Not x to x
+  and y to y: every channel of the signal is regressed on every channel of
+  the reference, so a sensor turned a little against its neighbour is fitted
+  too. `taps` adds earlier samples of each, for coupling that differs with
+  frequency. None of the methods fits an offset.
+  - `ls` solves the last `window` afresh at every sample, from sums it
+    keeps running and retakes each time the ring comes round.
+  - `rls` is the same fit with a memory that fades over `window`. It starts
+    out sure of nothing on the scale of the first sample that says
+    anything, so units do not matter, and keeps its inverse symmetric.
+  - `nlms` steps along the error, normalized by the regressors' power: the
+    present sample's, or the window's average where that is more, because
+    with few regressors a sample where the reference crosses zero would
+    otherwise throw the weights. Its weights decay over one to two windows.
+- **The rejection bound holds.** With a reference that sees the shared field
+  in noise of its own, the best any gain can do leaves the signal's noise
+  and `g² c² n² / (c² + n²)`. Least squares and RLS sit within 3 % of that
+  and NLMS within 5 %, once settled. Over a recording, in §6's spec with the
+  subtraction swapped out, least squares and RLS take a 50 nT field down by
+  more than 40 dB and keep a 3 nT source only one sensor saw. NLMS is held
+  to 10 dB there: the reference's three axes say nearly the same thing, and
+  it is slow along every direction in which they barely differ.
+- **A run can be closed.** `Graph::close` ends every source's run, and an
+  `Extent` says so. A stage that needs the whole of a run emits nothing
+  until then and all of it at once. A recording is closed at its end, and at
+  a gap in any source when some stage needs whole runs, so that what came
+  before the gap is emitted and not dropped. A live graph is never closed.
+- **Zero phase is an argument, not a function.** `lowpass(10 Hz, phase =
+  zero)`, and likewise on `highpass`, `bandpass` and `notch`, where §9 had a
+  `filtfilt(…)`. The filter keeps its own arguments and its own diagnostics
+  that way, and there is one fewer thing to learn. It runs the cascade both
+  ways with the ends handled as `scipy.signal.sosfiltfilt` handles them, and
+  matches it to a part in 10⁹ (`tests/whole.rs`), as `detrend` matches
+  `scipy.signal.detrend` and `polyfit`.
+- **What needs a whole run is refused live**, by `E0502`, at the call: a
+  session, the device and the app all go through it. `tiodsp check` does not
+  refuse it, since it cannot know which the spec is for, and the editor does
+  not offer these as stages.
+- **`psd` computes nothing of its own.** It hands the last `window` of a run
+  to `twinleaf::data::ops::Welch` and squares what comes back, so a spectrum
+  from a graph and one on a plot cannot differ. The layout of the bins is
+  asked of the estimate too, with a probe, and not copied from its
+  arithmetic. The plan had the estimator moving into this crate; it had
+  already moved into the library, which is the better home, so this crate
+  takes the library's `processing` feature instead.
+- **A spectrum is a signal over frequency.** Its samples are bins, its
+  domain's rate is bins per hertz and its origin the first bin, so the same
+  blocks carry it, and its channels are in the unit squared per hertz. The
+  checker knows it is not time: a filter applied to one is refused, the
+  summary says `1023 bins of 0.48828125 Hz`, and the CSV has `bin,frequency`
+  where a signal has `sample,time`. It is held to what a power spectral
+  density must be: white noise at its level with its variance under the
+  curve, a tone at its frequency with half its amplitude squared.
+- **A window that fixes a shape is written out.** `psd(window)` takes a
+  duration that is not a param, as `resample` takes a rate that is not.
+- **`fn` is in the checker and nowhere else.** A call swaps the scope for
+  the one the function was defined in, binds what it was given, and checks
+  the body in place. What goes wrong in a body is reported there, with the
+  call it went wrong for. Nodes made by two calls are written in the one
+  place, so the editor's edit at either is an edit of the function.
+- **A function is not checked until it is called.** A body that could never
+  check goes unreported, and the function is reported as unused instead.
+- **`tio-dsp` has not been moved upstream.** Promoting it into
+  `twinleaf-rust` as `twinleaf-dsp`, and exposing it as `tio dsp`, changes
+  another repository and was left for its owner to start. The crate still
+  names no app type in its public interface, which is what the move needs.
+- **Not done.** `mix`, `xcorr_align` and `noise_floor` from §9 have no
+  signature yet. A spectrum cannot be served, so the app does not plot one
+  from a graph; it draws the spectrum of any stream itself. Stages with
+  look-ahead still lose their last samples when a run is closed. `detrend`
+  has no window, and so no live form.
 
 ### Graph retention is not the display window
 

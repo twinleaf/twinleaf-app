@@ -96,6 +96,14 @@ void twinleaf_runtime_call_rpc_value(
     const TwinleafRpcArg *arg
 );
 
+/* What an editor needs to know about the text of a signal graph, as JSON:
+   how to colour it, what is wrong with it, the graph it describes and where
+   each node is written. Needs no runtime. Offsets count UTF-16 code units.
+   Free the result with twinleaf_string_free. Null if text is null or not
+   UTF-8. */
+char *twinleaf_spec_outline(const char *text);
+void twinleaf_string_free(char *text);
+
 #ifdef __cplusplus
 }
 #endif

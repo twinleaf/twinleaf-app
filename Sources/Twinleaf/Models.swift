@@ -770,11 +770,20 @@ struct LogMessage: Hashable, Identifiable {
     let route: String
     let timestampSeconds: Double
     let message: String
+    /// The device's own level: 0 critical, 1 error, 2 warning, 3 info,
+    /// 4 debug.
+    let level: UInt8
 
-    init(route: String, timestampSeconds: Double, message: String) {
+    init(route: String, timestampSeconds: Double, message: String, level: UInt8 = 3) {
         self.route = route
         self.timestampSeconds = timestampSeconds
         self.message = message
+        self.level = level
+    }
+
+    /// Whether the device is reporting something wrong.
+    var isProblem: Bool {
+        level <= 2
     }
 }
 
@@ -1017,5 +1026,17 @@ enum JSONValue: Codable, Hashable, CustomStringConvertible {
         default:
             false
         }
+    }
+}
+
+/// The files a signal graph can be opened from.
+enum SignalGraphFile {
+    /// A `.tsl` spec, or any plain text.
+    static var contentTypes: [UTType] {
+        var types: [UTType] = [.plainText]
+        if let spec = UTType(filenameExtension: "tsl") {
+            types.insert(spec, at: 0)
+        }
+        return types
     }
 }

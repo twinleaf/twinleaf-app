@@ -92,6 +92,7 @@ struct DocumentWindow: View {
     @State private var showingDevicePicker = true
     @State private var showingPlotSettings = false
     @State private var showingExportPanel = false
+    @State private var showingSignalGraphPanel = false
     @State private var showingUpgradePopover = false
     @State private var showingHealthPopover = false
     @State private var didStartDocument = false
@@ -198,6 +199,15 @@ struct DocumentWindow: View {
                 guard receivesWindowCommand(notification) else { return }
                 presentExportPanel()
             }
+            .onReceive(NotificationCenter.default.publisher(for: .openSignalGraph)) { notification in
+                // A recording being inspected has no sensors to compute from.
+                guard receivesWindowCommand(notification), !bridge.isInspectionMode else { return }
+                showingSignalGraphPanel = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .removeSignalGraph)) { notification in
+                guard receivesWindowCommand(notification) else { return }
+                bridge.setSignalGraph(nil)
+            }
             #if os(macOS)
             .onReceive(NotificationCenter.default.publisher(for: .printDocument)) { notification in
                 handlePrintCommand(notification)
@@ -298,6 +308,32 @@ struct DocumentWindow: View {
                 defaultFilename: exportDefaultFilename
             ) { result in
                 handleExportDestination(result)
+            }
+            // On a view of its own: two file panels on one view do not both
+            // present.
+            .background {
+                Color.clear.fileImporter(
+                    isPresented: $showingSignalGraphPanel,
+                    allowedContentTypes: SignalGraphFile.contentTypes
+                ) { result in
+                    handleSignalGraphFile(result)
+                }
+            }
+            .background {
+                SignalGraphEditorOpener(bridge: bridge) { notification in
+                    receivesWindowCommand(notification)
+                }
+            }
+            .alert(
+                "Signal Graph",
+                isPresented: Binding(
+                    get: { bridge.signalGraphNotice != nil },
+                    set: { if !$0 { bridge.clearSignalGraphNotice() } }
+                )
+            ) {
+                Button("OK") {}
+            } message: {
+                Text(bridge.signalGraphNotice ?? "")
             }
             .task {
                 guard !didStartDocument else { return }
@@ -884,6 +920,28 @@ struct DocumentWindow: View {
         !document.shouldOpenForInspection && !bridge.isInspectionMode
     }
 
+    private func handleSignalGraphFile(_ result: Result<URL, Error>) {
+        switch result {
+        case .success(let url):
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer {
+                if scoped {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            do {
+                let text = try String(contentsOf: url, encoding: .utf8)
+                bridge.setSignalGraph(SignalGraph(name: url.lastPathComponent, text: text))
+            } catch {
+                bridge.reportSignalGraphProblem(
+                    "Could not read \(url.lastPathComponent): \(error.localizedDescription)"
+                )
+            }
+        case .failure(let error):
+            bridge.reportSignalGraphProblem(error.localizedDescription)
+        }
+    }
+
     private func receivesWindowCommand(_ notification: Notification) -> Bool {
         guard let targetWindowID = notification.object as? ObjectIdentifier else {
             return true
@@ -1110,8 +1168,7 @@ struct DocumentWindow: View {
 
         let store = BoardViewLayoutStore(rawValue: boardViewLayoutsRaw)
         let devicesWithLayouts = bridge.devices.compactMap { device -> (DeviceInfo, BoardViewLayout)? in
-            let key = BoardViewLayoutStore.boardKey(for: device)
-            guard let layout = store.boards[key] else { return nil }
+            guard let layout = store.layout(for: device) else { return nil }
             return (device, layout)
         }
         guard !devicesWithLayouts.isEmpty else {
@@ -2469,6 +2526,13 @@ struct DocumentWindow: View {
                 ShareLink(item: documentShareURL) {
                     Label("Share Log", systemImage: "square.and.arrow.up")
                 }
+                if !bridge.isInspectionMode {
+                    Button {
+                        NotificationCenter.default.post(name: .editSignalGraph, object: nil)
+                    } label: {
+                        Label("Edit Signal Graph", systemImage: "point.3.connected.trianglepath.dotted")
+                    }
+                }
             } label: {
                 HStack(spacing: 4) {
                     Text(documentDisplayName)
@@ -3763,10 +3827,22 @@ private enum RPCFavorites {
 
     static func matches(_ rpc: RpcInfo, id: String) -> Bool {
         if id.contains("#") {
-            return id == routeScopedID(for: rpc)
+            let scoped = routeScopedID(for: rpc)
+            return id == scoped || mounted(id) == scoped
         }
 
         return id == rpc.name
+    }
+
+    /// A favorite saved when a lone sensor sat at the root of its session,
+    /// as the sensor is addressed now that every session mounts it at `/0`:
+    /// `/#name` is `/0#name`, and a hub's `/1#name` is `/0/1#name`. The saved
+    /// form is left as it is and keeps matching what it always matched.
+    static func mounted(_ id: String) -> String {
+        guard let separator = id.firstIndex(of: "#") else { return id }
+        let route = id[..<separator]
+        let rest = id[separator...]
+        return route == "/" ? "/0\(rest)" : "/0\(route)\(rest)"
     }
 
     static func removing(_ rpc: RpcInfo, from ids: [String]) -> [String] {
@@ -7986,8 +8062,7 @@ private struct StreamSidebar: View {
 
         for device in bridge.devices {
             let rows = streamRows(for: device)
-            let key = BoardViewLayoutStore.boardKey(for: device)
-            guard let expandedStreams = store.boards[key]?.expandedStreams else {
+            guard let expandedStreams = store.layout(for: device)?.expandedStreams else {
                 nextExpandedStreamIDs.formUnion(rows.map(\.id))
                 continue
             }
@@ -8975,6 +9050,19 @@ private struct BoardViewLayoutStore: Codable {
             return ""
         }
         return string
+    }
+
+    /// The layout saved for a device, under its key or under the key it had
+    /// before every session mounted its sensor at `/0`: a device without a
+    /// name, alone at the root, was keyed by its URL.
+    func layout(for device: DeviceInfo) -> BoardViewLayout? {
+        if let layout = boards[Self.boardKey(for: device)] {
+            return layout
+        }
+        guard Self.normalizedBoardKey(device.meta.name).isEmpty, device.route == "/0" else {
+            return nil
+        }
+        return boards[Self.normalizedBoardKey(device.url)]
     }
 
     static func boardKey(for device: DeviceInfo) -> String {

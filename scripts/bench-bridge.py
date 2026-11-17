@@ -21,7 +21,7 @@ Typical session — build the simulator once, run it in one terminal:
 then benchmark a release bridge in another:
 
     cargo build --release --manifest-path rust/tio-bridge/Cargo.toml
-    scripts/bench-bridge.py rust/tio-bridge/target/release/tio-bridge
+    scripts/bench-bridge.py rust/target/release/tio-bridge
 
 To compare against another revision, check it out in a git worktree
 (remember `git submodule update --init vendor/twinleaf-rust`), build its
@@ -29,7 +29,8 @@ bridge the same way, and run this driver against both binaries with the
 same simulator instance.
 
 The active-column selection assumes the simulator's schema (stream 1,
-two sine channels at route "/"); pass --columns to override.
+two sine channels at route "/0", where a session mounts its sensor); pass
+--columns to override.
 """
 
 import argparse
@@ -67,8 +68,8 @@ def parse_args():
     )
     parser.add_argument(
         "--columns",
-        default='[{"route":"/","streamId":1,"columnIndex":0},'
-        '{"route":"/","streamId":1,"columnIndex":1}]',
+        default='[{"route":"/0","streamId":1,"columnIndex":0},'
+        '{"route":"/0","streamId":1,"columnIndex":1}]',
         help="JSON array of column keys to activate",
     )
     parser.add_argument(

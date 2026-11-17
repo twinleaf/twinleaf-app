@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 mod direct {
-    use std::ffi::CStr;
+    use std::ffi::{CStr, CString};
     use std::os::raw::c_char;
 
     pub struct TwinleafRuntime {
@@ -147,10 +147,13 @@ mod direct {
         };
         send_runtime_command(
             runtime,
+            // A session with a signal graph is started through
+            // `twinleaf_runtime_send_command_json`, which carries its text.
             ClientCommand::Connect {
                 url,
                 route: c_string(route),
                 log_path: c_string(log_path),
+                spec: None,
             },
         );
     }
@@ -256,6 +259,35 @@ mod direct {
                 viewport_end: (has_viewport_end != 0).then_some(viewport_end),
             },
         );
+    }
+
+    /// Reads the text of a signal graph and returns, as JSON, what an editor
+    /// needs to know about it: how to colour it, what is wrong with it, the
+    /// graph it describes and where each node is written. See
+    /// `tio_dsp::lang::outline`. It needs no runtime and no device, and
+    /// offsets count UTF-16 code units, as a text view does.
+    ///
+    /// The result is freed with `twinleaf_string_free`. Null if `text` is
+    /// null or not UTF-8.
+    #[no_mangle]
+    pub unsafe extern "C" fn twinleaf_spec_outline(text: *const c_char) -> *mut c_char {
+        let Some(text) = c_string(text) else {
+            return std::ptr::null_mut();
+        };
+        let outline = std::panic::catch_unwind(|| tio_dsp::lang::outline::outline(&text));
+        outline
+            .ok()
+            .and_then(|outline| serde_json::to_string(&outline).ok())
+            .and_then(|json| CString::new(json).ok())
+            .map_or(std::ptr::null_mut(), CString::into_raw)
+    }
+
+    /// Frees a string this library returned.
+    #[no_mangle]
+    pub unsafe extern "C" fn twinleaf_string_free(text: *mut c_char) {
+        if !text.is_null() {
+            drop(CString::from_raw(text));
+        }
     }
 
     /// Structured commands cross the boundary as a JSON `ClientCommand`.
@@ -371,6 +403,7 @@ mod direct {
                     url,
                     route,
                     log_path,
+                    spec,
                 } => {
                     emitter.debug(format!("direct connect command received for {url}"));
                     stop_direct_session(&mut session);
@@ -379,7 +412,7 @@ mod direct {
                     let session_emitter = emitter.clone();
                     let handle = match thread::Builder::new()
                         .name("twinleaf-session".into())
-                        .spawn(move || run_session(url, route, log_path, rx, session_emitter))
+                        .spawn(move || run_session(url, route, log_path, spec, rx, session_emitter))
                     {
                         Ok(handle) => handle,
                         Err(err) => {
@@ -555,6 +588,24 @@ mod direct {
                     });
                     // No session, or one whose thread has already exited
                     // (its connection failed or closed): answer here.
+                    if !sent {
+                        emit_raw_rpc_error(&emitter, &answer_id, "Not connected to a device", None);
+                    }
+                }
+                ClientCommand::TransferSpec {
+                    request_id,
+                    route,
+                    text,
+                } => {
+                    let answer_id = request_id.clone();
+                    let sent = session.as_ref().is_some_and(|(tx, _)| {
+                        tx.send(SessionCommand::TransferSpec {
+                            request_id,
+                            route,
+                            text,
+                        })
+                        .is_ok()
+                    });
                     if !sent {
                         emit_raw_rpc_error(&emitter, &answer_id, "Not connected to a device", None);
                     }

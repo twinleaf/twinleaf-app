@@ -464,7 +464,8 @@ fn run_remote_session(
                     "error": READ_ONLY
                 }));
             }
-            SessionCommand::CallRawRpc { request_id, .. } => {
+            SessionCommand::CallRawRpc { request_id, .. }
+            | SessionCommand::TransferSpec { request_id, .. } => {
                 emit_raw_rpc_error(&emitter, &request_id, READ_ONLY, None);
             }
             // A viewer has no device to share, flash, or measure the link of.

@@ -1,0 +1,41 @@
+[package]
+name = "tio-dsp"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "A text-specified DSP flow graph over Twinleaf sensor streams."
+
+[lib]
+name = "tio_dsp"
+path = "src/lib.rs"
+
+[features]
+default = ["serial"]
+# Sensors on serial ports, for `tiodsp serve`.
+serial = ["twinleaf/serial"]
+# Lets an editor take a spec's outline as JSON.
+serde = ["dep:serde"]
+# Compiles a spec's figure to PDF or SVG in this process, with no Typst
+# installed. It is a large dependency, and only `tiodsp graph` uses it.
+typst = ["dep:typst", "dep:typst-layout", "dep:typst-pdf", "dep:typst-svg", "dep:typst-kit"]
+
+[[bin]]
+name = "tiodsp"
+path = "src/main.rs"
+
+[dependencies]
+num-complex = "0.4"
+rayon = "1"
+# No app types in the public API, so the crate lifts into the twinleaf-rust
+# workspace as `twinleaf-dsp` unchanged once the language stops moving.
+twinleaf = { version = "2.0", path = "../../vendor/twinleaf-rust/twinleaf", default-features = false, features = ["processing"] }
+thiserror = "2"
+serde = { version = "1", features = ["derive"], optional = true }
+typst = { version = "0.15", optional = true }
+typst-layout = { version = "0.15", optional = true }
+typst-pdf = { version = "0.15", optional = true }
+typst-svg = { version = "0.15", optional = true }
+typst-kit = { version = "0.15", optional = true, features = ["embedded-fonts", "system-packages", "system-downloader"] }
+# Already part of `twinleaf`. Named here for the reply to a metadata request,
+# which a device and this crate must build alike.
+twinleaf-device = { version = "0.1", path = "../../vendor/twinleaf-rust/twinleaf-device" }

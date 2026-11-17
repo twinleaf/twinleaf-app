@@ -1,4 +1,5 @@
 .DS_Store
 build/
+rust/target/
 rust/tio-bridge/target/
 xcuserdata

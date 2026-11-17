@@ -1,0 +1,15 @@
+[workspace]
+# `examples/private-dsp` is a worked example and not part of the app: a DSP
+# device with a function of its own, built on `tio-dsp`.
+members = ["tio-bridge", "tio-dsp", "examples/private-dsp"]
+resolver = "2"
+
+# Full debug info in release builds, packed into .dSYM bundles next to the
+# artifacts. App Store Connect requires matching dSYMs for every binary in an
+# uploaded archive; the binaries themselves stay lean (DWARF lives in the
+# dSYM, not the dylib/executable). Profiles are read from the workspace root
+# only, so this lives here rather than in tio-bridge's manifest.
+[profile.release]
+debug = "full"
+split-debuginfo = "packed"
+strip = "none"

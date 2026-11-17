@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use twinleaf::data::ops::Welch;
-use twinleaf::flume::{self, Receiver, Sender};
 use twinleaf::data::{
     Change, ColumnArray, ColumnOp, DataType, DeviceMetadataSnapshot, LogFile, PacketParser,
     SampleBatch,
@@ -29,6 +28,7 @@ use twinleaf::device::{
 };
 #[cfg(feature = "firmware")]
 use twinleaf::firmware::{self, FirmwareCatalog, FlashEvent, StopOutcome, UpdateStatus};
+use twinleaf::flume::{self, Receiver, Sender};
 use twinleaf::proto::rpc::RpcError;
 use twinleaf::proto::sync::Epoch;
 use twinleaf::proto::DeviceRoute;
@@ -403,6 +403,9 @@ fn encode_log_message_event(value: &Value) -> Option<Vec<u8>> {
     writer.write_str(value.get("route")?.as_str()?);
     writer.write_f64(value.get("timestampSeconds")?.as_f64()?);
     writer.write_str(value.get("message")?.as_str()?);
+    // A message that names no level is taken for information.
+    let level = value.get("level").and_then(Value::as_u64).unwrap_or(3);
+    writer.write_u8(u8::try_from(level).unwrap_or(3));
     Some(writer.finish())
 }
 
@@ -704,6 +707,9 @@ enum ClientCommand {
         url: String,
         route: Option<String>,
         log_path: Option<String>,
+        /// The text of a signal graph to run over the session's sensors. Its
+        /// outputs then appear as one more device, at `/255`.
+        spec: Option<String>,
     },
     SetLogging {
         enabled: bool,
@@ -756,6 +762,18 @@ enum ClientCommand {
         #[serde(default)]
         arg_hex: Option<String>,
     },
+    /// Read the text of the signal graph at `route`, or, given `text`, write
+    /// it and have the graph run it. A text does not fit one RPC, so this is
+    /// several. It is answered like a raw RPC, by one `rawRpcResult`: the
+    /// text read, as bytes in hex, or nothing for a write. A text the graph
+    /// refuses fails with the device's error, and the graph says why in its
+    /// log.
+    TransferSpec {
+        request_id: String,
+        route: String,
+        #[serde(default)]
+        text: Option<String>,
+    },
     CheckUpgrade,
     PerformUpgrade {
         route: String,
@@ -803,6 +821,11 @@ enum SessionCommand {
         route: String,
         name: String,
         arg_hex: Option<String>,
+    },
+    TransferSpec {
+        request_id: String,
+        route: String,
+        text: Option<String>,
     },
     CopyViewData {
         request_id: String,
@@ -2584,6 +2607,7 @@ fn main() {
                 url,
                 route,
                 log_path,
+                spec,
             } => {
                 emitter.debug(format!("connect command received for {url}"));
                 if let Some(tx) = session_tx.take() {
@@ -2594,7 +2618,7 @@ fn main() {
                 let session_emitter = emitter.clone();
                 thread::Builder::new()
                     .name("twinleaf-session".into())
-                    .spawn(move || run_session(url, route, log_path, rx, session_emitter))
+                    .spawn(move || run_session(url, route, log_path, spec, rx, session_emitter))
                     .expect("failed to spawn Twinleaf session thread");
                 session_tx = Some(tx);
             }
@@ -2780,6 +2804,24 @@ fn main() {
                 });
                 // No session, or one whose thread has already exited (its
                 // connection failed or closed): answer here.
+                if !sent {
+                    emit_raw_rpc_error(&emitter, &answer_id, "Not connected to a device", None);
+                }
+            }
+            ClientCommand::TransferSpec {
+                request_id,
+                route,
+                text,
+            } => {
+                let answer_id = request_id.clone();
+                let sent = session_tx.as_ref().is_some_and(|tx| {
+                    tx.send(SessionCommand::TransferSpec {
+                        request_id,
+                        route,
+                        text,
+                    })
+                    .is_ok()
+                });
                 if !sent {
                     emit_raw_rpc_error(&emitter, &answer_id, "Not connected to a device", None);
                 }
@@ -3142,9 +3184,11 @@ fn spawn_discovery_hub(include_all: bool, emitter: Emitter) -> DiscoveryHubHandl
     DiscoveryHubHandle { stop_tx }
 }
 
-/// The layout a multi-URL session opens: each URL mounted at /0, /1, ... so
-/// the session sees one combined device tree, exactly as it would behind a
-/// hub. The proxy does the mounting.
+/// The layout a session opens: each URL mounted at /0, /1, ... so the session
+/// sees one device tree, exactly as it would behind a hub. One sensor is
+/// mounted too, at /0, so that what is written against `/0/field` (a plot, a
+/// favorite, a signal graph) still names the same thing when a second sensor
+/// is attached. The proxy does the mounting.
 fn session_layout(urls: &[String]) -> Layout {
     Layout {
         mounts: urls
@@ -3160,22 +3204,100 @@ fn session_layout(urls: &[String]) -> Layout {
     }
 }
 
+/// A session's signal graph: the device that publishes it, hosted in this
+/// process, and the layout that puts it beside the sensors.
+struct SignalGraph {
+    hosted: tio_dsp::serve::Hosted,
+    layout: Layout,
+    /// Where the graph's outputs are in the tree.
+    route: DeviceRoute,
+}
+
+/// Starts the signal graph `spec` for a session over the sensors at `url`,
+/// which may name several. The sensors are mounted where a session without
+/// a graph mounts them, by the same proxy, so that each is opened once and
+/// stays open when a graph is added or taken away. What is wrong with a spec
+/// that does not check is returned as it would be printed.
+fn host_signal_graph(spec: &str, url: &str) -> Result<SignalGraph, String> {
+    use tio_dsp::serve::{output_route, Hosted, ServeError};
+
+    let urls: Vec<String> = url.split_whitespace().map(str::to_string).collect();
+    let mut layout = session_layout(&urls);
+    let mounted: Vec<DeviceRoute> = layout.mounts.iter().map(|mount| mount.prefix).collect();
+    let route = output_route(&mounted)
+        .ok_or_else(|| "No route is free for the signal graph's outputs".to_string())?;
+
+    let mut run = tio_dsp::run::RunOptions::default();
+    // Leave a core each to the thread draining the socket and the one
+    // drawing the interface.
+    run.graph.threads =
+        thread::available_parallelism().map_or(1, |cores| cores.get().saturating_sub(2).max(1));
+    let hosted = Hosted::start(spec.to_owned(), run).map_err(|error| match error {
+        ServeError::Spec(diagnostics) => format!(
+            "The signal graph does not check.\n{}",
+            tio_dsp::lang::diag::render_all(&diagnostics, "signal graph", spec)
+        ),
+        other => format!("Could not start the signal graph: {other}"),
+    })?;
+    layout.mounts.push(Mount {
+        url: hosted.url().to_owned(),
+        source: DeviceRoute::root(),
+        prefix: route,
+    });
+    // The graph reads the sensors' samples from the tree it is mounted in.
+    let tree = layout.clone();
+    hosted
+        .read_from(move || Connection::open_layout(&tree))
+        .map_err(|error| format!("Could not start the signal graph: {error}"))?;
+    Ok(SignalGraph {
+        hosted,
+        layout,
+        route,
+    })
+}
+
+/// Whether a URL names a device tree that is already laid out, rather than a
+/// sensor to mount: a proxy on this machine, such as `tiodsp serve`, which
+/// has the sensors at /0, /1, ... and its outputs beside them. Mounting it
+/// again would push all of that down a level.
+fn names_a_local_tree(url: &str) -> bool {
+    let Some(address) = ["tcp://", "tcp4://", "tcp6://"]
+        .iter()
+        .find_map(|scheme| url.strip_prefix(scheme))
+    else {
+        return false;
+    };
+    // The host is what precedes the port, which follows the last colon
+    // outside any brackets.
+    let host = match address.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => address,
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
+}
+
 /// Opens the session's connection on its own thread, so the session keeps
-/// taking commands while the proxy opens the device. A TCP or UDP URL, or a
-/// layout, is tried again after a failure until the startup window closes.
-fn spawn_connect(url: String, emitter: Emitter) -> flume::Receiver<std::io::Result<Connection>> {
+/// taking commands while the proxy opens the device. A TCP or UDP URL, or
+/// several URLs, is tried again after a failure until the startup window
+/// closes.
+fn spawn_connect(
+    url: String,
+    layout: Option<Layout>,
+    emitter: Emitter,
+) -> flume::Receiver<std::io::Result<Connection>> {
     let (result_tx, result_rx) = flume::bounded(1);
     let urls: Vec<String> = url.split_whitespace().map(str::to_string).collect();
     thread::Builder::new()
         .name("twinleaf-connect".into())
         .spawn(move || {
             let deadline = Instant::now() + CONNECTION_STARTUP_TIMEOUT;
-            let retry = urls.len() > 1 || is_retryable_connect_url(&url);
+            let retry = layout.is_some() || urls.len() > 1 || is_retryable_connect_url(&url);
             let result = loop {
-                let attempt = if urls.len() > 1 {
-                    Connection::open_layout(&session_layout(&urls))
-                } else {
-                    Connection::open(&url)
+                let attempt = match (&layout, urls.as_slice()) {
+                    // The sensors, and a signal graph beside them.
+                    (Some(layout), _) => Connection::open_layout(layout),
+                    (None, [tree]) if names_a_local_tree(tree) => Connection::open(tree),
+                    (None, _) => Connection::open_layout(&session_layout(&urls)),
                 };
                 match attempt {
                     Err(err) if retry && Instant::now() < deadline => {
@@ -3677,6 +3799,7 @@ fn run_session(
     url: String,
     route: Option<String>,
     log_path: Option<String>,
+    spec: Option<String>,
     command_rx: Receiver<SessionCommand>,
     emitter: Emitter,
 ) {
@@ -3704,10 +3827,33 @@ fn run_session(
     emitter.status("connecting", format!("Connecting to {url}"));
     emitter.debug(format!("session starting: url={url}, route={root_route}"));
 
-    // Several whitespace-separated URLs are opened as one layout, each mounted
-    // at /0, /1, ..., so the rest of the session sees one combined device tree
-    // exactly as it would behind a hub.
-    let open_rx = spawn_connect(url.clone(), emitter.clone());
+    // A session with a signal graph hosts the graph's device here, in this
+    // process, and mounts it beside the sensors: they at /0, /1, ... and its
+    // outputs at /255. It is stopped when the session ends, which is when
+    // this binding is dropped.
+    let signal_graph = match spec.as_deref() {
+        Some(spec) => match host_signal_graph(spec, &url) {
+            Ok(graph) => {
+                emitter.debug(format!(
+                    "signal graph hosted at {}, outputs at {}",
+                    graph.hosted.url(),
+                    graph.route
+                ));
+                Some(graph)
+            }
+            Err(message) => {
+                emitter.error(message);
+                return;
+            }
+        },
+        None => None,
+    };
+    let layout = signal_graph.as_ref().map(|graph| graph.layout.clone());
+
+    // The URL may be several, separated by whitespace. Each is mounted at /0,
+    // /1, ..., so the rest of the session sees one device tree exactly as it
+    // would behind a hub.
+    let open_rx = spawn_connect(url.clone(), layout, emitter.clone());
     let mut pending_startup_commands = VecDeque::new();
     let Some(connection) = wait_for_connection(
         &open_rx,
@@ -3924,7 +4070,8 @@ fn run_session(
                                             &mut rpc_index,
                                         ) {
                                             emit_metadata_devices(&emitter, &discovery.devices);
-                                            publish_tap.publish_metadata(&discovery.devices, &emitter);
+                                            publish_tap
+                                                .publish_metadata(&discovery.devices, &emitter);
                                             health.update_stream_sample_sizes(&discovery.devices);
                                         }
                                         emitter
@@ -4314,6 +4461,11 @@ fn run_session(
                     name,
                     arg_hex,
                 } => dispatch_raw_rpc(&connection, request_id, route, name, arg_hex, &emitter),
+                SessionCommand::TransferSpec {
+                    request_id,
+                    route,
+                    text,
+                } => dispatch_spec_transfer(&connection, request_id, route, text, &emitter),
                 SessionCommand::CopyViewData {
                     request_id,
                     pane_id,
@@ -4955,7 +5107,9 @@ fn emit_tio_log_message(packet: &tio::Packet, timestamp_seconds: Option<f64>, em
         "type": "logMessage",
         "route": packet.route().to_string(),
         "timestampSeconds": timestamp_seconds,
-        "message": message
+        "message": message,
+        // 0 critical, 1 error, 2 warning, 3 info, 4 debug.
+        "level": log.level.value()
     }));
 }
 
@@ -7711,6 +7865,68 @@ fn dispatch_raw_rpc(
     }
 }
 
+/// Reads or writes the text of a signal graph, in as many RPCs as its length
+/// takes, on a thread of its own. Answered once, like the raw RPC it is made
+/// of: with the text read, or with nothing once a text written is running.
+fn dispatch_spec_transfer(
+    connection: &Connection,
+    request_id: String,
+    route: String,
+    text: Option<String>,
+    emitter: &Emitter,
+) {
+    use tio_dsp::client::{read_spec, write_spec, TransferError};
+
+    let Ok(route_value) = DeviceRoute::from_str(&route) else {
+        emit_raw_rpc_error(emitter, &request_id, "Invalid route", None);
+        return;
+    };
+    let device = connection.device(route_value);
+    let worker_emitter = emitter.clone();
+    let worker_request_id = request_id.clone();
+    let spawned = thread::Builder::new()
+        .name("twinleaf-spec".into())
+        .spawn(move || {
+            let call = |name: &str, arg: &[u8]| device.raw_rpc(name, arg);
+            let transfer = panic::catch_unwind(AssertUnwindSafe(|| match &text {
+                Some(text) => write_spec(call, text).map(|()| Vec::new()),
+                None => read_spec(call).map(String::into_bytes),
+            }));
+            match transfer {
+                Ok(Ok(bytes)) => worker_emitter.emit(&json!({
+                    "type": "rawRpcResult",
+                    "requestId": worker_request_id,
+                    "ok": true,
+                    "valueHex": hex_encode(&bytes)
+                })),
+                Ok(Err(TransferError::Call(err))) => {
+                    let (message, code) = raw_rpc_error_text(&err);
+                    emit_raw_rpc_error(&worker_emitter, &worker_request_id, &message, code);
+                }
+                Ok(Err(err)) => {
+                    emit_raw_rpc_error(&worker_emitter, &worker_request_id, &err.to_string(), None);
+                }
+                Err(err) => emit_raw_rpc_error(
+                    &worker_emitter,
+                    &worker_request_id,
+                    &format!(
+                        "Twinleaf parser panic while moving a spec: {}",
+                        panic_message(err)
+                    ),
+                    None,
+                ),
+            }
+        });
+    if let Err(err) = spawned {
+        emit_raw_rpc_error(
+            emitter,
+            &request_id,
+            &format!("Failed to start spec worker: {err}"),
+            None,
+        );
+    }
+}
+
 /// Answers every raw RPC in `commands` with a not-connected error; used for
 /// commands a session ends without seeing. Other commands need no reply.
 fn fail_unanswered_raw_rpcs<I: IntoIterator<Item = SessionCommand>>(
@@ -7718,7 +7934,9 @@ fn fail_unanswered_raw_rpcs<I: IntoIterator<Item = SessionCommand>>(
     emitter: &Emitter,
 ) {
     for command in commands {
-        if let SessionCommand::CallRawRpc { request_id, .. } = command {
+        if let SessionCommand::CallRawRpc { request_id, .. }
+        | SessionCommand::TransferSpec { request_id, .. } = command
+        {
             emit_raw_rpc_error(emitter, &request_id, "Not connected to a device", None);
         }
     }
@@ -8278,6 +8496,13 @@ mod tests {
             arg_hex: Some("00".into()),
         })
         .unwrap();
+        // A spec on its way to a signal graph is answered the same way.
+        tx.send(SessionCommand::TransferSpec {
+            request_id: "queued-3".into(),
+            route: "/255".into(),
+            text: Some("out y = a".into()),
+        })
+        .unwrap();
 
         CAPTURED_EVENTS.lock().unwrap().clear();
         drop(SessionCommandDrain {
@@ -8311,10 +8536,41 @@ mod tests {
                     false,
                     "Not connected to a device".to_string()
                 ),
+                (
+                    "queued-3".to_string(),
+                    false,
+                    "Not connected to a device".to_string()
+                ),
             ]
         );
         // The drain consumed the channel; nothing waits behind a dead session.
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn decodes_a_spec_transfer_either_way() {
+        // With no text it reads; with text, even none at all, it writes.
+        let read: ClientCommand = serde_json::from_value(json!({
+            "type": "transferSpec",
+            "requestId": "req-4",
+            "route": "/255"
+        }))
+        .unwrap();
+        assert!(matches!(
+            read,
+            ClientCommand::TransferSpec { text: None, ref route, .. } if route == "/255"
+        ));
+        let write: ClientCommand = serde_json::from_value(json!({
+            "type": "transferSpec",
+            "requestId": "req-5",
+            "route": "/255",
+            "text": ""
+        }))
+        .unwrap();
+        assert!(matches!(
+            write,
+            ClientCommand::TransferSpec { text: Some(ref text), .. } if text.is_empty()
+        ));
     }
 
     #[test]
@@ -8421,13 +8677,23 @@ mod tests {
 
         // `dev.priv` unlocks: the registry lists one more RPC, and the app hears it.
         let unlocked = fetched_rpcs(&route, &registry(&["dev.name", "dev.priv.password"]));
-        assert!(apply_rpc_table(&route, unlocked, &mut discovery, &mut rpc_index));
+        assert!(apply_rpc_table(
+            &route,
+            unlocked,
+            &mut discovery,
+            &mut rpc_index
+        ));
         assert_eq!(discovery.devices[0].rpcs.len(), 2);
         assert!(rpc_index.contains_key(&(route.to_string(), "dev.priv.password".to_string())));
 
         // The same table again changes nothing the app must hear about.
         let again = fetched_rpcs(&route, &registry(&["dev.name", "dev.priv.password"]));
-        assert!(!apply_rpc_table(&route, again, &mut discovery, &mut rpc_index));
+        assert!(!apply_rpc_table(
+            &route,
+            again,
+            &mut discovery,
+            &mut rpc_index
+        ));
     }
 
     #[test]
@@ -8839,6 +9105,45 @@ mod tests {
         };
         assert_eq!(view.window_seconds, 10.0);
         assert!(!view.log_y);
+    }
+
+    #[test]
+    fn only_a_proxy_on_this_machine_is_opened_without_mounting() {
+        // A hosted signal graph, or any proxy here, is a tree already.
+        for url in [
+            "tcp://127.0.0.1:53412",
+            "tcp://localhost:7855",
+            "tcp6://[::1]:7855",
+            "tcp://127.0.0.1",
+        ] {
+            assert!(names_a_local_tree(url), "{url}");
+        }
+        // A sensor is mounted at /0, wherever it is.
+        for url in [
+            "serial:///dev/cu.usbmodem14201",
+            "udp://127.0.0.1:17855",
+            "tcp://192.168.1.20",
+            "tcp://sensor-a.local:7855",
+            "",
+        ] {
+            assert!(!names_a_local_tree(url), "{url}");
+        }
+        let layout = session_layout(&["serial:///dev/cu.usbmodem14201".to_owned()]);
+        assert_eq!(layout.mounts.len(), 1);
+        assert_eq!(layout.mounts[0].prefix.to_string(), "/0");
+    }
+
+    #[test]
+    fn a_signal_graph_that_does_not_check_is_refused_with_its_reasons() {
+        let Err(message) = host_signal_graph("out y = nothing\n", "udp://127.0.0.1:1") else {
+            panic!("a spec that does not check was hosted");
+        };
+        assert!(
+            message.starts_with(
+                "The signal graph does not check.\nerror[E0202]: cannot find `nothing`\n --> signal graph:1:9"
+            ),
+            "{message}"
+        );
     }
 
     #[test]

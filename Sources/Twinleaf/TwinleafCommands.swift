@@ -48,6 +48,26 @@ struct TwinleafCommands: Commands {
                 postCommand(.toggleDataLogging)
             }
             .keyboardShortcut("l", modifiers: [.command, .option])
+
+            Divider()
+
+            // A spec that computes new streams from the sensors'. They
+            // appear as one more device, with the spec's params as settings.
+            Button("Open Signal Graph...") {
+                postCommand(.openSignalGraph)
+            }
+            .keyboardShortcut("g", modifiers: [.command, .option])
+
+            // Its text beside the graph the text describes. Changes go to
+            // the running graph as they are made.
+            Button("Edit Signal Graph...") {
+                postCommand(.editSignalGraph)
+            }
+            .keyboardShortcut("e", modifiers: [.command, .option])
+
+            Button("Remove Signal Graph") {
+                postCommand(.removeSignalGraph)
+            }
         }
 
         CommandGroup(after: .toolbar) {

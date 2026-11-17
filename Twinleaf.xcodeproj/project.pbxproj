@@ -26,6 +26,9 @@
 		A00000000000000000000540 /* Sources/TwinleafQuickLook/PreviewProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000422 /* Sources/TwinleafQuickLook/PreviewProvider.swift */; };
 		A00000000000000000000541 /* TwinleafQuickLook.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = A00000000000000000000203 /* TwinleafQuickLook.appex */; platformFilters = (macos, ); settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		A00000000000000000000525 /* Sources/Twinleaf/LoggingSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000426 /* Sources/Twinleaf/LoggingSession.swift */; };
+		A00000000000000000000581 /* Sources/Twinleaf/SignalGraphEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000481 /* Sources/Twinleaf/SignalGraphEditor.swift */; };
+		A00000000000000000000582 /* Sources/Twinleaf/SignalGraphTextView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000482 /* Sources/Twinleaf/SignalGraphTextView.swift */; };
+		A00000000000000000000583 /* Sources/Twinleaf/SignalGraphCanvas.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000483 /* Sources/Twinleaf/SignalGraphCanvas.swift */; };
 		A00000000000000000000526 /* Sources/Twinleaf/Tips.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000427 /* Sources/Twinleaf/Tips.swift */; };
 		A00000000000000000000528 /* Sources/Twinleaf/SettingsSync.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000430 /* Sources/Twinleaf/SettingsSync.swift */; };
 		A00000000000000000000527 /* Sources/TwinleafLiveActivity/LoggingActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000428 /* Sources/TwinleafLiveActivity/LoggingActivityAttributes.swift */; };
@@ -80,6 +83,9 @@
 		A00000000000000000000203 /* TwinleafQuickLook.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = TwinleafQuickLook.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		A00000000000000000000204 /* TwinleafLiveActivity.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = TwinleafLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		A00000000000000000000426 /* Sources/Twinleaf/LoggingSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/LoggingSession.swift; sourceTree = "<group>"; };
+		A00000000000000000000481 /* Sources/Twinleaf/SignalGraphEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/SignalGraphEditor.swift; sourceTree = "<group>"; };
+		A00000000000000000000482 /* Sources/Twinleaf/SignalGraphTextView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/SignalGraphTextView.swift; sourceTree = "<group>"; };
+		A00000000000000000000483 /* Sources/Twinleaf/SignalGraphCanvas.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/SignalGraphCanvas.swift; sourceTree = "<group>"; };
 		A00000000000000000000427 /* Sources/Twinleaf/Tips.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/Tips.swift; sourceTree = "<group>"; };
 		A00000000000000000000430 /* Sources/Twinleaf/SettingsSync.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/Twinleaf/SettingsSync.swift; sourceTree = "<group>"; };
 		A00000000000000000000428 /* Sources/TwinleafLiveActivity/LoggingActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/TwinleafLiveActivity/LoggingActivityAttributes.swift; sourceTree = "<group>"; };
@@ -111,7 +117,7 @@
 		A00000000000000000000451 /* scripts/xcode-build-rust.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "scripts/xcode-build-rust.sh"; sourceTree = "<group>"; };
 		A00000000000000000000452 /* scripts/build-ios-rust.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = "scripts/build-ios-rust.sh"; sourceTree = "<group>"; };
 		A00000000000000000000461 /* rust/tio-bridge/Cargo.toml */ = {isa = PBXFileReference; lastKnownFileType = text; path = "rust/tio-bridge/Cargo.toml"; sourceTree = "<group>"; };
-		A00000000000000000000462 /* rust/tio-bridge/Cargo.lock */ = {isa = PBXFileReference; lastKnownFileType = text; path = "rust/tio-bridge/Cargo.lock"; sourceTree = "<group>"; };
+		A00000000000000000000462 /* rust/Cargo.lock */ = {isa = PBXFileReference; lastKnownFileType = text; path = "rust/Cargo.lock"; sourceTree = "<group>"; };
 		A00000000000000000000463 /* rust/tio-bridge/src/lib.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = "rust/tio-bridge/src/lib.rs"; sourceTree = "<group>"; };
 		A00000000000000000000464 /* rust/tio-bridge/src/main.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = "rust/tio-bridge/src/main.rs"; sourceTree = "<group>"; };
 		A00000000000000000000465 /* vendor/twinleaf-rust */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "vendor/twinleaf-rust"; sourceTree = "<group>"; };
@@ -224,6 +230,9 @@
 				A00000000000000000000420 /* Sources/Twinleaf/TwinleafSceneActions.swift */,
 				A00000000000000000000421 /* Sources/Twinleaf/BridgeSessionRegistry.swift */,
 				A00000000000000000000426 /* Sources/Twinleaf/LoggingSession.swift */,
+				A00000000000000000000481 /* Sources/Twinleaf/SignalGraphEditor.swift */,
+				A00000000000000000000482 /* Sources/Twinleaf/SignalGraphTextView.swift */,
+				A00000000000000000000483 /* Sources/Twinleaf/SignalGraphCanvas.swift */,
 				A00000000000000000000427 /* Sources/Twinleaf/Tips.swift */,
 				A00000000000000000000430 /* Sources/Twinleaf/SettingsSync.swift */,
 				A00000000000000000000418 /* Sources/Twinleaf/BridgeClient.swift */,
@@ -270,7 +279,7 @@
 			isa = PBXGroup;
 			children = (
 				A00000000000000000000461 /* rust/tio-bridge/Cargo.toml */,
-				A00000000000000000000462 /* rust/tio-bridge/Cargo.lock */,
+				A00000000000000000000462 /* rust/Cargo.lock */,
 				A00000000000000000000466 /* rust/tio-bridge/include/twinleaf_core.h */,
 				A0000000000000000000000B /* src */,
 			);
@@ -497,6 +506,9 @@
 				A00000000000000000000520 /* Sources/Twinleaf/TwinleafSceneActions.swift in Sources */,
 				A00000000000000000000521 /* Sources/Twinleaf/BridgeSessionRegistry.swift in Sources */,
 				A00000000000000000000525 /* Sources/Twinleaf/LoggingSession.swift in Sources */,
+				A00000000000000000000581 /* Sources/Twinleaf/SignalGraphEditor.swift in Sources */,
+				A00000000000000000000582 /* Sources/Twinleaf/SignalGraphTextView.swift in Sources */,
+				A00000000000000000000583 /* Sources/Twinleaf/SignalGraphCanvas.swift in Sources */,
 				A00000000000000000000526 /* Sources/Twinleaf/Tips.swift in Sources */,
 				A00000000000000000000528 /* Sources/Twinleaf/SettingsSync.swift in Sources */,
 				A00000000000000000000527 /* Sources/TwinleafLiveActivity/LoggingActivityAttributes.swift in Sources */,

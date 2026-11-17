@@ -31,6 +31,16 @@ struct TwinleafApp: App {
             TwinleafCommands()
         }
         .defaultLaunchBehavior(.suppressed)
+        // A document's signal graph editor. Opened from its document and of
+        // no use without it, so it neither opens at launch nor comes back.
+        WindowGroup("Signal Graph", for: SignalGraphEditorDescriptor.self) { $descriptor in
+            if let descriptor {
+                SignalGraphEditorScene(descriptor: descriptor)
+            }
+        }
+        .defaultSize(width: 1120, height: 680)
+        .defaultLaunchBehavior(.suppressed)
+        .restorationBehavior(.disabled)
         #else
         DocumentGroup(newDocument: TioLogDocument()) { configuration in
             DocumentWindow(
@@ -47,6 +57,11 @@ struct TwinleafApp: App {
         WindowGroup(for: PlotPopoutDescriptor.self) { $descriptor in
             if let descriptor {
                 IPadPlotPopoutScene(descriptor: descriptor)
+            }
+        }
+        WindowGroup("Signal Graph", for: SignalGraphEditorDescriptor.self) { $descriptor in
+            if let descriptor {
+                SignalGraphEditorScene(descriptor: descriptor)
             }
         }
         #endif

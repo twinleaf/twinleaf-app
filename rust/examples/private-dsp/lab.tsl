@@ -1,0 +1,11 @@
+# A private stage in a public graph. `despike` is labdsp's own; everything
+# around it is tiodsp's.
+#
+#   labdsp serve lab.tsl --mount udp://127.0.0.1:17856
+
+source a = /0/sine @rate(500) @channels(sine, cosine) @unit(V)
+
+param limit = 3 [1 .. 10]
+param edge : Hz = 40 [1 .. 200]
+
+out clean : V = a | despike(n = 7, limit = limit) | lowpass(edge)

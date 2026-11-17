@@ -9,9 +9,17 @@ import AppKit
 import UIKit
 #endif
 
+/// A signal graph for a document's sessions: a spec that computes new
+/// streams from the sensors', which then appear as one more device.
+struct SignalGraph: Equatable, Sendable {
+    /// The name of the file it was opened from.
+    let name: String
+    let text: String
+}
+
 private protocol BridgeRuntime: AnyObject {
     func setDiscovery(active: Bool, includeAll: Bool)
-    func connect(url: String, route: String, logPath: String?)
+    func connect(url: String, route: String, logPath: String?, spec: String?)
     func setLogging(enabled: Bool, logPath: String?)
     func openLog(path: String)
     func exportLog(requestId: String, sourcePath: String, outputPath: String, format: ExportFormat)
@@ -26,6 +34,7 @@ private protocol BridgeRuntime: AnyObject {
     func setView(_ view: ViewConfig)
     func callRpc(requestId: String, route: String, name: String, argument: Any?)
     func callRawRpc(requestId: String, route: String, name: String, argumentHex: String?)
+    func transferSpec(requestId: String, route: String, text: String?)
     func resetHealthCounters()
     func checkUpgrade()
     func performUpgrade(route: String)
@@ -36,7 +45,7 @@ extension RustRuntime: BridgeRuntime {}
 #else
 private final class UnavailableBridgeRuntime: BridgeRuntime {
     func setDiscovery(active: Bool, includeAll: Bool) {}
-    func connect(url: String, route: String, logPath: String?) {}
+    func connect(url: String, route: String, logPath: String?, spec: String?) {}
     func setLogging(enabled: Bool, logPath: String?) {}
     func openLog(path: String) {}
     func exportLog(requestId: String, sourcePath: String, outputPath: String, format: ExportFormat) {}
@@ -51,6 +60,7 @@ private final class UnavailableBridgeRuntime: BridgeRuntime {
     func setView(_ view: ViewConfig) {}
     func callRpc(requestId: String, route: String, name: String, argument: Any?) {}
     func callRawRpc(requestId: String, route: String, name: String, argumentHex: String?) {}
+    func transferSpec(requestId: String, route: String, text: String?) {}
     func resetHealthCounters() {}
     func checkUpgrade() {}
     func performUpgrade(route: String) {}
@@ -212,6 +222,14 @@ final class BridgeClient: ObservableObject {
     @Published private(set) var rpcReplyChangeToken: UInt64 = 0
     @Published private(set) var deviceDiscoverySummary = ""
     @Published private(set) var connectionProgress = ConnectionProgress()
+    /// The signal graph this document's sessions run, if any.
+    @Published private(set) var signalGraph: SignalGraph?
+    /// Something to tell the user about the signal graph, once.
+    @Published private(set) var signalGraphNotice: String?
+    /// The device and log file of the session in progress, kept so that it
+    /// can be started over with a signal graph or without one.
+    private var sessionDevice: AvailableDevice?
+    private var sessionLogURL: URL?
     private var rpcValueRevisions: [String: UInt64] = [:]
     private var rpcReplyRevisions: [String: UInt64] = [:]
 
@@ -395,8 +413,38 @@ final class BridgeClient: ObservableObject {
         logDeviceDiscovery("DevicePicker \(message)")
     }
 
+    /// Chooses the signal graph this document's sessions run, or none. A
+    /// session in progress starts over, so that the sensors are mounted with
+    /// the graph's outputs beside them, unless that would restart a recording.
+    func setSignalGraph(_ graph: SignalGraph?) {
+        guard graph != signalGraph else { return }
+        signalGraph = graph
+        guard let device = sessionDevice, !isInspectionMode else { return }
+        guard device.kind != TwinleafLabcast.deviceKind else {
+            signalGraphNotice = "A shared session is computed where it is hosted, so a signal graph does not apply to it."
+            return
+        }
+        if logPackets > 0 {
+            signalGraphNotice = graph == nil
+                ? "The signal graph will stop at the next connection. Reconnecting now would restart this recording."
+                : "The signal graph will run from the next connection. Reconnecting now would restart this recording."
+            return
+        }
+        connect(to: device, logURL: sessionLogURL)
+    }
+
+    func reportSignalGraphProblem(_ message: String) {
+        signalGraphNotice = message
+    }
+
+    func clearSignalGraphNotice() {
+        signalGraphNotice = nil
+    }
+
     func connect(to device: AvailableDevice, logURL: URL?) {
         startIfNeeded()
+        sessionDevice = device
+        sessionLogURL = logURL
         logDeviceDiscovery("connect selected url=\(device.url) kind=\(device.kind) label=\(device.label)")
         let attemptID = nextConnectionAttemptID
         nextConnectionAttemptID &+= 1
@@ -432,7 +480,7 @@ final class BridgeClient: ObservableObject {
         if device.kind == TwinleafLabcast.deviceKind {
             startRemoteSession(device, logPath: logURL?.path)
         } else {
-            runtime?.connect(url: device.url, route: "/", logPath: logURL?.path)
+            runtime?.connect(url: device.url, route: "/", logPath: logURL?.path, spec: signalGraph?.text)
             #if os(macOS)
             isDeviceSession = true
             #endif
@@ -472,6 +520,8 @@ final class BridgeClient: ObservableObject {
     }
 
     func disconnect() {
+        sessionDevice = nil
+        sessionLogURL = nil
         stopRemoteSession()
         stopPublishing()
         runtime?.disconnect()
@@ -1276,6 +1326,56 @@ final class BridgeClient: ObservableObject {
     /// `rpc.*` introspection calls rely on. Every request resolves: the Rust
     /// side answers each one exactly once, and a disconnect fails the rest.
     func callRawRpc(route: String, name: String, argument: Data?) async throws -> Data {
+        try await rawReply { runtime, requestId in
+            runtime.callRawRpc(
+                requestId: requestId,
+                route: route,
+                name: name,
+                argumentHex: argument.map { $0.map { String(format: "%02x", $0) }.joined() }
+            )
+        }
+    }
+
+    /// The text of the signal graph running at `route`.
+    func readSignalGraphText(route: String) async throws -> String {
+        let bytes = try await rawReply { runtime, requestId in
+            runtime.transferSpec(requestId: requestId, route: route, text: nil)
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    /// Has the signal graph at `route` run `text` instead. If the text does
+    /// not check there, this throws, the graph carries on with the text it
+    /// had, and it says what was wrong in its log. A text that is taken
+    /// restarts only what it changed.
+    func writeSignalGraphText(_ text: String, route: String) async throws {
+        _ = try await rawReply { runtime, requestId in
+            runtime.transferSpec(requestId: requestId, route: route, text: text)
+        }
+        noteSignalGraphText(text)
+    }
+
+    /// The route of the session's signal graph, once it is running: the
+    /// device that answers for a spec.
+    var signalGraphRoute: String? {
+        devices.first { device in
+            device.rpcs.contains { $0.name == "dsp.spec.size" }
+        }?.route
+    }
+
+    /// Keeps the document's signal graph in step with a text that was put
+    /// to the running graph in place, so that the next connection starts
+    /// from it. Does not reconnect.
+    private func noteSignalGraphText(_ text: String) {
+        guard let graph = signalGraph, graph.text != text else { return }
+        signalGraph = SignalGraph(name: graph.name, text: text)
+    }
+
+    /// Sends one request that the bridge answers with a `rawRpcResult`, and
+    /// waits for the answer.
+    private func rawReply(
+        _ send: (BridgeRuntime, String) -> Void
+    ) async throws -> Data {
         guard let runtime, !isInspectionMode else {
             throw RawRpcError.notConnected
         }
@@ -1290,12 +1390,7 @@ final class BridgeClient: ObservableObject {
         defer { watchdog.cancel() }
         return try await withCheckedThrowingContinuation { continuation in
             pendingRawRpcContinuations[requestId] = continuation
-            runtime.callRawRpc(
-                requestId: requestId,
-                route: route,
-                name: name,
-                argumentHex: argument.map { $0.map { String(format: "%02x", $0) }.joined() }
-            )
+            send(runtime, requestId)
         }
     }
 
@@ -1773,7 +1868,8 @@ final class BridgeClient: ObservableObject {
                 handleLogMessageEvent(TioLogMessageEvent(
                     route: try reader.readString(),
                     timestampSeconds: try reader.readDouble(),
-                    message: try reader.readString()
+                    message: try reader.readString(),
+                    level: try reader.readUInt8()
                 ))
             case .rpcResult:
                 handleRpcResult(RpcResultEvent(
@@ -1971,16 +2067,22 @@ final class BridgeClient: ObservableObject {
     }
 
     private func handleLogMessageEvent(_ event: TioLogMessageEvent) {
-        appendLogMessage(route: event.route, timestampSeconds: event.timestampSeconds, message: event.message)
+        appendLogMessage(
+            route: event.route,
+            timestampSeconds: event.timestampSeconds,
+            message: event.message,
+            level: event.level ?? 3
+        )
     }
 
-    private func appendLogMessage(route: String, timestampSeconds: Double, message: String) {
+    private func appendLogMessage(route: String, timestampSeconds: Double, message: String, level: UInt8) {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines.union(.controlCharacters))
         guard !trimmed.isEmpty else { return }
         logMessages.append(LogMessage(
             route: route,
             timestampSeconds: timestampSeconds,
-            message: trimmed
+            message: trimmed,
+            level: level
         ))
         trimLogMessages(limit: Self.preferredLogMessageLimit())
     }
@@ -3304,6 +3406,7 @@ private struct TioLogMessageEvent: Decodable {
     let route: String
     let timestampSeconds: Double
     let message: String
+    let level: UInt8?
 }
 
 private struct DeviceEventEvent: Decodable {
