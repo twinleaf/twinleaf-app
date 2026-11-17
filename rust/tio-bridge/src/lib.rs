@@ -264,7 +264,7 @@ mod direct {
     /// Reads the text of a signal graph and returns, as JSON, what an editor
     /// needs to know about it: how to colour it, what is wrong with it, the
     /// graph it describes and where each node is written. See
-    /// `tio_dsp::lang::outline`. It needs no runtime and no device, and
+    /// `twinleaf_dsp::lang::outline`. It needs no runtime and no device, and
     /// offsets count UTF-16 code units, as a text view does.
     ///
     /// The result is freed with `twinleaf_string_free`. Null if `text` is
@@ -274,7 +274,7 @@ mod direct {
         let Some(text) = c_string(text) else {
             return std::ptr::null_mut();
         };
-        let outline = std::panic::catch_unwind(|| tio_dsp::lang::outline::outline(&text));
+        let outline = std::panic::catch_unwind(|| twinleaf_dsp::lang::outline::outline(&text));
         outline
             .ok()
             .and_then(|outline| serde_json::to_string(&outline).ok())

@@ -3207,7 +3207,7 @@ fn session_layout(urls: &[String]) -> Layout {
 /// A session's signal graph: the device that publishes it, hosted in this
 /// process, and the layout that puts it beside the sensors.
 struct SignalGraph {
-    hosted: tio_dsp::serve::Hosted,
+    hosted: twinleaf_dsp::serve::Hosted,
     layout: Layout,
     /// Where the graph's outputs are in the tree.
     route: DeviceRoute,
@@ -3219,7 +3219,7 @@ struct SignalGraph {
 /// stays open when a graph is added or taken away. What is wrong with a spec
 /// that does not check is returned as it would be printed.
 fn host_signal_graph(spec: &str, url: &str) -> Result<SignalGraph, String> {
-    use tio_dsp::serve::{output_route, Hosted, ServeError};
+    use twinleaf_dsp::serve::{output_route, Hosted, ServeError};
 
     let urls: Vec<String> = url.split_whitespace().map(str::to_string).collect();
     let mut layout = session_layout(&urls);
@@ -3227,7 +3227,7 @@ fn host_signal_graph(spec: &str, url: &str) -> Result<SignalGraph, String> {
     let route = output_route(&mounted)
         .ok_or_else(|| "No route is free for the signal graph's outputs".to_string())?;
 
-    let mut run = tio_dsp::run::RunOptions::default();
+    let mut run = twinleaf_dsp::run::RunOptions::default();
     // Leave a core each to the thread draining the socket and the one
     // drawing the interface.
     run.graph.threads =
@@ -3235,7 +3235,7 @@ fn host_signal_graph(spec: &str, url: &str) -> Result<SignalGraph, String> {
     let hosted = Hosted::start(spec.to_owned(), run).map_err(|error| match error {
         ServeError::Spec(diagnostics) => format!(
             "The signal graph does not check.\n{}",
-            tio_dsp::lang::diag::render_all(&diagnostics, "signal graph", spec)
+            twinleaf_dsp::lang::diag::render_all(&diagnostics, "signal graph", spec)
         ),
         other => format!("Could not start the signal graph: {other}"),
     })?;
@@ -3257,7 +3257,7 @@ fn host_signal_graph(spec: &str, url: &str) -> Result<SignalGraph, String> {
 }
 
 /// Whether a URL names a device tree that is already laid out, rather than a
-/// sensor to mount: a proxy on this machine, such as `tiodsp serve`, which
+/// sensor to mount: a proxy on this machine, such as `tio dsp serve`, which
 /// has the sensors at /0, /1, ... and its outputs beside them. Mounting it
 /// again would push all of that down a level.
 fn names_a_local_tree(url: &str) -> bool {
@@ -7875,7 +7875,7 @@ fn dispatch_spec_transfer(
     text: Option<String>,
     emitter: &Emitter,
 ) {
-    use tio_dsp::client::{read_spec, write_spec, TransferError};
+    use twinleaf_dsp::client::{read_spec, write_spec, TransferError};
 
     let Ok(route_value) = DeviceRoute::from_str(&route) else {
         emit_raw_rpc_error(emitter, &request_id, "Invalid route", None);

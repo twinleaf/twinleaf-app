@@ -1,3 +1,0 @@
-source a = /0/field @rate(1000) @channels(x, y, z) @unit(nT)
-out y = a | nothc(60)
-out z = a | fourier(8)

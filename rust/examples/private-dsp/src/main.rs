@@ -1,4 +1,4 @@
-//! `labdsp`: everything `tiodsp` does, with this lab's functions beside the
+//! `labdsp`: everything `tio dsp` does, with this lab's functions beside the
 //! public ones.
 //!
 //! ```sh
@@ -10,5 +10,5 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    tio_dsp::cli::run(labdsp::library())
+    twinleaf_dsp::cli::run(labdsp::library())
 }

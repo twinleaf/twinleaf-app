@@ -3,7 +3,7 @@ name = "labdsp"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "A worked example of a private DSP device: tiodsp with a function of its own."
+description = "A worked example of a private DSP device: `tio dsp` with a function of its own."
 publish = false
 
 [lib]
@@ -18,7 +18,7 @@ path = "src/main.rs"
 # All a private device links. The language, the checker, the engine, the
 # device and the command line come from here; what is in this crate is the
 # algorithm and nothing else.
-tio-dsp = { path = "../../tio-dsp" }
+twinleaf-dsp = { version = "0.1", path = "../../../vendor/twinleaf-rust/twinleaf-dsp" }
 
 [dev-dependencies]
 # For the reply types a test reads back from the device.

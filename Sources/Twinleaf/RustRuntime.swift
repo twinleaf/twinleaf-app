@@ -530,7 +530,7 @@ final class RustRuntime {
     }()
 
     /// What an editor needs to know about a signal graph's text, as the JSON
-    /// of `tio_dsp::lang::outline::Outline`: how to colour it, what is wrong
+    /// of `twinleaf_dsp::lang::outline::Outline`: how to colour it, what is wrong
     /// with it, the graph it describes and where each node is written. Nil
     /// where the Rust core is not available.
     static func specOutlineJSON(_ text: String) -> Data? {

@@ -1,7 +1,7 @@
 //! A private DSP device, worked through.
 //!
 //! This crate is the whole of what a lab writes to put an algorithm of its
-//! own in a signal graph: one function, in [`despike`]. It links `tio-dsp`
+//! own in a signal graph: one function, in [`despike`]. It links `twinleaf-dsp`
 //! for everything else and ships as its own binary, `labdsp`, which is a TIO
 //! device. The Twinleaf app connects to it as it connects to a sensor, plots
 //! its outputs, sets its params and edits its spec, and never learns what
@@ -9,7 +9,7 @@
 
 pub mod despike;
 
-use tio_dsp::Library;
+use twinleaf_dsp::Library;
 
 /// The public functions, and this lab's.
 pub fn library() -> Library {

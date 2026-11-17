@@ -6,7 +6,11 @@ TIO device: it mounts the sensors, publishes its own results alongside them, and
 exposes its parameters as RPCs. Whether it runs inside the app or on another
 machine is a URL.
 
-Status: M0 to M6 of §17 are implemented, and M7 but for its last step, the first four in `rust/tio-dsp`. M0 is the engine:
+Status: M0 to M7 of §17 are implemented. The engine and the language are the
+crate `twinleaf-dsp`, which began here as `rust/tio-dsp` and now lives in the
+`twinleaf-rust` workspace, at `vendor/twinleaf-rust/twinleaf-dsp`. Its command
+line is `tio dsp`. Where this document says `tiodsp` or `tio-dsp`, as it does
+wherever it was written before the move, read those. M0 is the engine:
 the signal model, the node, stage and kernel traits, lane expansion, the
 scheduler and the invariance harness. M1 is the language front end: lexer,
 lossless syntax tree, parser, checker and diagnostics, behind `tiodsp check`
@@ -22,9 +26,9 @@ figure, `tiodsp graph --typst` and `--pdf`, and the private device: a build
 that adds functions of its own to the public ones, worked through in
 `rust/examples/private-dsp` and `docs/private-dsp-device.md`. M7 makes every
 function in the table run, the adaptive decorrelators among them, adds
-zero-phase filtering, `detrend` and `psd` for recordings, and `fn`. What is
-left of it is the move upstream, which has not been made. §18 lists what M2 to
-M7 left out. Written 10 September 2026.
+zero-phase filtering, `detrend` and `psd` for recordings, and `fn`, and ends
+with the move upstream. §18 lists what M2 to M7 left out, and how the move was
+made. Written 10 September 2026.
 
 ## Decisions
 
@@ -412,7 +416,7 @@ attr        := "@" ident "(" arg* ")"         # @rate(500), @pos(120, 40)
 ### As implemented
 
 The grammar the parser accepts is written out at the top of
-`rust/tio-dsp/src/lang/parser.rs`. It settles what the sketch left open:
+`twinleaf-dsp/src/lang/parser.rs`. It settles what the sketch left open:
 
 - **Precedence.** `*` and `/` bind tighter than `+` and `-`, and a pipe binds
   loosest, so `a - b | f()` filters the difference. A stage cannot be followed
@@ -860,10 +864,15 @@ tiodsp functions
 tiodsp run gradiometer.tsl --log session.tio --hdf5 gradient.h5 --threads 16
 ```
 
-Once `tio-dsp` is promoted into the `twinleaf-rust` workspace this becomes
+Since `tio-dsp` was promoted into the `twinleaf-rust` workspace this is
 `tio dsp …` alongside `monitor`, `health` and `log`, with no change to the
-engine. At that point `tio dsp serve` also subsumes `tio proxy mount`, since
-mounting sensors with an empty graph is exactly what the mount already does.
+engine: `tio dsp check`, `functions`, `graph`, `run` and `serve`, each with
+the flags above, but for `--listen loopback|all` in place of a URL, as the
+other `tio` servers have it. There is no `tiodsp` binary any more. A private
+build is still its own binary, and gets the same command line from the
+library. `tio dsp serve` overlaps `tio proxy --mount`, since mounting sensors
+with an empty graph is exactly what the mount already does. Nothing has been
+done to retire the one for the other.
 
 ## 16. Proving it correct
 
@@ -1321,10 +1330,29 @@ should be at every timestamp.
   place, so the editor's edit at either is an edit of the function.
 - **A function is not checked until it is called.** A body that could never
   check goes unreported, and the function is reported as unused instead.
-- **`tio-dsp` has not been moved upstream.** Promoting it into
-  `twinleaf-rust` as `twinleaf-dsp`, and exposing it as `tio dsp`, changes
-  another repository and was left for its owner to start. The crate still
-  names no app type in its public interface, which is what the move needs.
+- **`tio-dsp` is upstream, as `twinleaf-dsp`.** The crate moved into the
+  `twinleaf-rust` workspace with its tests, fixtures and example spec, and
+  nothing in the engine or the language changed on the way. It could, because
+  it never named an app type. The bridge and `rust/examples/private-dsp` link
+  it by path into `vendor/twinleaf-rust`, and the app's lockfile lost the
+  Typst tree, which only the command line uses.
+- **`tio dsp` is the command line, and there is one of it.** It is parsed by
+  clap, as the rest of `tio` is, so it has `--help` and shell completions,
+  and it lives in the library, behind the `cli` feature, so that a private
+  build's `main` is still one call. `tio` hands its `dsp` subcommand to it
+  whole and exits with its status. The standalone `tiodsp` binary is gone.
+  `serve --all-interfaces` became `--listen all`, to match `tio proxy`. The
+  device a public build serves still answers `tiodsp` to `dev.name`.
+- **It follows the house it moved into.** The manifest has the workspace's
+  metadata, lint and minimum Rust. The doc comments were reworded to
+  upstream's prose rule and the crate was added to the test that enforces
+  it. The command-line tests run in process, through writers, and one test
+  in `twinleaf-tools` runs `tio dsp` itself. The fixtures are pinned to LF
+  line endings, since they are compared byte for byte.
+- **What the move costs upstream.** The optional `typst` feature brings 183
+  packages into that workspace's lockfile, none of them built by default,
+  and moves one locked package forward, `rustix` 1.1.4 to 1.1.6. The crate
+  kept its Apache-2.0 licence, where the others there are MIT.
 - **Not done.** `mix`, `xcorr_align` and `noise_floor` from §9 have no
   signature yet. A spectrum cannot be served, so the app does not plot one
   from a graph; it draws the spectrum of any stream itself. Stages with

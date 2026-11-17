@@ -1,5 +1,5 @@
 # A private stage in a public graph. `despike` is labdsp's own; everything
-# around it is tiodsp's.
+# around it is `tio dsp`'s.
 #
 #   labdsp serve lab.tsl --mount udp://127.0.0.1:17856
 

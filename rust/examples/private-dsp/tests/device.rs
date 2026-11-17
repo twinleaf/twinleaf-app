@@ -3,16 +3,16 @@
 
 use labdsp::{despike, library};
 use std::sync::Arc;
-use tio_dsp::client::{read_spec, write_spec, TransferError};
-use tio_dsp::lang;
-use tio_dsp::lang::builtins::{Rule, Signals};
-use tio_dsp::lower::{lower, LowerError, SourceFacts};
-use tio_dsp::run::RunOptions;
-use tio_dsp::serve::Device;
-use tio_dsp::{Block, Graph, Options, RunId};
 use twinleaf::proto::rpc::{Method, RpcError};
 use twinleaf::proto::sync::Epoch;
 use twinleaf::proto::SessionId;
+use twinleaf_dsp::client::{read_spec, write_spec, TransferError};
+use twinleaf_dsp::lang;
+use twinleaf_dsp::lang::builtins::{Rule, Signals};
+use twinleaf_dsp::lower::{lower, LowerError, SourceFacts};
+use twinleaf_dsp::run::RunOptions;
+use twinleaf_dsp::serve::Device;
+use twinleaf_dsp::{Block, Graph, Options, RunId};
 
 const SPEC: &str = "\
 source a = /0/field @rate(500) @channels(x, y) @unit(nT)

@@ -8,7 +8,7 @@ import UniformTypeIdentifiers
 
 /// What the Rust front end makes of a signal graph's text: how to colour it,
 /// what is wrong with it, the graph it describes, and where in the text each
-/// part of that graph is written. Mirrors `tio_dsp::lang::outline::Outline`.
+/// part of that graph is written. Mirrors `twinleaf_dsp::lang::outline::Outline`.
 ///
 /// Offsets count UTF-16 code units, as `NSRange` does.
 struct SignalGraphOutline: Decodable, Equatable {

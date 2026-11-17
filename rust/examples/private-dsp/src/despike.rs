@@ -10,11 +10,11 @@
 //! It stands in here for an algorithm a lab would rather not publish. What
 //! makes it private is only where it is compiled: nothing below is special.
 
-use tio_dsp::lang::builtins::{optional, ArgKind, Builtin, Rule, Signals};
-use tio_dsp::lower::Call;
-use tio_dsp::node::{arity, fingerprint, Coupling, Inputs, Kernel, Node, Stage};
-use tio_dsp::signal::{Domains, SignalType, Span};
-use tio_dsp::BuildError;
+use twinleaf_dsp::lang::builtins::{optional, ArgKind, Builtin, Rule, Signals};
+use twinleaf_dsp::lower::Call;
+use twinleaf_dsp::node::{arity, fingerprint, Coupling, Inputs, Kernel, Node, Stage};
+use twinleaf_dsp::signal::{Domains, SignalType, Span};
+use twinleaf_dsp::BuildError;
 
 /// How a spec writes the function, and how its result is typed.
 pub const FUNCTION: Builtin = Builtin {

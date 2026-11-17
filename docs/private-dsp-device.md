@@ -14,7 +14,7 @@ There are two ways to build such a device. Most labs want the first.
 | **Be a TIO device of your own** | Everything | Plotting, logging, export and settings in the app |
 
 A worked example of the first is in `rust/examples/private-dsp`. It builds
-`labdsp`, which is `tiodsp` with one more function, `despike`. The rest of
+`labdsp`, which is `tio dsp` with one more function, `despike`. The rest of
 this page follows it.
 
 ## What to link
@@ -23,11 +23,15 @@ One crate:
 
 ```toml
 [dependencies]
-tio-dsp = { path = "…/rust/tio-dsp" }
+twinleaf-dsp = { path = "…/twinleaf-rust/twinleaf-dsp" }
 ```
 
-`tio-dsp` is Apache-2.0. Your crate links it and is not part of it: nothing
-of yours needs to be in this repository, and nothing here needs changing.
+`twinleaf-dsp` is a crate of the `twinleaf-rust` workspace, beside the
+`twinleaf` library and the `tio` tools. The example names this repository's
+copy of it, at `vendor/twinleaf-rust/twinleaf-dsp`. Once the crate is
+published from there, a `git` or a version dependency does as well. It is
+Apache-2.0. Your crate links it and is not part of it: nothing of yours needs
+to be in that repository, and nothing there needs changing.
 
 ## What to write
 
@@ -124,7 +128,7 @@ pub fn library() -> Library {
 }
 
 fn main() -> ExitCode {
-    tio_dsp::cli::run(library())
+    twinleaf_dsp::cli::run(library())
 }
 ```
 
@@ -132,7 +136,7 @@ A name that is already a function's is refused, so a private function cannot
 quietly stand in for a public one. The name given to the library is what the
 command line calls itself and what the device answers to `dev.name`.
 
-The binary is then `tiodsp` under another name:
+The binary is then `tio dsp` under another name:
 
 ```sh
 labdsp functions                      # the public functions, and yours
@@ -204,10 +208,10 @@ app cannot tell and does not need to. A well-formed device:
 - says what is wrong in log messages, at warning or error level.
 
 `twinleaf-device`, in `twinleaf-rust`, is the device side of the protocol.
-From this crate, `tio_dsp::publish::Publisher` turns blocks of samples you
-computed into a device's metadata and sample packets, and
-`tio_dsp::serve::Hosted` is a whole device on a loopback port, if you want
-those halves without the language.
+From `twinleaf-dsp`, `twinleaf_dsp::publish::Publisher` turns blocks of
+samples you computed into a device's metadata and sample packets, and
+`twinleaf_dsp::serve::Hosted` is a whole device on a loopback port, if you
+want those halves without the language.
 
 Without `dsp.spec.size` the app offers no editor for the device, which is
 right: there is no text to edit.

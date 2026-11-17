@@ -1,7 +1,9 @@
 [workspace]
 # `examples/private-dsp` is a worked example and not part of the app: a DSP
-# device with a function of its own, built on `tio-dsp`.
-members = ["tio-bridge", "tio-dsp", "examples/private-dsp"]
+# device with a function of its own, built on `twinleaf-dsp`. That crate, the
+# signal graph itself, is in the twinleaf-rust workspace, under
+# `../vendor/twinleaf-rust/twinleaf-dsp`.
+members = ["tio-bridge", "examples/private-dsp"]
 resolver = "2"
 
 # Full debug info in release builds, packed into .dSYM bundles next to the

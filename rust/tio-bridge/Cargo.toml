@@ -11,7 +11,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["serial", "firmware", "mdns"]
-serial = ["twinleaf/serial", "tio-dsp/serial"]
+serial = ["twinleaf/serial", "twinleaf-dsp/serial"]
 hdf5 = ["twinleaf/hdf5"]
 # Firmware update support: lazy availability check + flashing, backed by the
 # GitHub firmware catalog (pulls in an HTTP client + TLS via twinleaf).
@@ -29,5 +29,6 @@ log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 twinleaf = { version = "2.0", path = "../../vendor/twinleaf-rust/twinleaf", default-features = false, features = ["processing"] }
-# The signal graph: hosted in process when a session has a spec.
-tio-dsp = { path = "../tio-dsp", default-features = false, features = ["serde"] }
+# The signal graph: hosted in process when a session has a spec. Its command
+# line, which is `tio dsp`, is left out.
+twinleaf-dsp = { version = "0.1", path = "../../vendor/twinleaf-rust/twinleaf-dsp", default-features = false, features = ["serde"] }
