@@ -2688,7 +2688,7 @@ final class BridgeClient: ObservableObject {
     @discardableResult
     private func loadReadableRPCs() -> Set<String> {
         guard !isInspectionMode else { return [] }
-        // `isActionRPC` (writable unit-typed) is excluded: even when the device
+        // `isActionRPC` (a typed void) is excluded: even when the device
         // reports such an RPC as readable, "reading" a unit RPC executes the
         // action — `dev.conf.save/load/reset` etc. would all fire on startup.
         let readableRPCs = devices
