@@ -10771,7 +10771,6 @@ private struct RpcRow: View, @MainActor Equatable {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(!rpc.writable)
             .frame(width: 128, alignment: .trailing)
             .help("Run \(rpc.name)")
         } else if rpc.isEnableSwitchRPC {
@@ -11022,7 +11021,7 @@ private struct UnifiedRpcRow: View {
     private var unifiedControl: some View {
         if primary.isActionRPC {
             Button {
-                for rpc in rpcs where rpc.writable {
+                for rpc in rpcs where rpc.isActionRPC {
                     bridge.callRpc(rpc)
                 }
             } label: {
@@ -11033,7 +11032,6 @@ private struct UnifiedRpcRow: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .disabled(!primary.writable)
             .frame(width: 128, alignment: .trailing)
             .help("Run \(primary.name) on all sensors")
         } else if primary.isEnableSwitchRPC {

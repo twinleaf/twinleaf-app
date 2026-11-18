@@ -491,7 +491,7 @@ struct RpcInfo: Codable, Hashable, Identifiable {
     }
 
     var isVisibleInRPCList: Bool {
-        !name.isEmpty && !isInternalRPC && ((readable || writable) || isCaptureRPC)
+        !name.isEmpty && !isInternalRPC && ((readable || writable) || isCaptureRPC || isActionRPC)
     }
 
     var isInternalRPC: Bool {
@@ -536,8 +536,12 @@ struct RpcInfo: Codable, Hashable, Identifiable {
         hasMetadata && baseArgType == "bool"
     }
 
+    /// An RPC called with no argument for its effect, like `dev.reboot`.
+    /// Firmware reports these as a typed void with no access flags at all
+    /// (metadata 0x8000, permissions `---`), so the writable flag says
+    /// nothing about whether one can be run.
     var isActionRPC: Bool {
-        writable && hasMetadata && baseArgType == "unit"
+        hasMetadata && baseArgType == "unit"
     }
 
     var isCaptureRPC: Bool {
