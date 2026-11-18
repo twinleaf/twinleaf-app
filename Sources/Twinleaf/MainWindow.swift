@@ -24,6 +24,9 @@ private struct PlotCanvasFrameHost: View {
     let logY: Bool
     let showKey: Bool
     let showsTimeseriesXAxisLabels: Bool
+    /// True while the graph follows live data rather than a paused view or a
+    /// saved log.
+    var followsLiveData = false
     var topPlotInset: CGFloat = 0
     var rightAxisReservationCount = 0
     var legendSafeAreaInsets = EdgeInsets()
@@ -78,7 +81,10 @@ private struct PlotCanvasFrameHost: View {
             otherDropTypes: otherDropTypes,
             onOtherItemsDropped: onOtherItemsDropped,
             onOtherItemsHover: onOtherItemsHover,
-            legendMenu: legendMenu
+            legendMenu: legendMenu,
+            // Scrolling redraws at the display's rate, so it stops whenever
+            // the governor is holding redraws back to save power.
+            scrollsSmoothly: followsLiveData && PlotRefreshGovernor.shared.minimumPlotInterval == 0
         )
     }
 }
@@ -1918,6 +1924,7 @@ struct DocumentWindow: View {
                     logY: pane.viewConfig.logY,
                     showKey: showPlotKey,
                     showsTimeseriesXAxisLabels: index == paneCount - 1,
+                followsLiveData: !bridge.isPlotPaused && !bridge.isInspectionMode,
                     topPlotInset: topPlotInset(for: pane, index: index),
                     rightAxisReservationCount: rightAxisReservationCount,
                     legendSafeAreaInsets: legendSafeInsets,
@@ -3001,6 +3008,7 @@ private struct PlotPopoutWindowView: View {
                 logY: pane.viewConfig.logY,
                 showKey: showPlotKey,
                 showsTimeseriesXAxisLabels: true,
+                followsLiveData: !bridge.isPlotPaused && !bridge.isInspectionMode,
                 rightAxisReservationCount: rightAxisReservationCount,
                 legendSafeAreaInsets: geometry.safeAreaInsets,
                 onPlotWidthChange: bridge.setPlotWidthPixels,

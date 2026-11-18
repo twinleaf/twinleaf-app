@@ -306,7 +306,11 @@ struct PlotCanvas: View {
     /// on plain white with an opaque legend, and skips the interaction
     /// monitor that only makes sense inside a window.
     var rendersForPrint = false
+    /// True while the graph follows live data. A timeseries then scrolls at
+    /// the display's refresh rate instead of stepping once per data frame.
+    var scrollsSmoothly = false
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.displayScale) private var displayScale
     @AppStorage(ViewPreferenceKeys.traceColorPaletteLight) private var traceColorPaletteLightRaw = PlotTracePalette.defaultLightRawValue
     @AppStorage(ViewPreferenceKeys.traceColorPaletteDark) private var traceColorPaletteDarkRaw = PlotTracePalette.defaultDarkRawValue
     @AppStorage(ViewPreferenceKeys.yAxisHysteresis) private var yAxisHysteresis = PlotAxisHysteresis.defaultFraction
@@ -333,6 +337,7 @@ struct PlotCanvas: View {
     // properties of the class instance does not trigger SwiftUI invalidation,
     // which is exactly what we want for an internal memoization layer.
     @State private var planCache = PlotPlanCache()
+    @State private var scrollClock = PlotScrollClock()
 
     private var colors: [Color] {
         if colorScheme == .dark {
@@ -361,11 +366,21 @@ struct PlotCanvas: View {
                 let plan = computePlan()
                 let rect = plotRect(size: geometry.size)
                 let plotWidth = rect.width
+                let scroll = liveScroll(for: plan)
+                // The cursor reads the window as it is drawn right now, which
+                // while scrolling ends a little before the plan's.
+                let cursorPlan = scroll.map { scroll in
+                    plan?.endingAt(scrollClock.displayEnd(
+                        at: Date.timeIntervalSinceReferenceDate,
+                        dataEnd: scroll.dataEnd,
+                        maximumLag: scroll.maximumLag
+                    ))
+                } ?? plan
                 let activeCursorSelection = cursorLocation.flatMap {
                     self.cursorSelection(
                         size: geometry.size,
                         location: $0,
-                        plan: plan,
+                        plan: cursorPlan,
                         snapsToData: !cursorModifiers.freesCursor
                     )
                 }
@@ -373,7 +388,7 @@ struct PlotCanvas: View {
 
                 let axisDescriptor = axisDescriptor(for: plan)
 
-                plotLayers(size: geometry.size, rect: rect, plan: plan, axisDescriptor: axisDescriptor)
+                plotLayers(size: geometry.size, rect: rect, plan: plan, axisDescriptor: axisDescriptor, scroll: scroll)
                 .frame(width: geometry.size.width, height: geometry.size.height)
                 .overlay {
                     if !axisDescriptor.hasData {
@@ -503,7 +518,12 @@ struct PlotCanvas: View {
         }
     }
 
-    private func traceLayer(size: CGSize, rect: CGRect, plan: PlotDataPlan?) -> PlotTraceLayer {
+    private func traceLayer(
+        size: CGSize,
+        rect: CGRect,
+        plan: PlotDataPlan?,
+        scroll: PlotLiveScroll?
+    ) -> PlotTraceLayer {
         PlotTraceLayer(
             revision: plotRevision,
             canvasSize: size,
@@ -513,15 +533,68 @@ struct PlotCanvas: View {
             plan: plan,
             series: series,
             mode: mode,
-            effectiveAxisMode: effectiveVerticalAxisMode
+            effectiveAxisMode: effectiveVerticalAxisMode,
+            leadInSeconds: scroll?.maximumLag ?? 0,
+            // A scrolling trace has to land in the same frame as the offset
+            // computed for it, or it jumps back for a frame on every update.
+            rendersAsynchronously: scroll == nil
         )
+    }
+
+    /// How the trace scrolls between data frames, or nil when it stays put:
+    /// anything but a live timeseries that has data.
+    private func liveScroll(for plan: PlotDataPlan?) -> PlotLiveScroll? {
+        guard scrollsSmoothly, !rendersForPrint, mode == .timeseries,
+              let plan, plan.hasData else {
+            return nil
+        }
+        let window = max(windowSeconds, 1e-6)
+        scrollClock.noteFrame(
+            revision: plotRevision,
+            dataEnd: plan.xRange.upperBound,
+            at: Date.timeIntervalSinceReferenceDate
+        )
+        return PlotLiveScroll(
+            dataEnd: plan.xRange.upperBound,
+            windowSeconds: window,
+            maximumLag: PlotScrollClock.maximumLag(windowSeconds: window)
+        )
+    }
+
+    /// The trace, slid right by however far the drawn window currently ends
+    /// before the newest data. Sliding moves the layer the trace was already
+    /// drawn into; the trace itself is redrawn only when a data frame arrives.
+    private func scrollingTraceLayer(
+        size: CGSize,
+        rect: CGRect,
+        plan: PlotDataPlan?,
+        scroll: PlotLiveScroll?
+    ) -> some View {
+        let clock = scrollClock
+        let scale = max(displayScale, 1)
+        return TimelineView(.animation(paused: scroll == nil)) { timeline in
+            let lag = scroll.map {
+                $0.dataEnd - clock.displayEnd(
+                    at: timeline.date.timeIntervalSinceReferenceDate,
+                    dataEnd: $0.dataEnd,
+                    maximumLag: $0.maximumLag
+                )
+            } ?? 0
+            let points = lag / (scroll?.windowSeconds ?? 1) * Double(rect.width)
+            traceLayer(size: size, rect: rect, plan: plan, scroll: scroll)
+                .equatable()
+                // Whole device pixels, so the lines stay as sharp as drawn.
+                .offset(x: (CGFloat(points) * scale).rounded() / scale)
+        }
+        .clipShape(PlotHorizontalClip(minX: rect.minX, maxX: rect.maxX))
     }
 
     private func plotLayers(
         size: CGSize,
         rect: CGRect,
         plan: PlotDataPlan?,
-        axisDescriptor: PlotAxisDescriptor
+        axisDescriptor: PlotAxisDescriptor,
+        scroll: PlotLiveScroll?
     ) -> some View {
         ZStack {
             PlotAxesLayer(
@@ -533,8 +606,7 @@ struct PlotCanvas: View {
             )
             .equatable()
 
-            traceLayer(size: size, rect: rect, plan: plan)
-                .equatable()
+            scrollingTraceLayer(size: size, rect: rect, plan: plan, scroll: scroll)
 
             PlotRecordingOffsetLayer(
                 canvasSize: size,
@@ -758,7 +830,7 @@ struct PlotCanvas: View {
             return nil
         }
 
-        let exportView = traceLayer(size: size, rect: rect, plan: plan)
+        let exportView = traceLayer(size: size, rect: rect, plan: plan, scroll: nil)
             .frame(width: size.width, height: size.height)
         let renderer = ImageRenderer(content: exportView)
         renderer.proposedSize = ProposedViewSize(width: size.width, height: size.height)
@@ -1807,6 +1879,10 @@ private struct PlotTraceLayer: View, Equatable {
     let series: [PlotSeries]
     let mode: PlotMode
     let effectiveAxisMode: VerticalAxisMode
+    /// How far before the x range points are still drawn. A scrolling trace
+    /// is slid right by up to this much, bringing them into view.
+    var leadInSeconds: Double = 0
+    var rendersAsynchronously = true
 
     // `nonisolated` so the conformance can be referenced off the main actor.
     // SwiftUI's View protocol pulls types onto the main actor, but the
@@ -1820,10 +1896,12 @@ private struct PlotTraceLayer: View, Equatable {
             && lhs.traceColorSignature == rhs.traceColorSignature
             && lhs.mode == rhs.mode
             && lhs.effectiveAxisMode == rhs.effectiveAxisMode
+            && lhs.leadInSeconds == rhs.leadInSeconds
+            && lhs.rendersAsynchronously == rhs.rendersAsynchronously
     }
 
     var body: some View {
-        Canvas(rendersAsynchronously: true) { context, size in
+        Canvas(rendersAsynchronously: rendersAsynchronously) { context, size in
             let profileStart = PlotProfiler.start()
             drawAll(context: &context, size: size)
             PlotProfiler.finish(
@@ -1848,7 +1926,7 @@ private struct PlotTraceLayer: View, Equatable {
         // Precompute axis transforms once per axis. The inner loop then
         // does at most one log10 per point instead of six.
         let xMap = AxisMapping(range: xRange, useLog: useLogX)
-        let xLower = xRange.lowerBound
+        let xLower = xRange.lowerBound - leadInSeconds
         let xUpper = xRange.upperBound
         var pixelBuffer: [CGPoint] = []
 
@@ -2030,6 +2108,98 @@ private struct PlotDataPlan {
     let useLogX: Bool
     let useLogY: Bool
     let hasData: Bool
+
+    /// The same plan with its x range moved to end at `end`.
+    func endingAt(_ end: Double) -> PlotDataPlan {
+        PlotDataPlan(
+            xRange: (end - (xRange.upperBound - xRange.lowerBound))...end,
+            sharedYRange: sharedYRange,
+            seriesYRanges: seriesYRanges,
+            useLogX: useLogX,
+            useLogY: useLogY,
+            hasData: hasData
+        )
+    }
+}
+
+/// What a live timeseries needs to scroll between data frames.
+private struct PlotLiveScroll {
+    /// The newest time in the current frame, where its x range ends.
+    let dataEnd: Double
+    let windowSeconds: Double
+    /// The most the drawn window may end before `dataEnd`.
+    let maximumLag: Double
+}
+
+/// Clips to a band of x, at any height.
+private struct PlotHorizontalClip: Shape {
+    let minX: CGFloat
+    let maxX: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        Path(CGRect(x: minX, y: rect.minY, width: max(0, maxX - minX), height: rect.height))
+    }
+}
+
+/// Works out where a live timeseries window should end at any instant, so the
+/// trace can scroll at the display's rate while data arrives in frames.
+///
+/// Each frame says "the newest sample is at data time E" at some wall time.
+/// The clock tracks the smoothed difference between the two and reads data
+/// time off the wall clock in between. The window is drawn ending one frame
+/// interval behind that estimate (more when frames arrive unevenly), so the
+/// next frame's data is already there by the time the window reaches it.
+final class PlotScrollClock {
+    /// The most the drawn window may end before the newest data. Frames carry
+    /// this much history ahead of the window; it must not exceed
+    /// `live_scroll_lead_in_seconds` in the Rust core.
+    static func maximumLag(windowSeconds: Double) -> Double {
+        min(0.25, windowSeconds * 0.25)
+    }
+
+    private var lastRevision: UInt64?
+    private var lastArrival: Double?
+    /// Smoothed data time minus wall time, over `sampleCount` frames.
+    private var offset: Double?
+    private var sampleCount = 0
+    /// Smoothed time between frames.
+    private var period = 1.0 / 30.0
+    /// How far behind the estimate recent frames' newest data has been.
+    private var lateness = 0.0
+
+    func noteFrame(revision: UInt64, dataEnd: Double, at wallTime: Double) {
+        guard revision != lastRevision, dataEnd.isFinite else { return }
+        lastRevision = revision
+
+        let sample = dataEnd - wallTime
+        let gap = lastArrival.map { wallTime - $0 }
+        lastArrival = wallTime
+
+        // Start over after a pause, a stall or a jump in the data's time.
+        guard let offset, let gap, gap < 0.5, abs(sample - offset) < 0.5 else {
+            self.offset = sample
+            sampleCount = 1
+            lateness = 0
+            return
+        }
+
+        sampleCount += 1
+        // A plain average at first, settling into a slow follower that rides
+        // out uneven arrivals yet still tracks drift between the two clocks.
+        let weight = max(0.03, 1 / Double(sampleCount))
+        let updated = offset + (sample - offset) * weight
+        self.offset = updated
+        period += (gap - period) * 0.1
+        lateness = max(updated - sample, lateness * 0.98)
+    }
+
+    /// Where the window should end at `wallTime`: never past the newest data,
+    /// and never further behind it than `maximumLag`.
+    func displayEnd(at wallTime: Double, dataEnd: Double, maximumLag: Double) -> Double {
+        guard let offset else { return dataEnd }
+        let estimate = wallTime + offset - (period + lateness + 0.002)
+        return min(dataEnd, max(dataEnd - maximumLag, estimate))
+    }
 }
 
 private enum PlotAxisRangeUpdateCadence {

@@ -2013,7 +2013,7 @@ impl ColumnState {
 
     fn ensure_fpcs_configured(&mut self, pane_id: usize, view: &ViewConfig) {
         let ratio = fpcs_ratio(self.sample_rate, view);
-        let capacity = target_plot_points(view).max(2);
+        let capacity = fpcs_capacity(view);
         if self
             .fpcs_by_pane
             .get(&pane_id)
@@ -2032,9 +2032,10 @@ impl ColumnState {
     /// leaving a gap across the unselected interval.
     fn rebuild_fpcs(&mut self, pane_id: usize, view: &ViewConfig) {
         let ratio = fpcs_ratio(self.sample_rate, view);
-        let capacity = target_plot_points(view).max(2);
+        let capacity = fpcs_capacity(view);
         let mut fpcs = StreamingFpcs::new(ratio, capacity);
-        for point in self.recent_points(view.window_seconds) {
+        let replay_seconds = view.window_seconds + live_scroll_lead_in_seconds(view);
+        for point in self.recent_points(replay_seconds) {
             fpcs.process_point(point);
         }
         self.fpcs_by_pane.insert(pane_id, fpcs);
@@ -6505,6 +6506,21 @@ fn target_plot_points(view: &ViewConfig) -> usize {
     ((width as f64 * multiplier).round() as usize).clamp(64, 8_192)
 }
 
+/// How much history before the window a live timeseries frame carries. The app
+/// draws the window's right edge slightly behind the newest sample and slides
+/// the trace toward it between frames; this is the most it may lag by, and
+/// `PlotScrollClock.maximumLag` in the app must not exceed it.
+fn live_scroll_lead_in_seconds(view: &ViewConfig) -> f64 {
+    (view.window_seconds.max(1e-6) * 0.25).min(0.25)
+}
+
+/// Ring size for a pane's streaming decimator: a full window of points plus
+/// room for the lead-in before it.
+fn fpcs_capacity(view: &ViewConfig) -> usize {
+    let target = target_plot_points(view).max(2);
+    target + target / 4
+}
+
 fn fpcs_ratio(sample_rate: f64, view: &ViewConfig) -> usize {
     let window_samples = sample_rate.max(1.0) * view.window_seconds.max(1e-6);
     ((2.0 * window_samples) / target_plot_points(view) as f64)
@@ -6905,6 +6921,9 @@ fn build_live_timeseries_series<'a>(
         .map(|end| end - view.window_seconds.max(1e-6))
         .unwrap_or(f64::NEG_INFINITY);
     let window_end = view_end.unwrap_or(f64::INFINITY);
+    // Points are sent from a little before the window so the app can scroll
+    // the trace between frames without uncovering a gap at the left edge.
+    let points_start = window_start - live_scroll_lead_in_seconds(view);
 
     let mut series = Vec::new();
     let mut point_count = 0usize;
@@ -6943,9 +6962,9 @@ fn build_live_timeseries_series<'a>(
         let points = match view.decimation_method {
             DecimationMethod::Fpcs => state
                 .fpcs_for_pane(pane_id)
-                .map(|fpcs| fpcs.point_source_since(window_start))
-                .unwrap_or_else(|| state.point_source_between(window_start, window_end)),
-            DecimationMethod::None => state.point_source_between(window_start, window_end),
+                .map(|fpcs| fpcs.point_source_since(points_start))
+                .unwrap_or_else(|| state.point_source_between(points_start, window_end)),
+            DecimationMethod::None => state.point_source_between(points_start, window_end),
         };
 
         // FPCS retains points since window_start regardless of the upper
@@ -8894,6 +8913,35 @@ mod tests {
     }
 
     #[test]
+    fn live_timeseries_frames_carry_a_lead_in_before_the_window() {
+        let key = ColumnKeyDto::raw("/0".to_string(), 1, 0);
+        let mut state = ColumnState::new("a".to_string(), "V".to_string(), 100.0);
+        for i in 0..2000 {
+            state.push_raw(
+                Point {
+                    x: i as f64 * 0.01,
+                    y: 1.0,
+                },
+                1e9,
+            );
+        }
+        let states = HashMap::from([(key.clone(), state)]);
+        let mut view = ViewConfig::default();
+        view.window_seconds = 1.0;
+        assert_eq!(live_scroll_lead_in_seconds(&view), 0.25);
+
+        // One second of window plus a quarter second ahead of it, at 100 Hz.
+        let pane = vec![key];
+        let (view_end, series, _) = build_live_timeseries_series(0, &states, &pane, &view, None);
+        assert_eq!(view_end, Some(1999.0 * 0.01));
+        assert!((125..=127).contains(&series[0].points.len()));
+
+        // The lead-in is capped for long windows.
+        view.window_seconds = 100.0;
+        assert_eq!(live_scroll_lead_in_seconds(&view), 0.25);
+    }
+
+    #[test]
     fn noise_floor_estimate_tracks_the_spectrum_it_is_taken_from() {
         // Deterministic white noise of a known level, with a strong tone on
         // top so peak rejection is exercised.
@@ -9575,7 +9623,7 @@ mod tests {
         state.ensure_fpcs_configured(0, &view);
         assert_eq!(
             state.fpcs_for_pane(0).unwrap().capacity,
-            target_plot_points(&view)
+            fpcs_capacity(&view)
         );
 
         for index in 0..100 {
