@@ -8833,10 +8833,14 @@ mod tests {
         assert!(enabled.meta.flags().contains(RpcMetaFlags::READABLE));
         assert!(enabled.meta.flags().contains(RpcMetaFlags::WRITABLE));
 
-        let action = RpcDescriptor::from_meta(RpcMetaFlags::WRITABLE.bits(), "test.go".to_string());
+        // A device reports an action as a typed void with no access flags.
+        let action = RpcDescriptor::from_meta(0x8000, "test.go".to_string());
         assert_eq!(rpc_arg_type(&action), "unit");
         assert_eq!(rpc_size(&action), 0);
-        assert_eq!(action.meta.perm_str(), "-W-");
+        assert_eq!(action.meta.perm_str(), "---");
+        assert!(!rpc_readable(&action));
+        assert!(!rpc_unknown(&action));
+        assert!(!action.meta.flags().contains(RpcMetaFlags::WRITABLE));
 
         let capture = RpcDescriptor::from_meta(
             RpcMetaFlags::READABLE.bits() | RpcMetaFlags::CAPTURE.bits(),
