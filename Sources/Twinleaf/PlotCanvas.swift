@@ -2,6 +2,7 @@
 
 import SwiftUI
 import Foundation
+import QuartzCore
 import UniformTypeIdentifiers
 
 #if os(macOS)
@@ -338,6 +339,7 @@ struct PlotCanvas: View {
     // which is exactly what we want for an internal memoization layer.
     @State private var planCache = PlotPlanCache()
     @State private var scrollClock = PlotScrollClock()
+    @State private var scrollLines = PlotScrollingLines()
 
     private var colors: [Color] {
         if colorScheme == .dark {
@@ -370,11 +372,7 @@ struct PlotCanvas: View {
                 // The cursor reads the window as it is drawn right now, which
                 // while scrolling ends a little before the plan's.
                 let cursorPlan = scroll.map { scroll in
-                    plan?.endingAt(scrollClock.displayEnd(
-                        at: Date.timeIntervalSinceReferenceDate,
-                        dataEnd: scroll.dataEnd,
-                        maximumLag: scroll.maximumLag
-                    ))
+                    plan?.endingAt(scroll.displayEnd(at: CACurrentMediaTime()))
                 } ?? plan
                 let activeCursorSelection = cursorLocation.flatMap {
                     self.cursorSelection(
@@ -526,7 +524,7 @@ struct PlotCanvas: View {
         size: CGSize,
         rect: CGRect,
         plan: PlotDataPlan?,
-        scroll: PlotLiveScroll?
+        scroll: PlotLiveScroll? = nil
     ) -> PlotTraceLayer {
         PlotTraceLayer(
             revision: plotRevision,
@@ -539,8 +537,8 @@ struct PlotCanvas: View {
             mode: mode,
             effectiveAxisMode: effectiveVerticalAxisMode,
             leadInSeconds: scroll?.maximumLag ?? 0,
-            // A scrolling trace has to land in the same frame as the offset
-            // computed for it, or it jumps back for a frame on every update.
+            // A scrolling canvas has to land in the same frame as the offset
+            // computed for it.
             rendersAsynchronously: scroll == nil
         )
     }
@@ -553,44 +551,79 @@ struct PlotCanvas: View {
             return nil
         }
         let window = max(windowSeconds, 1e-6)
-        scrollClock.noteFrame(
+        let maximumLag = PlotScrollClock.maximumLag(windowSeconds: window)
+        guard let playout = scrollClock.noteFrame(
             revision: plotRevision,
             dataEnd: plan.xRange.upperBound,
-            at: Date.timeIntervalSinceReferenceDate
-        )
-        return PlotLiveScroll(
-            dataEnd: plan.xRange.upperBound,
-            windowSeconds: window,
-            maximumLag: PlotScrollClock.maximumLag(windowSeconds: window)
-        )
+            at: CACurrentMediaTime(),
+            maximumLag: maximumLag
+        ) else {
+            return nil
+        }
+        return PlotLiveScroll(windowSeconds: window, maximumLag: maximumLag, playout: playout)
     }
 
     /// The trace, slid right by however far the drawn window currently ends
-    /// before the newest data. Sliding moves the layer the trace was already
-    /// drawn into; the trace itself is redrawn only when a data frame arrives.
+    /// before the newest data.
+    ///
+    /// A trace with few enough points is drawn in layers that Core Animation
+    /// slides on its own, which keeps the motion even while the main thread
+    /// is busy. A denser one is drawn once per data frame in a canvas, and
+    /// the canvas is moved from here on every display refresh.
+    @ViewBuilder
     private func scrollingTraceLayer(
         size: CGSize,
         rect: CGRect,
         plan: PlotDataPlan?,
         scroll: PlotLiveScroll?
     ) -> some View {
-        let clock = scrollClock
-        let scale = max(displayScale, 1)
-        return TimelineView(.animation(paused: scroll == nil)) { timeline in
-            let lag = scroll.map {
-                $0.dataEnd - clock.displayEnd(
-                    at: timeline.date.timeIntervalSinceReferenceDate,
-                    dataEnd: $0.dataEnd,
-                    maximumLag: $0.maximumLag
+        if let scroll, let plan {
+            let lines = scrollLines.lines(
+                for: PlotScrollingLines.Key(
+                    revision: plotRevision,
+                    plotRect: rect,
+                    effectiveAxisMode: effectiveVerticalAxisMode,
+                    leadInSeconds: scroll.maximumLag
                 )
-            } ?? 0
-            let points = lag / (scroll?.windowSeconds ?? 1) * Double(rect.width)
-            traceLayer(size: size, rect: rect, plan: plan, scroll: scroll)
+            ) {
+                plotTracePolylines(
+                    plan: plan,
+                    series: series,
+                    // In the scrolling layers x runs from the plot's left edge.
+                    rect: CGRect(x: 0, y: rect.minY, width: rect.width, height: rect.height),
+                    effectiveAxisMode: effectiveVerticalAxisMode,
+                    leadInSeconds: scroll.maximumLag
+                ).map { plotSimplifiedPolyline($0) }
+            }
+            if scrollLines.slidesInLayers {
+                PlotScrollingTrace(
+                    revision: plotRevision,
+                    canvasSize: size,
+                    plotRect: rect,
+                    traceColors: colors,
+                    traceColorSignature: traceColorSignature,
+                    lines: lines,
+                    effectiveAxisMode: effectiveVerticalAxisMode,
+                    scroll: scroll
+                )
+                .allowsHitTesting(false)
+            } else {
+                let scale = max(displayScale, 1)
+                TimelineView(.animation) { timeline in
+                    let lag = scroll.lag(at: CACurrentMediaTime() + timeline.date.timeIntervalSinceNow)
+                    let points = lag / scroll.windowSeconds * Double(rect.width)
+                    traceLayer(size: size, rect: rect, plan: plan, scroll: scroll)
+                        .equatable()
+                        // Whole device pixels, so the lines stay as sharp as drawn.
+                        .offset(x: (CGFloat(points) * scale).rounded() / scale)
+                }
+                .clipShape(PlotHorizontalClip(minX: rect.minX, maxX: rect.maxX))
+            }
+        } else {
+            traceLayer(size: size, rect: rect, plan: plan)
                 .equatable()
-                // Whole device pixels, so the lines stay as sharp as drawn.
-                .offset(x: (CGFloat(points) * scale).rounded() / scale)
+                .clipShape(PlotHorizontalClip(minX: rect.minX, maxX: rect.maxX))
         }
-        .clipShape(PlotHorizontalClip(minX: rect.minX, maxX: rect.maxX))
     }
 
     private func plotLayers(
@@ -834,7 +867,7 @@ struct PlotCanvas: View {
             return nil
         }
 
-        let exportView = traceLayer(size: size, rect: rect, plan: plan, scroll: nil)
+        let exportView = traceLayer(size: size, rect: rect, plan: plan)
             .frame(width: size.width, height: size.height)
         let renderer = ImageRenderer(content: exportView)
         renderer.proposedSize = ProposedViewSize(width: size.width, height: size.height)
@@ -1917,54 +1950,141 @@ private struct PlotTraceLayer: View, Equatable {
     }
 
     private func drawAll(context: inout GraphicsContext, size: CGSize) {
-        let rect = plotRect
-
         guard let plan, plan.hasData else { return }
 
-        let useLogX = plan.useLogX
-        let useLogY = plan.useLogY
-        let xRange = plan.xRange
-        let sharedYRange = plan.sharedYRange
-        let seriesYRanges = plan.seriesYRanges
-
-        // Precompute axis transforms once per axis. The inner loop then
-        // does at most one log10 per point instead of six.
-        let xMap = AxisMapping(range: xRange, useLog: useLogX)
-        let xLower = xRange.lowerBound - leadInSeconds
-        let xUpper = xRange.upperBound
-        var pixelBuffer: [CGPoint] = []
-
-        for (index, item) in series.enumerated() {
-            let yRange = effectiveAxisMode == .independent
-                ? seriesYRanges[item.id] ?? sharedYRange
-                : sharedYRange
-            let yMap = AxisMapping(range: yRange, useLog: useLogY)
-
-            pixelBuffer.removeAll(keepingCapacity: true)
-            pixelBuffer.reserveCapacity(item.points.count)
-
-            for point in item.points {
-                if !point.x.isFinite || !point.y.isFinite { continue }
-                if useLogX && point.x <= 0 { continue }
-                if useLogY && point.y <= 0 { continue }
-                if point.x < xLower || point.x > xUpper { continue }
-                let xFrac = xMap.fraction(point.x)
-                let yFrac = yMap.fraction(point.y)
-                pixelBuffer.append(CGPoint(
-                    x: rect.minX + rect.width * CGFloat(xFrac),
-                    y: rect.maxY - rect.height * CGFloat(yFrac)
-                ))
-            }
-            guard pixelBuffer.count >= 2 else { continue }
-
+        let polylines = plotTracePolylines(
+            plan: plan,
+            series: series,
+            rect: plotRect,
+            effectiveAxisMode: effectiveAxisMode,
+            leadInSeconds: leadInSeconds
+        )
+        for (index, points) in polylines.enumerated() where points.count >= 2 {
             var path = Path()
-            path.addLines(pixelBuffer)
+            path.addLines(points)
             context.stroke(
                 path,
                 with: .color(traceColors[index % traceColors.count]),
-                lineWidth: 1.6
+                lineWidth: plotTraceLineWidth
             )
         }
+    }
+}
+
+private let plotTraceLineWidth: CGFloat = 1.6
+
+/// Each series as a run of points in `rect`, without the points that cannot
+/// be drawn. Points up to `leadInSeconds` before the x range are kept: a
+/// scrolling trace is slid right by up to that much, bringing them into view.
+private func plotTracePolylines(
+    plan: PlotDataPlan,
+    series: [PlotSeries],
+    rect: CGRect,
+    effectiveAxisMode: VerticalAxisMode,
+    leadInSeconds: Double = 0
+) -> [[CGPoint]] {
+    let useLogX = plan.useLogX
+    let useLogY = plan.useLogY
+    let xRange = plan.xRange
+
+    // Precompute axis transforms once per axis. The inner loop then
+    // does at most one log10 per point instead of six.
+    let xMap = AxisMapping(range: xRange, useLog: useLogX)
+    let xLower = xRange.lowerBound - leadInSeconds
+    let xUpper = xRange.upperBound
+
+    return series.map { item in
+        let yRange = effectiveAxisMode == .independent
+            ? plan.seriesYRanges[item.id] ?? plan.sharedYRange
+            : plan.sharedYRange
+        let yMap = AxisMapping(range: yRange, useLog: useLogY)
+
+        var points: [CGPoint] = []
+        points.reserveCapacity(item.points.count)
+        for point in item.points {
+            if !point.x.isFinite || !point.y.isFinite { continue }
+            if useLogX && point.x <= 0 { continue }
+            if useLogY && point.y <= 0 { continue }
+            if point.x < xLower || point.x > xUpper { continue }
+            let xFrac = xMap.fraction(point.x)
+            let yFrac = yMap.fraction(point.y)
+            points.append(CGPoint(
+                x: rect.minX + rect.width * CGFloat(xFrac),
+                y: rect.maxY - rect.height * CGFloat(yFrac)
+            ))
+        }
+        return points
+    }
+}
+
+/// `points` without the ones that lie on a straight run between their
+/// neighbours, to within `tolerance`. The points must run left to right, as
+/// a timeseries does. A signal that holds or ramps keeps only its corners.
+private func plotSimplifiedPolyline(_ points: [CGPoint], tolerance: CGFloat = 0.25) -> [CGPoint] {
+    guard points.count > 2 else { return points }
+    var kept: [CGPoint] = [points[0]]
+    kept.reserveCapacity(points.count)
+
+    var anchor = points[0]
+    // The slopes of a line from the anchor that passes within the tolerance,
+    // measured in y, of every point skipped since it.
+    var lowest = -CGFloat.infinity
+    var highest = CGFloat.infinity
+    var candidate = points[1]
+
+    for point in points.dropFirst(2) {
+        var skips = false
+        let run = candidate.x - anchor.x
+        if run > 0 {
+            lowest = max(lowest, (candidate.y - tolerance - anchor.y) / run)
+            highest = min(highest, (candidate.y + tolerance - anchor.y) / run)
+            if point.x > candidate.x {
+                let slope = (point.y - anchor.y) / (point.x - anchor.x)
+                skips = slope >= lowest && slope <= highest
+            }
+        }
+        if !skips {
+            kept.append(candidate)
+            anchor = candidate
+            lowest = -.infinity
+            highest = .infinity
+        }
+        candidate = point
+    }
+    kept.append(candidate)
+    return kept
+}
+
+/// A scrolling trace's lines for the data frame last asked about, and whether
+/// they are few enough for Core Animation to slide.
+///
+/// The render server draws a layer's lines again on every display refresh
+/// that moves them, and that takes it longer the more points they have: on an
+/// M5 about 1.5 µs a point, measured with `CARenderer`. Past the limit the
+/// trace goes to a canvas, which draws once per data frame.
+private final class PlotScrollingLines {
+    struct Key: Equatable {
+        let revision: UInt64
+        let plotRect: CGRect
+        let effectiveAxisMode: VerticalAxisMode
+        let leadInSeconds: Double
+    }
+
+    private static let layerPointLimit = 600
+    /// Lower than the limit, so a trace near it does not flip back and forth.
+    private static let layerPointReturn = 450
+
+    private var key: Key?
+    private var lines: [[CGPoint]] = []
+    private(set) var slidesInLayers = true
+
+    func lines(for key: Key, make: () -> [[CGPoint]]) -> [[CGPoint]] {
+        guard key != self.key else { return lines }
+        self.key = key
+        lines = make()
+        let count = lines.reduce(0) { $0 + $1.count }
+        slidesInLayers = count <= (slidesInLayers ? Self.layerPointLimit : Self.layerPointReturn)
+        return lines
     }
 }
 
@@ -2127,12 +2247,21 @@ private struct PlotDataPlan {
 }
 
 /// What a live timeseries needs to scroll between data frames.
-private struct PlotLiveScroll {
-    /// The newest time in the current frame, where its x range ends.
-    let dataEnd: Double
+private struct PlotLiveScroll: Equatable {
     let windowSeconds: Double
-    /// The most the drawn window may end before `dataEnd`.
+    /// The most the drawn window may end before the newest data.
     let maximumLag: Double
+    let playout: PlotScrollPlayout
+
+    /// How long before the newest data the drawn window ends at `mediaTime`.
+    func lag(at mediaTime: Double) -> Double {
+        min(maximumLag, playout.lag(at: mediaTime))
+    }
+
+    /// The time at the right edge of the drawn window at `mediaTime`.
+    func displayEnd(at mediaTime: Double) -> Double {
+        playout.dataEnd - lag(at: mediaTime)
+    }
 }
 
 /// Clips to a band of x, at any height.
@@ -2145,14 +2274,38 @@ private struct PlotHorizontalClip: Shape {
     }
 }
 
-/// Works out where a live timeseries window should end at any instant, so the
-/// trace can scroll at the display's rate while data arrives in frames.
+/// Where a live timeseries window ends from one data frame to the next. It
+/// ends `lag` seconds before the frame's newest data at `time` and closes on
+/// it at `rate`, stopping when it gets there.
+struct PlotScrollPlayout: Equatable {
+    /// The newest time in the frame, where its x range ends.
+    var dataEnd: Double
+    /// How long before `dataEnd` the window ended at `time`.
+    var lag: Double
+    /// The media time (`CACurrentMediaTime`) `lag` was true at.
+    var time: Double
+    /// Seconds of data the window takes in per second.
+    var rate: Double
+
+    func lag(at mediaTime: Double) -> Double {
+        max(0, lag - rate * (mediaTime - time))
+    }
+
+    func displayEnd(at mediaTime: Double) -> Double {
+        dataEnd - lag(at: mediaTime)
+    }
+}
+
+/// Paces a live timeseries window so the trace can scroll at the display's
+/// rate while data arrives in frames.
 ///
-/// Each frame says "the newest sample is at data time E" at some wall time.
-/// The clock tracks the smoothed difference between the two and reads data
-/// time off the wall clock in between. The window is drawn ending one frame
-/// interval behind that estimate (more when frames arrive unevenly), so the
-/// next frame's data is already there by the time the window reaches it.
+/// The window runs a little behind the newest data, and each frame extends
+/// what lies ahead of it. A frame never moves the window: the window carries
+/// on from wherever it had got to, so the trace neither jumps nor backs up.
+/// How far behind it runs follows the longest recent wait between frames, so
+/// that a frame held up by a busy main thread still lands before the window
+/// reaches the end of the data. The window steers toward that distance by
+/// running a few percent slow or a little fast, which is too little to see.
 final class PlotScrollClock {
     /// The most the drawn window may end before the newest data. Frames carry
     /// this much history ahead of the window; it must not exceed
@@ -2161,48 +2314,272 @@ final class PlotScrollClock {
         min(0.25, windowSeconds * 0.25)
     }
 
+    /// A wait this long between frames, or a step this large in the data's
+    /// time, starts the window over instead of scrolling across it.
+    private static let restartSeconds = 0.5
+    /// Kept in hand beyond the longest recent wait: about a display refresh,
+    /// for the time a frame takes to reach the screen.
+    private static let slackSeconds = 0.012
+    /// How far from real time the window may run to get to its target. It
+    /// slows readily, since running out of data freezes the trace, and gains
+    /// only slowly, since being further behind than it needs costs nothing.
+    private static let slowestRate = 0.95
+    private static let fastestRate = 1.01
+    /// How long the window takes to make up a difference from its target.
+    private static let correctionSeconds = 1.0
+
+    private(set) var playout: PlotScrollPlayout?
     private var lastRevision: UInt64?
     private var lastArrival: Double?
-    /// Smoothed data time minus wall time, over `sampleCount` frames.
-    private var offset: Double?
-    private var sampleCount = 0
     /// Smoothed time between frames.
-    private var period = 1.0 / 30.0
-    /// How far behind the estimate recent frames' newest data has been.
-    private var lateness = 0.0
+    private var meanGap = 1.0 / 30.0
+    /// The longest recent time between frames, easing back toward the mean.
+    private var peakGap = 1.0 / 30.0
 
-    func noteFrame(revision: UInt64, dataEnd: Double, at wallTime: Double) {
-        guard revision != lastRevision, dataEnd.isFinite else { return }
+    /// Takes in the frame `revision`, whose newest data is at `dataEnd` and
+    /// which arrived at `mediaTime`, and returns how the window moves from
+    /// here. A revision already taken in changes nothing.
+    @discardableResult
+    func noteFrame(
+        revision: UInt64,
+        dataEnd: Double,
+        at mediaTime: Double,
+        maximumLag: Double
+    ) -> PlotScrollPlayout? {
+        guard revision != lastRevision, dataEnd.isFinite else { return playout }
         lastRevision = revision
 
-        let sample = dataEnd - wallTime
-        let gap = lastArrival.map { wallTime - $0 }
-        lastArrival = wallTime
+        let gap = lastArrival.map { mediaTime - $0 }
+        lastArrival = mediaTime
 
         // Start over after a pause, a stall or a jump in the data's time.
-        guard let offset, let gap, gap < 0.5, abs(sample - offset) < 0.5 else {
-            self.offset = sample
-            sampleCount = 1
-            lateness = 0
-            return
+        guard let previous = playout, let gap, gap < Self.restartSeconds,
+              dataEnd >= previous.dataEnd,
+              dataEnd - previous.dataEnd < Self.restartSeconds else {
+            meanGap = 1.0 / 30.0
+            peakGap = meanGap
+            let start = PlotScrollPlayout(
+                dataEnd: dataEnd,
+                lag: min(maximumLag, peakGap + Self.slackSeconds),
+                time: mediaTime,
+                rate: 1
+            )
+            playout = start
+            return start
         }
 
-        sampleCount += 1
-        // A plain average at first, settling into a slow follower that rides
-        // out uneven arrivals yet still tracks drift between the two clocks.
-        let weight = max(0.03, 1 / Double(sampleCount))
-        let updated = offset + (sample - offset) * weight
-        self.offset = updated
-        period += (gap - period) * 0.1
-        lateness = max(updated - sample, lateness * 0.98)
+        meanGap += (gap - meanGap) * 0.1
+        peakGap = max(gap, peakGap - (peakGap - meanGap) * 0.01)
+        let target = min(maximumLag, peakGap + Self.slackSeconds)
+
+        // The window stays where it is; only what lies ahead of it grows.
+        // Past the lead-in the frame carries there is nothing to draw, so a
+        // burst larger than that does move it.
+        let lag = min(maximumLag, dataEnd - previous.displayEnd(at: mediaTime))
+        let rate = max(Self.slowestRate, min(Self.fastestRate, 1 + (lag - target) / Self.correctionSeconds))
+        let next = PlotScrollPlayout(dataEnd: dataEnd, lag: lag, time: mediaTime, rate: rate)
+        playout = next
+        return next
+    }
+}
+
+/// A scrolling trace, drawn in shape layers that Core Animation slides.
+///
+/// A data frame redraws the layers and sets them moving in one transaction,
+/// so what is drawn and where it sits cannot come apart. From there the
+/// render server carries the motion at the display's own rate, which keeps
+/// it even while the main thread is busy with the rest of the window.
+private struct PlotScrollingTrace {
+    let revision: UInt64
+    let canvasSize: CGSize
+    let plotRect: CGRect
+    let traceColors: [Color]
+    let traceColorSignature: String
+    /// One run of points per series, with x from the plot's left edge.
+    let lines: [[CGPoint]]
+    let effectiveAxisMode: VerticalAxisMode
+    let scroll: PlotLiveScroll
+
+    @MainActor
+    fileprivate func update(_ view: PlotScrollingTraceView, environment: EnvironmentValues) {
+        let content = PlotScrollingTraceView.Content(
+            revision: revision,
+            canvasSize: canvasSize,
+            plotRect: plotRect,
+            traceColorSignature: traceColorSignature,
+            effectiveAxisMode: effectiveAxisMode,
+            leadInSeconds: scroll.maximumLag,
+            displayScale: environment.displayScale
+        )
+        view.show(content, scroll: scroll) {
+            lines.enumerated().map { index, points in
+                PlotScrollingTraceView.Trace(
+                    points: points,
+                    color: traceColors[index % traceColors.count].resolve(in: environment).cgColor
+                )
+            }
+        }
+    }
+}
+
+#if os(macOS)
+extension PlotScrollingTrace: NSViewRepresentable {
+    func makeNSView(context: Context) -> PlotScrollingTraceView {
+        PlotScrollingTraceView()
     }
 
-    /// Where the window should end at `wallTime`: never past the newest data,
-    /// and never further behind it than `maximumLag`.
-    func displayEnd(at wallTime: Double, dataEnd: Double, maximumLag: Double) -> Double {
-        guard let offset else { return dataEnd }
-        let estimate = wallTime + offset - (period + lateness + 0.002)
-        return min(dataEnd, max(dataEnd - maximumLag, estimate))
+    func updateNSView(_ view: PlotScrollingTraceView, context: Context) {
+        update(view, environment: context.environment)
+    }
+}
+
+private typealias PlotPlatformView = NSView
+#else
+extension PlotScrollingTrace: UIViewRepresentable {
+    func makeUIView(context: Context) -> PlotScrollingTraceView {
+        PlotScrollingTraceView()
+    }
+
+    func updateUIView(_ view: PlotScrollingTraceView, context: Context) {
+        update(view, environment: context.environment)
+    }
+}
+
+private typealias PlotPlatformView = UIView
+#endif
+
+private final class PlotScrollingTraceView: PlotPlatformView {
+    /// Everything the drawn paths depend on.
+    struct Content: Equatable {
+        let revision: UInt64
+        let canvasSize: CGSize
+        let plotRect: CGRect
+        let traceColorSignature: String
+        let effectiveAxisMode: VerticalAxisMode
+        let leadInSeconds: Double
+        let displayScale: CGFloat
+    }
+
+    struct Trace {
+        let points: [CGPoint]
+        let color: CGColor
+    }
+
+    private static let motionKey = "scroll"
+
+    /// Cuts the traces off at the plot's left and right edges.
+    private let clipLayer = CALayer()
+    /// Holds the traces and slides right by the scroll's lag.
+    private let scrollLayer = CALayer()
+    private var traceLayers: [CAShapeLayer] = []
+    private var content: Content?
+    private var scroll: PlotLiveScroll?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        setUp()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setUp()
+    }
+
+    private func setUp() {
+        clipLayer.masksToBounds = true
+        scrollLayer.anchorPoint = .zero
+        clipLayer.addSublayer(scrollLayer)
+#if os(macOS)
+        wantsLayer = true
+        layer?.addSublayer(clipLayer)
+#else
+        isUserInteractionEnabled = false
+        layer.addSublayer(clipLayer)
+#endif
+    }
+
+#if os(macOS)
+    // Top-left origin, as the points are worked out.
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+#endif
+
+    /// Draws `content` if it is not what is already drawn, and sets the
+    /// layers moving as `scroll` says. `traces` is only asked for a redraw.
+    func show(_ content: Content, scroll: PlotLiveScroll, traces: () -> [Trace]) {
+        let redraws = content != self.content
+        guard redraws || scroll != self.scroll else { return }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+
+        if redraws {
+            self.content = content
+            draw(traces(), for: content)
+        }
+        self.scroll = scroll
+        startScrolling(scroll, plotWidth: content.plotRect.width)
+    }
+
+    private func draw(_ traces: [Trace], for content: Content) {
+        clipLayer.frame = CGRect(
+            x: content.plotRect.minX,
+            y: 0,
+            width: content.plotRect.width,
+            height: content.canvasSize.height
+        )
+        scrollLayer.bounds = clipLayer.bounds
+
+        while traceLayers.count > traces.count {
+            traceLayers.removeLast().removeFromSuperlayer()
+        }
+        while traceLayers.count < traces.count {
+            let layer = CAShapeLayer()
+            layer.anchorPoint = .zero
+            layer.fillColor = nil
+            layer.lineWidth = plotTraceLineWidth
+            scrollLayer.addSublayer(layer)
+            traceLayers.append(layer)
+        }
+
+        for (layer, trace) in zip(traceLayers, traces) {
+            layer.bounds = scrollLayer.bounds
+            layer.contentsScale = content.displayScale
+            layer.strokeColor = trace.color
+            if trace.points.count >= 2 {
+                let path = CGMutablePath()
+                path.addLines(between: trace.points)
+                layer.path = path
+            } else {
+                layer.path = nil
+            }
+        }
+    }
+
+    /// Puts the layers where the window is now and lets Core Animation run
+    /// them on to where it ends at the newest data, which is where they rest.
+    private func startScrolling(_ scroll: PlotLiveScroll, plotWidth: CGFloat) {
+        let now = CACurrentMediaTime()
+        let lag = scroll.lag(at: now)
+        let rate = scroll.playout.rate
+
+        scrollLayer.removeAnimation(forKey: Self.motionKey)
+        scrollLayer.position = .zero
+        guard lag > 0, rate > 0, plotWidth > 0 else { return }
+
+        let animation = CABasicAnimation(keyPath: "position.x")
+        animation.fromValue = CGFloat(lag / scroll.windowSeconds) * plotWidth
+        animation.toValue = 0
+        animation.duration = lag / rate
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        // Timed from when the lag was read, not from when the transaction
+        // reaches the render server, which on a busy main thread is later.
+        animation.beginTime = scrollLayer.convertTime(now, from: nil)
+        scrollLayer.add(animation, forKey: Self.motionKey)
     }
 }
 
