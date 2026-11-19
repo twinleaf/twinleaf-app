@@ -105,6 +105,23 @@ final class StreamValueStore: ObservableObject {
     }
 }
 
+/// How much has been logged and how much time it covers. Both change about
+/// once a second while logging, and only the status readouts and the size
+/// warning show them, so they too are kept out of `BridgeClient`.
+@MainActor
+final class LogProgressStore: ObservableObject {
+    @Published private(set) var bytes: UInt64 = 0
+    @Published private(set) var elapsedSeconds: Double?
+
+    func setBytes(_ bytes: UInt64) {
+        if bytes != self.bytes { self.bytes = bytes }
+    }
+
+    func setElapsedSeconds(_ seconds: Double?) {
+        if seconds != elapsedSeconds { elapsedSeconds = seconds }
+    }
+}
+
 /// Per-stream timing and the incoming link's traffic, as `tio health` shows
 /// them. They arrive twice a second and only the health popover reads them,
 /// so they are kept out of `BridgeClient` for the same reason as the values.
@@ -258,13 +275,13 @@ final class BridgeClient: ObservableObject {
     @Published private(set) var playbackStart: Double = 0
     @Published private(set) var playbackEnd: Double = 0
     @Published var playbackPosition: Double = 0
-    @Published private(set) var logBytes: UInt64 = 0
+    /// The log's size and the time it covers, refreshed about once a second.
+    let logProgress = LogProgressStore()
     @Published private(set) var logStartSeconds: Double?
-    @Published private(set) var logElapsedSeconds: Double?
     @Published private(set) var logTimeReferenceStartSeconds: Double?
     @Published private(set) var livePlotStartSeconds: Double?
-    @Published private(set) var logPackets: UInt64 = 0
-    @Published private(set) var logSerializeErrors: UInt64 = 0
+    private var logPackets: UInt64 = 0
+    private var logSerializeErrors: UInt64 = 0
     @Published private(set) var rpcCacheNeedsReload = false
     @Published private(set) var rpcValueChangeToken: UInt64 = 0
     @Published private(set) var rpcReplyChangeToken: UInt64 = 0
@@ -644,7 +661,7 @@ final class BridgeClient: ObservableObject {
         refreshLoggingLiveness()
         guard enabled, let logURL else {
             runtime?.setLogging(enabled: false, logPath: nil)
-            logBytes = 0
+            logProgress.setBytes(0)
             logPackets = 0
             logSerializeErrors = 0
             resetLogTiming()
@@ -2243,18 +2260,26 @@ final class BridgeClient: ObservableObject {
         playbackEnd = event.end
         playbackPosition = event.position
         plotFrames.setViewportEnd(event.position)
-        logStartSeconds = event.recordingStart ?? (event.start.isFinite ? event.start : nil)
-        logTimeReferenceStartSeconds = sanitizedTimeReference(event.timeReferenceStart)
+        setLogStart(
+            event.recordingStart ?? (event.start.isFinite ? event.start : nil),
+            timeReference: sanitizedTimeReference(event.timeReferenceStart)
+        )
         if let start = logStartSeconds, event.end.isFinite {
-            logElapsedSeconds = max(0, event.end - start)
+            logProgress.setElapsedSeconds(max(0, event.end - start))
         }
     }
 
+    /// Where the log starts. Set only on a change: it arrives with every
+    /// progress report, and the window lays the graphs out by it.
+    private func setLogStart(_ start: Double?, timeReference: Double?) {
+        if logStartSeconds != start { logStartSeconds = start }
+        if logTimeReferenceStartSeconds != timeReference { logTimeReferenceStartSeconds = timeReference }
+    }
+
     private func handleLogProgressEvent(_ event: LogProgressEvent) {
-        logBytes = event.fileBytes ?? event.bytes
-        logStartSeconds = event.startSeconds
-        logElapsedSeconds = event.elapsedSeconds
-        logTimeReferenceStartSeconds = sanitizedTimeReference(event.timeReferenceStart)
+        logProgress.setBytes(event.fileBytes ?? event.bytes)
+        setLogStart(event.startSeconds, timeReference: sanitizedTimeReference(event.timeReferenceStart))
+        logProgress.setElapsedSeconds(event.elapsedSeconds)
         logPackets = event.packets
         logSerializeErrors = event.serializeErrors ?? 0
         markLogActivity(force: true)
@@ -2638,7 +2663,7 @@ final class BridgeClient: ObservableObject {
 
     private func updateLogFileSize(at url: URL?) {
         guard let url else {
-            logBytes = 0
+            logProgress.setBytes(0)
             resetLogTiming()
             return
         }
@@ -2646,18 +2671,17 @@ final class BridgeClient: ObservableObject {
         do {
             let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
             if let size = attributes[.size] as? NSNumber {
-                logBytes = size.uint64Value
+                logProgress.setBytes(size.uint64Value)
             }
         } catch {
-            logBytes = 0
+            logProgress.setBytes(0)
             resetLogTiming()
         }
     }
 
     private func resetLogTiming() {
-        logStartSeconds = nil
-        logElapsedSeconds = nil
-        logTimeReferenceStartSeconds = nil
+        setLogStart(nil, timeReference: nil)
+        logProgress.setElapsedSeconds(nil)
     }
 
     private func resetLivePlotTiming() {

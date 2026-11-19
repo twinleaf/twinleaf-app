@@ -89,9 +89,76 @@ private struct PlotCanvasFrameHost: View {
     }
 }
 
+/// A document's window.
+///
+/// The window's content does not hold the document. While data is logged the
+/// document is marked as changed twice a second so that it gets saved, and
+/// each mark changes the document's value. Anything holding the binding is
+/// redrawn for it, which here is this thin view and not the content.
 struct DocumentWindow: View {
     @Binding var document: TioLogDocument
     let fileURL: URL?
+
+    @State private var log = DocumentLogHandle()
+
+    var body: some View {
+        // The handle always acts on the document as it is now.
+        let _ = log.follow($document)
+        DocumentWindowContent(
+            log: log,
+            temporaryLogURL: document.temporaryLogURL,
+            opensForInspection: document.shouldOpenForInspection,
+            fileURL: fileURL
+        )
+        .equatable()
+    }
+}
+
+/// What a window's content does to its document, without holding it.
+@MainActor
+final class DocumentLogHandle {
+    private var document: Binding<TioLogDocument>?
+
+    func follow(_ document: Binding<TioLogDocument>) {
+        self.document = document
+    }
+
+    /// Whether nothing has been recorded yet, so the log can be discarded
+    /// without losing data.
+    var temporaryLogIsEmpty: Bool {
+        document?.wrappedValue.temporaryLogIsEmpty ?? true
+    }
+
+    func ensureTemporaryLogFile() {
+        document?.wrappedValue.ensureTemporaryLogFile()
+    }
+
+    func removeTemporaryLogFile() {
+        document?.wrappedValue.removeTemporaryLogFile()
+    }
+
+    /// Marks the document as changed, so that it is saved with the new data.
+    func markUpdated() {
+        document?.wrappedValue.markLogUpdated()
+    }
+}
+
+struct DocumentWindowContent: View, @MainActor Equatable {
+    let log: DocumentLogHandle
+    /// Where the document keeps its log while it is open.
+    let temporaryLogURL: URL
+    /// True for a document opened from a file that has data in it.
+    let opensForInspection: Bool
+    let fileURL: URL?
+
+    // Everything else the content shows is its own state, which redraws it
+    // by itself.
+    static func == (lhs: DocumentWindowContent, rhs: DocumentWindowContent) -> Bool {
+        lhs.log === rhs.log
+            && lhs.temporaryLogURL == rhs.temporaryLogURL
+            && lhs.opensForInspection == rhs.opensForInspection
+            && lhs.fileURL == rhs.fileURL
+    }
 
     @StateObject private var bridge = BridgeClient()
     @AppStorage("smokeThresholdMegabytes") private var smokeThresholdMegabytes = 1024.0
@@ -177,10 +244,12 @@ struct DocumentWindow: View {
 
     private static let splitViewCoordinateSpaceName = "TwinleafSplitView"
 
-    init(document: Binding<TioLogDocument>, fileURL: URL?) {
-        _document = document
+    init(log: DocumentLogHandle, temporaryLogURL: URL, opensForInspection: Bool, fileURL: URL?) {
+        self.log = log
+        self.temporaryLogURL = temporaryLogURL
+        self.opensForInspection = opensForInspection
         self.fileURL = fileURL
-        let shouldOpenForInspection = document.wrappedValue.shouldOpenForInspection
+        let shouldOpenForInspection = opensForInspection
         let storedLogOnStartup = UserDefaults.standard.object(forKey: ViewPreferenceKeys.logOnStartup) as? Bool ?? false
         _showingDevicePicker = State(initialValue: !shouldOpenForInspection)
         _isDataLoggingEnabled = State(initialValue: shouldOpenForInspection ? false : storedLogOnStartup)
@@ -278,13 +347,7 @@ struct DocumentWindow: View {
                 }
             }
             .overlay {
-                if shouldShowSmoke {
-                    SmokeOverlay(
-                        fileBytes: bridge.logBytes,
-                        thresholdBytes: smokeThresholdBytes
-                    )
-                    .transition(.opacity)
-                }
+                LogSizeWarningOverlay(progress: bridge.logProgress, thresholdBytes: smokeThresholdBytes)
             }
 #if os(macOS)
             .overlay {
@@ -345,15 +408,15 @@ struct DocumentWindow: View {
                 guard !didStartDocument else { return }
                 didStartDocument = true
                 bridge.startIfNeeded()
-                if document.shouldOpenForInspection {
+                if opensForInspection {
                     isDataLoggingEnabled = false
-                    bridge.openLogFile(at: document.temporaryLogURL)
+                    bridge.openLogFile(at: temporaryLogURL)
                 } else {
                     isDataLoggingEnabled = logOnStartup
                     if logOnStartup {
-                        document.ensureTemporaryLogFile()
+                        log.ensureTemporaryLogFile()
                     } else {
-                        document.removeTemporaryLogFile()
+                        log.removeTemporaryLogFile()
                         clearDocumentEditedRequest &+= 1
                     }
                 }
@@ -364,7 +427,7 @@ struct DocumentWindow: View {
             }
             .onReceive(bridge.logActivity) {
                 guard isDataLoggingEnabled else { return }
-                document.markLogUpdated()
+                log.markUpdated()
             }
             .onAppear {
                 migrateLegacyRightSidebarModeIfNeeded()
@@ -808,7 +871,7 @@ struct DocumentWindow: View {
         DevicePicker(
             bridge: bridge,
             fileURL: fileURL,
-            temporaryLogURL: document.temporaryLogURL,
+            temporaryLogURL: temporaryLogURL,
             loggingEnabled: logFromStartBinding,
             onDismiss: {
                 showingDevicePicker = false
@@ -847,7 +910,7 @@ struct DocumentWindow: View {
     }
 
     private var documentShareURL: URL {
-        fileURL ?? document.temporaryLogURL
+        fileURL ?? temporaryLogURL
     }
 
     private func handleExportDestination(_ result: Result<URL, Error>) {
@@ -856,7 +919,7 @@ struct DocumentWindow: View {
             let format = selectedExportFormat(from: url)
             lastExportFormat = format
             bridge.exportLog(
-                sourceURL: document.temporaryLogURL,
+                sourceURL: temporaryLogURL,
                 destinationURL: format.normalizedURL(url),
                 format: format
             )
@@ -923,7 +986,7 @@ struct DocumentWindow: View {
     }
 
     private var canControlDataLogging: Bool {
-        !document.shouldOpenForInspection && !bridge.isInspectionMode
+        !opensForInspection && !bridge.isInspectionMode
     }
 
     private func handleSignalGraphFile(_ result: Result<URL, Error>) {
@@ -2380,8 +2443,8 @@ struct DocumentWindow: View {
 
         isDataLoggingEnabled = enabled
         if enabled {
-            document.ensureTemporaryLogFile()
-            bridge.setLogging(enabled: true, logURL: document.temporaryLogURL)
+            log.ensureTemporaryLogFile()
+            bridge.setLogging(enabled: true, logURL: temporaryLogURL)
             bridge.reloadAllRPCs()
         } else {
             bridge.setLogging(enabled: false, logURL: nil)
@@ -2390,8 +2453,8 @@ struct DocumentWindow: View {
             // Only discard the log when nothing was captured, which is what
             // this cleanup was for — it keeps an untouched document from going
             // dirty and leaving a 0-byte .tio behind.
-            if document.temporaryLogIsEmpty {
-                document.removeTemporaryLogFile()
+            if log.temporaryLogIsEmpty {
+                log.removeTemporaryLogFile()
                 clearDocumentEditedRequest &+= 1
             }
         }
@@ -2580,10 +2643,6 @@ struct DocumentWindow: View {
         UInt64(max(1, smokeThresholdMegabytes) * 1_000_000)
     }
 
-    private var shouldShowSmoke: Bool {
-        bridge.logBytes >= smokeThresholdBytes
-    }
-
     private var statusBar: some View {
         HStack(spacing: 12) {
             statusBarDetails(isCompact: false)
@@ -2615,22 +2674,14 @@ struct DocumentWindow: View {
                     .foregroundStyle(.secondary)
             }
         }
-        Label(formatFileSize(bridge.logBytes), systemImage: "internaldrive")
-            .font(.caption)
-            .foregroundStyle(shouldShowSmoke ? .orange : .secondary)
-            .help("Current .tio log size")
+        LogSizeLabel(progress: bridge.logProgress, thresholdBytes: smokeThresholdBytes)
         if let reason = plotRefreshGovernor.reason, !bridge.isInspectionMode {
             Label(reason, systemImage: "tortoise")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .help("Graphs redraw less often to save power. Logging is not affected.")
         }
-        if let elapsedSeconds = bridge.logElapsedSeconds {
-            Label(formatPlaybackTime(elapsedSeconds), systemImage: "timer")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .help("Elapsed time covered by the logged data")
-        }
+        LogElapsedLabel(progress: bridge.logProgress)
         if !isCompact, let startSeconds = bridge.logTimeReferenceStartSeconds {
             Label(formatRecordingStartDate(startSeconds), systemImage: "calendar")
                 .font(.caption)
@@ -2667,7 +2718,7 @@ struct DocumentWindow: View {
 // MARK: - Printing
 
 #if os(macOS)
-extension DocumentWindow {
+extension DocumentWindowContent {
     /// Routes File > Print to the window that was frontmost when the command
     /// fired: the document window prints its plot area, and a popped-out
     /// graph window prints just its own graph.
@@ -10978,7 +11029,7 @@ private enum RpcFocusField: Hashable {
     case slider(String)
 }
 
-/// Editable setting IDs in sidebar display order, published up to `DocumentWindow`
+/// Editable setting IDs in sidebar display order, published up to `DocumentWindowContent`
 /// so it can build the Tab focus chain.
 private struct EditableSettingIDsKey: PreferenceKey {
     static let defaultValue: [String] = []
@@ -12207,6 +12258,50 @@ private enum RPCNumericStepper {
         return token[token.index(after: decimalIndex)..<end]
             .filter(\.isWholeNumber)
             .count
+    }
+}
+
+// The log's size and elapsed time tick about once a second while logging.
+// Each readout below watches them itself, so a tick redraws that readout and
+// not the window around it.
+
+/// Smoke rising from the window once the log passes the warning size.
+private struct LogSizeWarningOverlay: View {
+    @ObservedObject var progress: LogProgressStore
+    let thresholdBytes: UInt64
+
+    var body: some View {
+        if progress.bytes >= thresholdBytes {
+            SmokeOverlay(fileBytes: progress.bytes, thresholdBytes: thresholdBytes)
+                .transition(.opacity)
+        }
+    }
+}
+
+/// The status bar's log size, orange once it passes the warning size.
+private struct LogSizeLabel: View {
+    @ObservedObject var progress: LogProgressStore
+    let thresholdBytes: UInt64
+
+    var body: some View {
+        Label(formatFileSize(progress.bytes), systemImage: "internaldrive")
+            .font(.caption)
+            .foregroundStyle(progress.bytes >= thresholdBytes ? .orange : .secondary)
+            .help("Current .tio log size")
+    }
+}
+
+/// The status bar's count of the time the logged data covers.
+private struct LogElapsedLabel: View {
+    @ObservedObject var progress: LogProgressStore
+
+    var body: some View {
+        if let elapsedSeconds = progress.elapsedSeconds {
+            Label(formatPlaybackTime(elapsedSeconds), systemImage: "timer")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help("Elapsed time covered by the logged data")
+        }
     }
 }
 

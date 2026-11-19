@@ -10,7 +10,7 @@ import Foundation
 /// the parent document's `sessionID` and the popout view looks the bridge up
 /// here.
 ///
-/// Holds the bridge weakly: the parent `DocumentWindow` owns it via
+/// Holds the bridge weakly: the parent `DocumentWindowContent` owns it via
 /// `@StateObject`, and the popout's `@ObservedObject` keeps it alive while
 /// the popout is open. When both go away the registry entry becomes nil
 /// naturally.
