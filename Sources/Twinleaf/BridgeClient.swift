@@ -82,6 +82,44 @@ private func logDeviceDiscovery(_ message: String) {
     TwinleafConsole.debug("[Twinleaf][DeviceDiscovery] \(message)")
 }
 
+/// The live values shown beside the stream columns in the sidebar.
+///
+/// They change several times a second. Kept here instead of in
+/// `BridgeClient`, a new set redraws the numbers that show them and nothing
+/// else; published from the bridge, it would redraw every view watching it.
+@MainActor
+final class StreamValueStore: ObservableObject {
+    private var values: [ColumnKey: Double] = [:]
+
+    func value(for key: ColumnKey) -> Double? {
+        values[key]
+    }
+
+    /// Returns whether anything changed.
+    @discardableResult
+    func replace(with newValues: [ColumnKey: Double]) -> Bool {
+        guard newValues != values else { return false }
+        objectWillChange.send()
+        values = newValues
+        return true
+    }
+}
+
+/// Per-stream timing and the incoming link's traffic, as `tio health` shows
+/// them. They arrive twice a second and only the health popover reads them,
+/// so they are kept out of `BridgeClient` for the same reason as the values.
+@MainActor
+final class DeviceHealthStore: ObservableObject {
+    @Published private(set) var streams: [StreamHealthInfo] = []
+    /// Rolling averages of the incoming TIO packet traffic across every device.
+    @Published private(set) var incomingLinkStats: IncomingLinkStats?
+
+    func update(streams: [StreamHealthInfo], incomingLinkStats: IncomingLinkStats?) {
+        if streams != self.streams { self.streams = streams }
+        if incomingLinkStats != self.incomingLinkStats { self.incomingLinkStats = incomingLinkStats }
+    }
+}
+
 @MainActor
 final class PlotFrameStore: ObservableObject {
     struct FrameState {
@@ -94,13 +132,17 @@ final class PlotFrameStore: ObservableObject {
     private var paneFrames: [Int: FrameState] = [:]
     private(set) var latestViewportEnd: Double?
 
+    /// Returns whether the frame changes what the window lays the graph out
+    /// by: its mode or how many traces it has.
+    @discardableResult
     func apply(
         paneID: Int,
         mode: PlotMode,
         viewportEnd: Double?,
         series: [PlotSeries],
         revision: UInt64
-    ) {
+    ) -> Bool {
+        let previous = paneFrames[paneID]
         objectWillChange.send()
         latestViewportEnd = viewportEnd
         paneFrames[paneID] = FrameState(
@@ -109,6 +151,7 @@ final class PlotFrameStore: ObservableObject {
             viewportEnd: viewportEnd,
             revision: revision
         )
+        return previous?.mode != mode || previous?.series.count != series.count
     }
 
     func removePane(id: Int) {
@@ -201,11 +244,16 @@ final class BridgeClient: ObservableObject {
     @Published private(set) var upgradeProgress: FirmwareUpgradeProgress?
     /// Per-stream timing/rate diagnostics (mirrors `tio health`), refreshed
     /// continuously while connected.
-    @Published private(set) var streamHealth: [StreamHealthInfo] = []
-    /// Rolling averages of the incoming TIO packet traffic across every device.
-    @Published private(set) var incomingLinkStats: IncomingLinkStats?
+    let health = DeviceHealthStore()
+    /// Whether there are any stream diagnostics to show. Published because
+    /// the toolbar offers the health popover only when there are.
+    @Published private(set) var hasStreamHealth = false
+    /// The sidebar's live column values, refreshed several times a second.
+    let streamValues = StreamValueStore()
     @Published private(set) var logMessages: [LogMessage] = []
-    @Published private(set) var logRevision: UInt64 = 0
+    /// Fires while live data is arriving, at most twice a second. Not
+    /// published state: a window acts on it without being redrawn for it.
+    let logActivity = PassthroughSubject<Void, Never>()
     @Published private(set) var isInspectionMode = false
     @Published private(set) var playbackStart: Double = 0
     @Published private(set) var playbackEnd: Double = 0
@@ -455,8 +503,7 @@ final class BridgeClient: ObservableObject {
         connectionProgress = .started(attemptID: attemptID, device: device)
         availableUpgrades = []
         upgradeProgress = nil
-        streamHealth = []
-        incomingLinkStats = nil
+        setStreamHealth([], incomingLinkStats: nil)
         isInspectionMode = false
         rpcCacheNeedsReload = false
         clearLogMessages()
@@ -493,8 +540,7 @@ final class BridgeClient: ObservableObject {
         isInspectionMode = true
         isPlotPaused = true
         rpcCacheNeedsReload = false
-        streamHealth = []
-        incomingLinkStats = nil
+        setStreamHealth([], incomingLinkStats: nil)
         clearLogMessages()
         clearRPCReadbackState()
         clearStreamDisplayValues()
@@ -542,8 +588,7 @@ final class BridgeClient: ObservableObject {
         isPlotPaused = false
         availableUpgrades = []
         upgradeProgress = nil
-        streamHealth = []
-        incomingLinkStats = nil
+        setStreamHealth([], incomingLinkStats: nil)
     }
 
     /// Re-run the lazy firmware-availability check for the active session.
@@ -918,8 +963,11 @@ final class BridgeClient: ObservableObject {
         )
     }
 
-    func derivedDisplayValue(for key: ColumnKey) -> Double? {
-        streamDisplayValues[key]?.value
+    private func setStreamHealth(_ streams: [StreamHealthInfo], incomingLinkStats: IncomingLinkStats?) {
+        health.update(streams: streams, incomingLinkStats: incomingLinkStats)
+        if hasStreamHealth == streams.isEmpty {
+            hasStreamHealth = !streams.isEmpty
+        }
     }
 
     func removePlotPane(id: Int) {
@@ -1984,15 +2032,17 @@ final class BridgeClient: ObservableObject {
                 handleUpgradeProgressEvent(try decoder.decode(FirmwareUpgradeProgress.self, from: data))
             case "health":
                 let event = try decoder.decode(StreamHealthEvent.self, from: data)
-                streamHealth = event.streams
-                incomingLinkStats = event.incomingKbps == nil && event.incomingPacketsPerSecond == nil
-                    ? nil
-                    : IncomingLinkStats(
-                        kbps: event.incomingKbps,
-                        packetsPerSecond: event.incomingPacketsPerSecond,
-                        samplesPerPacket: event.incomingSamplesPerPacket,
-                        windowSeconds: event.incomingWindowSeconds
-                    )
+                setStreamHealth(
+                    event.streams,
+                    incomingLinkStats: event.incomingKbps == nil && event.incomingPacketsPerSecond == nil
+                        ? nil
+                        : IncomingLinkStats(
+                            kbps: event.incomingKbps,
+                            packetsPerSecond: event.incomingPacketsPerSecond,
+                            samplesPerPacket: event.incomingSamplesPerPacket,
+                            windowSeconds: event.incomingWindowSeconds
+                        )
+                )
             default:
                 break
             }
@@ -2284,25 +2334,28 @@ final class BridgeClient: ObservableObject {
         pendingStreamDisplayFlush?.cancel()
         pendingStreamDisplayFlush = nil
 
-        var nextDevices = devices
-        var appliedValues = 0
+        var values: [ColumnKey: Double] = [:]
+        values.reserveCapacity(streamDisplayValues.count)
         for (key, state) in streamDisplayValues {
-            if updateColumnDisplayValue(state.value, for: key, in: &nextDevices) {
-                appliedValues += 1
+            if key.isDerived {
+                values[key] = state.value
+            } else if let resolved = resolveColumnIndex(for: key, in: devices) {
+                // Filed under the column's own key, which is what a row
+                // looks it up by, whichever key the value arrived under.
+                let column = devices[resolved.device].streams[resolved.stream].columns[resolved.column]
+                values[column.key] = state.value
             }
         }
 
-        if appliedValues > 0 {
-            devices = nextDevices
-        }
         lastStreamDisplayPublishAt = now
-        return appliedValues
+        return streamValues.replace(with: values) ? values.count : 0
     }
 
     private func clearStreamDisplayValues() {
         pendingStreamDisplayFlush?.cancel()
         pendingStreamDisplayFlush = nil
         streamDisplayValues.removeAll()
+        streamValues.replace(with: [:])
         lastStreamDisplayPublishAt = Date.distantPast
     }
 
@@ -2392,7 +2445,7 @@ final class BridgeClient: ObservableObject {
 
     private func applyPlotSnapshot(_ snapshot: PlotSnapshot) {
         let profileStart = BridgeEventProfiler.start()
-        plotFrames.apply(
+        let changesLayout = plotFrames.apply(
             paneID: snapshot.paneID,
             mode: snapshot.mode,
             viewportEnd: snapshot.viewportEnd,
@@ -2400,6 +2453,11 @@ final class BridgeClient: ObservableObject {
             revision: nextPlotRevision
         )
         nextPlotRevision &+= 1
+        if changesLayout {
+            // The window reads a graph's mode and trace count from its frame
+            // to lay it out, and frames themselves do not redraw the window.
+            objectWillChange.send()
+        }
         BridgeEventProfiler.record(
             "plot.apply",
             start: profileStart,
@@ -2531,23 +2589,6 @@ final class BridgeClient: ObservableObject {
         return (label, column.units)
     }
 
-    private func updateColumnDisplayValue(
-        _ value: Double,
-        for key: ColumnKey,
-        in targetDevices: inout [DeviceInfo]
-    ) -> Bool {
-        guard let resolved = resolveColumnIndex(for: key, in: targetDevices) else {
-            return false
-        }
-
-        if targetDevices[resolved.device].streams[resolved.stream].columns[resolved.column].displayValue == value {
-            return false
-        }
-
-        targetDevices[resolved.device].streams[resolved.stream].columns[resolved.column].displayValue = value
-        return true
-    }
-
     private func resolveColumnIndex(
         for key: ColumnKey,
         in targetDevices: [DeviceInfo]
@@ -2592,7 +2633,7 @@ final class BridgeClient: ObservableObject {
         let now = Date()
         guard force || now.timeIntervalSince(lastLogRevisionMark) >= 0.5 else { return }
         lastLogRevisionMark = now
-        logRevision &+= 1
+        logActivity.send()
     }
 
     private func updateLogFileSize(at url: URL?) {

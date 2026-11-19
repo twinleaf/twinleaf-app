@@ -362,7 +362,7 @@ struct DocumentWindow: View {
                 PlotSettingsWindow(bridge: bridge)
                     .twinleafSettingsPresentation()
             }
-            .onChange(of: bridge.logRevision) { _, _ in
+            .onReceive(bridge.logActivity) {
                 guard isDataLoggingEnabled else { return }
                 document.markLogUpdated()
             }
@@ -2398,7 +2398,7 @@ struct DocumentWindow: View {
     }
 
     private var showHealthToolbarButton: Bool {
-        !bridge.streamHealth.isEmpty
+        bridge.hasStreamHealth
     }
 
     private var showUpgradeToolbarButton: Bool {
@@ -2444,7 +2444,7 @@ struct DocumentWindow: View {
                 .labelStyle(.iconOnly)
                 .help("Device timing and rate diagnostics")
                 .popover(isPresented: $showingHealthPopover, arrowEdge: .bottom) {
-                    DeviceHealthPopover(bridge: bridge)
+                    DeviceHealthPopover(bridge: bridge, health: bridge.health)
                 }
             }
 
@@ -7008,12 +7008,13 @@ private enum ConnectionProgressRowState {
 /// Live timing & rate diagnostics (the `tio health` data) grouped by device
 /// route, shown from the toolbar info button.
 private struct DeviceHealthPopover: View {
-    @ObservedObject var bridge: BridgeClient
+    let bridge: BridgeClient
+    @ObservedObject var health: DeviceHealthStore
 
     /// All streams sorted by route then stream id (route appears per row, so no
     /// grouping headers are needed — keeps it compact for iPhone).
     private var streams: [StreamHealthInfo] {
-        bridge.streamHealth.sorted {
+        health.streams.sorted {
             ($0.route, $0.streamId) < ($1.route, $1.streamId)
         }
     }
@@ -7028,11 +7029,11 @@ private struct DeviceHealthPopover: View {
             Text("Connection Health")
                 .font(.headline)
 
-            if let stats = bridge.incomingLinkStats {
+            if let stats = health.incomingLinkStats {
                 linkStatsList(stats)
             }
 
-            if bridge.streamHealth.isEmpty {
+            if health.streams.isEmpty {
                 Text("No live streams.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -7055,7 +7056,7 @@ private struct DeviceHealthPopover: View {
                     bridge.resetHealthCounters()
                 }
                 .controlSize(.small)
-                .disabled(bridge.streamHealth.isEmpty)
+                .disabled(health.streams.isEmpty)
                 .help("Zero the dropped-sample counter of every stream")
             }
         }
@@ -8704,19 +8705,12 @@ private struct StreamColumnRow: View, @MainActor Equatable {
     }
 
     private var valueContent: some View {
-        Text(displayValue)
-            .font(.body.monospacedDigit())
-            .foregroundStyle(column.displayValue == nil ? .secondary : .primary)
-            .lineLimit(1)
-            .frame(width: streamValueColumnWidth, alignment: .trailing)
-    }
-
-    private var displayValue: String {
-        let value = formatStreamValue(column.displayValue)
-        if column.units.isEmpty {
-            return value
-        }
-        return "\(value) \(column.units)"
+        StreamValueText(
+            values: bridge.streamValues,
+            key: column.key,
+            units: column.units,
+            fallback: column.displayValue
+        )
     }
 
     private var streamDetailText: String {
@@ -8842,23 +8836,12 @@ private struct DerivedColumnRow: View {
     }
 
     private var valueContent: some View {
-        Text(displayValue)
-            .font(.body.monospacedDigit())
-            .foregroundStyle(bridge.derivedDisplayValue(for: spec.key) == nil ? .secondary : .primary)
-            .lineLimit(1)
-            .frame(width: streamValueColumnWidth, alignment: .trailing)
-    }
-
-    private var units: String {
-        bridge.derivedMetadata(for: spec.key)?.units ?? ""
-    }
-
-    private var displayValue: String {
-        guard let value = bridge.derivedDisplayValue(for: spec.key) else {
-            return units.isEmpty ? "—" : "— \(units)"
-        }
-        let text = formatStreamValue(value)
-        return units.isEmpty ? text : "\(text) \(units)"
+        StreamValueText(
+            values: bridge.streamValues,
+            key: spec.key,
+            units: bridge.derivedMetadata(for: spec.key)?.units ?? "",
+            missingText: "—"
+        )
     }
 
     private var detailText: String {
@@ -8946,6 +8929,34 @@ private struct DerivedColumnRow: View {
         } else {
             Text(text)
         }
+    }
+}
+
+/// A column's live value in the sidebar.
+///
+/// Only this text watches the values. A new one, several times a second,
+/// redraws it and leaves its row, the list and the window alone.
+private struct StreamValueText: View {
+    @ObservedObject var values: StreamValueStore
+    let key: ColumnKey
+    let units: String
+    /// Shown until a live value arrives.
+    var fallback: Double? = nil
+    /// Shown while there is no value at all; the formatter's own text if nil.
+    var missingText: String? = nil
+
+    var body: some View {
+        let value = values.value(for: key) ?? fallback
+        Text(text(for: value))
+            .font(.body.monospacedDigit())
+            .foregroundStyle(value == nil ? .secondary : .primary)
+            .lineLimit(1)
+            .frame(width: streamValueColumnWidth, alignment: .trailing)
+    }
+
+    private func text(for value: Double?) -> String {
+        let number = value == nil ? (missingText ?? formatStreamValue(nil)) : formatStreamValue(value)
+        return units.isEmpty ? number : "\(number) \(units)"
     }
 }
 
@@ -9946,7 +9957,7 @@ private struct RPCSliderControlRow: View {
             value: sliderValueBinding(for: rpc),
             range: sliderRange,
             step: rpc.isIntegerRPC ? 1 : nil,
-            labelFormatter: { sliderTickLabel($0, for: rpc) },
+            labels: rpc.isIntegerRPC ? .integer : .significant,
             onEditingChanged: { editing in
                 handleEditingChanged(editing, for: rpc)
             }
@@ -10002,13 +10013,6 @@ private struct RPCSliderControlRow: View {
 
     private var sliderMovementEpsilon: Double {
         max(1e-12, abs(effectiveMaximum - slider.minimum) * 1e-12)
-    }
-
-    private func sliderTickLabel(_ value: Double, for rpc: RpcInfo) -> String {
-        if rpc.isIntegerRPC {
-            return String(format: "%.0f", value.rounded())
-        }
-        return NumericDisplayPolicy.significant(value, maximumDigits: 4)
     }
 
     private func typedRPCValue(_ value: Double, for rpc: RpcInfo) -> Double {
@@ -10200,19 +10204,59 @@ private struct SliderTickMark: Identifiable, Hashable {
     }
 }
 
+/// How a slider writes the values along its track.
+private enum SliderLabelStyle: Hashable {
+    case integer
+    case significant
+
+    func text(_ value: Double) -> String {
+        switch self {
+        case .integer: String(format: "%.0f", value.rounded())
+        case .significant: NumericDisplayPolicy.significant(value, maximumDigits: 4)
+        }
+    }
+}
+
+/// A slider's tick marks for the range, width and labels last asked about.
+/// The slider's body runs whenever the view around it does, and the marks
+/// only change with these.
+private final class SliderTickCache {
+    struct Key: Equatable {
+        let range: ClosedRange<Double>
+        let trackWidth: CGFloat
+        let labels: SliderLabelStyle
+    }
+
+    private var key: Key?
+    private var ticks: [SliderTickMark] = []
+
+    func ticks(for key: Key, make: () -> [SliderTickMark]) -> [SliderTickMark] {
+        if key != self.key {
+            self.key = key
+            ticks = make()
+        }
+        return ticks
+    }
+}
+
 private struct RPCValueSlider: View {
     @Binding var value: Double
     let range: ClosedRange<Double>
     let step: Double?
-    let labelFormatter: (Double) -> String
+    let labels: SliderLabelStyle
     let onEditingChanged: (Bool) -> Void
 
     @State private var isDragging = false
+    @State private var tickCache = SliderTickCache()
 
     var body: some View {
         GeometryReader { geometry in
             let metrics = SliderTrackMetrics(width: geometry.size.width)
-            let ticks = sliderTicks(trackWidth: metrics.trackWidth)
+            let ticks = tickCache.ticks(
+                for: SliderTickCache.Key(range: range, trackWidth: metrics.trackWidth, labels: labels)
+            ) {
+                sliderTicks(trackWidth: metrics.trackWidth)
+            }
 
             ZStack(alignment: .topLeading) {
                 Capsule()
@@ -10272,7 +10316,7 @@ private struct RPCValueSlider: View {
         }
         .accessibilityElement()
         .accessibilityLabel("Setting slider")
-        .accessibilityValue(labelFormatter(value))
+        .accessibilityValue(labels.text(value))
     }
 
     private func snappedValue(at x: CGFloat, metrics: SliderTrackMetrics) -> Double {
@@ -10308,7 +10352,7 @@ private struct RPCValueSlider: View {
             return SliderTickMark(value: value, label: nil, kind: .minor)
         }
 
-        let labeledMajorValues = labels(for: majorValues, trackWidth: trackWidth)
+        let labeledMajorValues = tickLabels(for: majorValues, trackWidth: trackWidth)
         ticks += majorValues.map { value in
             SliderTickMark(
                 value: value,
@@ -10376,7 +10420,7 @@ private struct RPCValueSlider: View {
         return uniqueSorted(values, tolerance: minorStep * 1e-6)
     }
 
-    private func labels(for values: [Double], trackWidth: CGFloat) -> [Double: String] {
+    private func tickLabels(for values: [Double], trackWidth: CGFloat) -> [Double: String] {
         let minimumSpacing = minimumLabelSpacing(trackWidth: trackWidth)
         let metrics = SliderTrackMetrics(width: trackWidth + SliderTrackMetrics.horizontalInset * 2)
         var result: [Double: String] = [:]
@@ -10384,7 +10428,7 @@ private struct RPCValueSlider: View {
         var seenLabels: Set<String> = []
 
         for value in values {
-            let label = labelFormatter(value)
+            let label = labels.text(value)
             let x = metrics.x(for: value, in: range)
             guard x - lastLabelX >= minimumSpacing || result.isEmpty else { continue }
             guard seenLabels.insert(label).inserted else { continue }
@@ -10394,7 +10438,7 @@ private struct RPCValueSlider: View {
 
         if let last = values.last,
            result[last] == nil {
-            let label = labelFormatter(last)
+            let label = labels.text(last)
             if seenLabels.insert(label).inserted {
                 result[last] = label
             }
@@ -10466,7 +10510,8 @@ private struct RPCValueSlider: View {
             .filter { $0.isFinite }
             .sorted()
             .reduce(into: [Double]()) { result, value in
-                guard !result.contains(where: { approximatelyEqual($0, value, tolerance: tolerance) }) else {
+                // Sorted, so the nearest value already kept is the last one.
+                if let last = result.last, approximatelyEqual(last, value, tolerance: tolerance) {
                     return
                 }
                 result.append(value)
