@@ -647,6 +647,32 @@ final class BridgeClient: ObservableObject {
         updateRuntimePlotPanes()
     }
 
+    /// A click on a stream or column in the sidebar: give it a graph of its
+    /// own, or close that graph if it already has one. An empty graph is
+    /// filled rather than left above a new one, and the only graph is emptied
+    /// rather than closed. `mode` and `logY` set up the graph the columns go
+    /// into.
+    func togglePlotPane(for keys: [ColumnKey], mode: PlotMode? = nil, logY: Bool? = nil) {
+        let columns = limitedColumnSet(from: keys)
+        guard !columns.isEmpty else { return }
+
+        if let own = plotPanes.last(where: { $0.columns == columns }) {
+            if plotPanes.count > 1 {
+                removePlotPane(id: own.id)
+            } else {
+                setColumns(keys, in: own.id, enabled: false)
+            }
+        } else if let empty = plotPanes.last(where: { $0.columns.isEmpty }) {
+            if let mode { setViewMode(mode, for: empty.id) }
+            if let logY { setLogY(logY, for: empty.id) }
+            setColumns(keys, in: empty.id, enabled: true)
+        } else {
+            addPlotPane(columns: keys, mode: mode, logY: logY)
+        }
+    }
+
+    /// A Command- or Option-click on a stream or column in the sidebar: add
+    /// it to the lowest graph, or take it back out.
     func toggleColumnsInLowestPlot(_ keys: [ColumnKey]) {
         guard !keys.isEmpty else {
             return

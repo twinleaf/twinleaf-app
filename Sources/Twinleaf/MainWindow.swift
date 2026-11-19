@@ -3380,32 +3380,40 @@ private extension View {
 #endif
     }
 
-    @ViewBuilder
-    func plotColumnDragSource(keys: [ColumnKey], sourcePaneID: Int? = nil) -> some View {
-        if keys.isEmpty {
-            self
-        } else {
-            onDrag {
-                PlotColumnDragPayload(keys: keys, sourcePaneID: sourcePaneID).itemProvider
-            }
-        }
+    /// Makes a sidebar row plot its columns when clicked and lets it be
+    /// dragged onto the graphs. `onClick` is told whether Command or Option
+    /// was held. `title` labels what is being dragged, and `leadingInset`
+    /// leaves the row's leading edge to a control of its own.
+    func sidebarPlotSource(
+        keys: [ColumnKey],
+        title: String,
+        help: String,
+        leadingInset: CGFloat = 0,
+        onClick: @escaping (_ addsToLowestGraph: Bool) -> Void
+    ) -> some View {
+        modifier(SidebarPlotSource(
+            keys: keys,
+            title: title,
+            help: help,
+            leadingInset: leadingInset,
+            onClick: onClick
+        ))
     }
 
     /// Lets settings be dragged out to the plot area, where they become
-    /// sliders or capture plots. Settings that can be neither are not draggable.
-    @ViewBuilder
-    func settingDragSource(_ rpcs: [RpcInfo]) -> some View {
-        let rpcIDs = rpcs.filter { $0.isSliderSuitable || $0.isCaptureRPC }.map(\.id)
-        if rpcIDs.isEmpty {
-            self
-        } else {
-            onDrag {
-                MainActor.assumeIsolated {
-                    SettingDragSession.rpcIDs = rpcIDs
-                }
-                return SettingDragPayload(rpcIDs: rpcIDs).itemProvider
-            }
-        }
+    /// sliders or capture plots. Settings that can be neither are not
+    /// draggable. `onClick`, when there is one, makes the view a button too.
+    func settingDragSource(
+        _ rpcs: [RpcInfo],
+        help: String? = nil,
+        onClick: (() -> Void)? = nil
+    ) -> some View {
+        modifier(SidebarSettingSource(
+            rpcIDs: rpcs.filter { $0.isSliderSuitable || $0.isCaptureRPC }.map(\.id),
+            title: rpcs.first?.name ?? "",
+            help: help,
+            onClick: onClick
+        ))
     }
 
     @ViewBuilder
@@ -8001,18 +8009,23 @@ private struct StreamSidebar: View {
             deviceColumn(device, streamId: column.key.streamId, columnIndex: column.key.columnIndex)?.key
         }
         let state = plotState(for: keys)
-        return Button {
-            bridge.toggleColumnsInLowestPlot(keys)
-        } label: {
-            Text(column.description.isEmpty ? column.name : column.description)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .foregroundStyle(state.isPlottedInAnyPlot ? Color.accentColor : Color.primary)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .plotColumnDragSource(keys: keys)
-        .help("Plot \(column.name) from all sensors in the lowest graph")
+        let bridge = bridge
+        return Text(column.description.isEmpty ? column.name : column.description)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .foregroundStyle(state.isPlottedInAnyPlot ? Color.accentColor : Color.primary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .sidebarPlotSource(
+                keys: keys,
+                title: column.name,
+                help: state.clickHelp(for: "\(column.name) from all sensors")
+            ) { addsToLowestGraph in
+                if addsToLowestGraph {
+                    bridge.toggleColumnsInLowestPlot(keys)
+                } else {
+                    bridge.togglePlotPane(for: keys)
+                }
+            }
     }
 
     private func deviceColumn(_ device: DeviceInfo, streamId: UInt8, columnIndex: Int) -> ColumnInfo? {
@@ -8146,11 +8159,14 @@ private struct StreamSidebar: View {
             )
         }
 
+        let columns = Set(normalizedKeys)
         return StreamPlotRowState(
             paneEntries: entries,
             isSelectedInLowestPlot: panes.last.map { areColumns(normalizedKeys, selectedIn: $0) } ?? false,
             isPlottedInAnyPlot: entries.contains(where: \.isSelected),
-            canAddPlotPane: bridge.canAddPlotPane
+            hasOwnPlot: !columns.isEmpty && panes.contains { $0.columns == columns },
+            canAddPlotPane: bridge.canAddPlotPane,
+            hasEmptyPlot: panes.contains { $0.columns.isEmpty }
         )
     }
 
@@ -8252,7 +8268,25 @@ private struct StreamPlotRowState: Equatable {
     let paneEntries: [StreamPlotMenuEntry]
     let isSelectedInLowestPlot: Bool
     let isPlottedInAnyPlot: Bool
+    /// True when some graph shows exactly these columns and nothing else.
+    let hasOwnPlot: Bool
     let canAddPlotPane: Bool
+    let hasEmptyPlot: Bool
+
+    /// What clicking the row for `subject` does, as its tooltip. Mirrors
+    /// `BridgeClient.togglePlotPane` and `toggleColumnsInLowestPlot`.
+    @MainActor
+    func clickHelp(for subject: String) -> String {
+        let click = if hasOwnPlot {
+            "Close the graph of \(subject)."
+        } else if canAddPlotPane || hasEmptyPlot {
+            "Plot \(subject) in a graph of its own."
+        } else {
+            "Maximum of \(BridgeClient.maxPlotPaneCount) graphs."
+        }
+        let modifiedClick = isSelectedInLowestPlot ? "remove from" : "add to"
+        return "\(click) Command-click to \(modifiedClick) the lowest graph."
+    }
 }
 
 /// Right-click menu for one legend entry.
@@ -8408,20 +8442,36 @@ private struct StreamHeaderRow: View {
     }
 
     var body: some View {
+        // The whole row past the disclosure chevron plots and drags, not just
+        // the name: the name alone is a small thing to hit.
         SidebarValueRowLayout() {
             headerContent
             Color.clear
                 .frame(width: streamValueColumnWidth, height: 1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .help(helpText)
+        .sidebarPlotSource(
+            keys: plotKeys,
+            title: stream.name,
+            help: helpText,
+            leadingInset: streamDisclosureWidth + streamDisclosureSpacing
+        ) { addsToLowestGraph in
+            if addsToLowestGraph {
+                bridge.toggleColumnsInLowestPlot(plotKeys)
+            } else {
+                bridge.togglePlotPane(for: plotKeys)
+            }
+        }
+        .contextMenu {
+            streamPlotMenu
+        }
     }
 
     private var headerContent: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: streamDisclosureSpacing) {
             disclosureButton
 
-            streamNameControl
+            labelContent
                 .frame(minWidth: sidebarInlineLabelMinimumWidth, alignment: .leading)
         }
     }
@@ -8433,25 +8483,11 @@ private struct StreamHeaderRow: View {
             Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-                .frame(width: 12, height: 18, alignment: .center)
+                .frame(width: streamDisclosureWidth, height: 18, alignment: .center)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help(isExpanded ? "Hide stream columns" : "Show stream columns")
-    }
-
-    private var streamNameControl: some View {
-        Button {
-            bridge.toggleColumnsInLowestPlot(plotKeys)
-        } label: {
-            labelContent
-        }
-        .buttonStyle(.plain)
-        .disabled(plotKeys.isEmpty)
-        .plotColumnDragSource(keys: plotKeys)
-        .contextMenu {
-            streamPlotMenu
-        }
     }
 
     private var labelContent: some View {
@@ -8530,16 +8566,11 @@ private struct StreamHeaderRow: View {
         }
     }
 
-    private var isSelectedInLowestPlot: Bool {
-        plotState.isSelectedInLowestPlot
-    }
-
     private var helpText: String {
         if plotKeys.isEmpty {
             return "No columns available to plot"
         }
-        let verb = isSelectedInLowestPlot ? "Remove" : "Plot"
-        return "\(verb) all columns in \(stream.name) in the lowest graph"
+        return plotState.clickHelp(for: stream.name)
     }
 }
 
@@ -8600,15 +8631,24 @@ private struct StreamColumnRow: View, @MainActor Equatable {
             valueContent
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            bridge.toggleColumnsInLowestPlot([column.key])
+        .sidebarPlotSource(
+            keys: plotKeys,
+            title: label,
+            help: plotState.clickHelp(for: label)
+        ) { addsToLowestGraph in
+            if addsToLowestGraph {
+                bridge.toggleColumnsInLowestPlot(plotKeys)
+            } else {
+                bridge.togglePlotPane(for: plotKeys)
+            }
         }
-        .plotColumnDragSource(keys: [column.key])
         .contextMenu {
             columnPlotMenu
         }
-        .help(helpText)
+    }
+
+    private var label: String {
+        column.description.isEmpty ? column.name : column.description
     }
 
     private var labelContent: some View {
@@ -8709,16 +8749,6 @@ private struct StreamColumnRow: View, @MainActor Equatable {
     private var plotKeys: [ColumnKey] {
         [column.key]
     }
-
-    private var isSelectedInLowestPlot: Bool {
-        plotState.isSelectedInLowestPlot
-    }
-
-    private var helpText: String {
-        let label = column.description.isEmpty ? column.name : column.description
-        let verb = isSelectedInLowestPlot ? "Remove" : "Plot"
-        return "\(verb) \(label) in the lowest graph"
-    }
 }
 
 /// Sidebar row for a derived channel, shown under the column it comes from.
@@ -8739,13 +8769,20 @@ private struct DerivedColumnRow: View {
             valueContent
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            bridge.toggleColumnsInLowestPlot([spec.key])
+        .sidebarPlotSource(keys: [spec.key], title: title, help: helpText) { addsToLowestGraph in
+            if addsToLowestGraph {
+                bridge.toggleColumnsInLowestPlot([spec.key])
+            } else {
+                // Log Y, as the menu's New Plot gives it: a noise floor
+                // drifting across decades is unreadable on a linear axis.
+                bridge.togglePlotPane(for: [spec.key], mode: .timeseries, logY: true)
+            }
         }
-        .plotColumnDragSource(keys: [spec.key])
         .contextMenu { menu }
-        .help(helpText)
+    }
+
+    private var title: String {
+        spec.derivation?.title ?? "Derived"
     }
 
     private var labelContent: some View {
@@ -8794,8 +8831,7 @@ private struct DerivedColumnRow: View {
     }
 
     private var helpText: String {
-        let verb = plotState.isSelectedInLowestPlot ? "Remove" : "Plot"
-        return "\(verb) the \(spec.derivation?.title.lowercased() ?? "derived") channel in the lowest graph."
+        plotState.clickHelp(for: "the \(title.lowercased()) channel")
             + " Each point summarises the \(formatNoiseFloorSeconds(spec.windowSeconds)) s ending at that time,"
             + " so successive points overlap."
     }
@@ -8880,6 +8916,353 @@ private struct DerivedColumnRow: View {
 private let streamValueColumnWidth: CGFloat = 96
 private let sidebarInlineLabelMinimumWidth: CGFloat = 96
 private let streamChildRowLeadingPadding: CGFloat = 20
+private let streamDisclosureWidth: CGFloat = 12
+private let streamDisclosureSpacing: CGFloat = 8
+
+// MARK: - Sidebar plot source
+
+/// A sidebar row that plots when clicked and can be dragged to the graphs.
+///
+/// On the Mac the row takes the mouse itself rather than putting `.onDrag`
+/// over a SwiftUI button or tap gesture, so telling a click from a drag does
+/// not depend on how the sidebar list arbitrates between the two.
+private struct SidebarPlotSource: ViewModifier {
+    let keys: [ColumnKey]
+    let title: String
+    let help: String
+    let leadingInset: CGFloat
+    let onClick: (Bool) -> Void
+
+#if os(macOS)
+    @State private var isPressed = false
+#endif
+
+    func body(content: Content) -> some View {
+        if keys.isEmpty {
+            content
+                .help(help)
+        } else {
+#if os(macOS)
+            content
+                .opacity(isPressed ? 0.6 : 1)
+                .overlay {
+                    SidebarPointerSource(
+                        title: title,
+                        help: help,
+                        pasteboardItem: {
+                            SidebarPointerSourceView.pasteboardItem(
+                                PlotColumnDragPayload(keys: keys),
+                                type: PlotColumnDragPayload.contentType
+                            )
+                        },
+                        onClick: { modifiers in
+                            onClick(!modifiers.isDisjoint(with: [.command, .option]))
+                        },
+                        isPressed: $isPressed
+                    )
+                    .padding(.leading, leadingInset)
+                }
+                .sidebarButtonAccessibility { onClick(false) }
+#else
+            content
+                .contentShape(Rectangle())
+#if os(iOS)
+                .gesture(SidebarTapGesture { modifiers in
+                    onClick(!modifiers.isDisjoint(with: [.command, .alternate]))
+                })
+#else
+                // `UIGestureRecognizerRepresentable` is unavailable on
+                // visionOS, so a tap there cannot tell which keys are held.
+                .onTapGesture { onClick(false) }
+#endif
+                .onDrag {
+                    PlotColumnDragPayload(keys: keys).itemProvider
+                }
+                .help(help)
+                .sidebarButtonAccessibility { onClick(false) }
+#endif
+        }
+    }
+}
+
+private extension View {
+    /// Tells assistive technology that the view acts as a button, when it
+    /// has something to do.
+    @ViewBuilder
+    func sidebarButtonAccessibility(_ action: (() -> Void)?) -> some View {
+        if let action {
+            accessibilityAddTraits(.isButton)
+                .accessibilityAction(.default, action)
+        } else {
+            self
+        }
+    }
+}
+
+/// A setting's name in the sidebar. Dragged to the plot area it becomes a
+/// slider or a capture plot, and clicked it does `onClick`, if there is one.
+private struct SidebarSettingSource: ViewModifier {
+    let rpcIDs: [String]
+    let title: String
+    let help: String?
+    let onClick: (() -> Void)?
+
+#if os(macOS)
+    @State private var isPressed = false
+#endif
+
+    func body(content: Content) -> some View {
+#if os(macOS)
+        if rpcIDs.isEmpty, onClick == nil {
+            content
+        } else {
+            content
+                .opacity(isPressed ? 0.6 : 1)
+                .overlay {
+                    SidebarPointerSource(
+                        title: title,
+                        help: help,
+                        pasteboardItem: rpcIDs.isEmpty ? nil : {
+                            // A drop target cannot read the drag until the
+                            // drop, so its preview learns what is coming here.
+                            SettingDragSession.rpcIDs = rpcIDs
+                            return SidebarPointerSourceView.pasteboardItem(
+                                SettingDragPayload(rpcIDs: rpcIDs),
+                                type: SettingDragPayload.contentType
+                            )
+                        },
+                        onClick: onClick.map { onClick in { _ in onClick() } },
+                        isPressed: $isPressed
+                    )
+                }
+                .sidebarButtonAccessibility(onClick)
+        }
+#else
+        if let onClick {
+            described(dragging(
+                Button(action: onClick) {
+                    content
+                }
+                .buttonStyle(.plain)
+            ))
+        } else {
+            dragging(content)
+        }
+#endif
+    }
+
+#if !os(macOS)
+    @ViewBuilder
+    private func dragging(_ view: some View) -> some View {
+        if rpcIDs.isEmpty {
+            view
+        } else {
+            view.onDrag {
+                MainActor.assumeIsolated {
+                    SettingDragSession.rpcIDs = rpcIDs
+                }
+                return SettingDragPayload(rpcIDs: rpcIDs).itemProvider
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func described(_ view: some View) -> some View {
+        if let help {
+            view.help(help)
+        } else {
+            view
+        }
+    }
+#endif
+}
+
+#if os(macOS)
+private struct SidebarPointerSource: NSViewRepresentable {
+    let title: String
+    let help: String?
+    /// Makes what a drag carries, as the drag begins. Nil when the row
+    /// cannot be dragged.
+    let pasteboardItem: (() -> NSPasteboardItem?)?
+    /// Nil when clicking the row does nothing.
+    let onClick: ((NSEvent.ModifierFlags) -> Void)?
+    @Binding var isPressed: Bool
+
+    func makeNSView(context: Context) -> SidebarPointerSourceView {
+        let view = SidebarPointerSourceView()
+        update(view)
+        return view
+    }
+
+    func updateNSView(_ view: SidebarPointerSourceView, context: Context) {
+        update(view)
+    }
+
+    private func update(_ view: SidebarPointerSourceView) {
+        view.dragTitle = title
+        view.toolTip = help
+        view.makePasteboardItem = pasteboardItem
+        view.onClick = onClick
+        let isPressed = $isPressed
+        view.onPressChanged = { isPressed.wrappedValue = $0 }
+    }
+}
+
+/// Tells a click from a drag by how far the pointer travels with the button
+/// down: a click reports the modifier keys held, and a drag carries the
+/// row's payload to wherever it is dropped.
+private final class SidebarPointerSourceView: NSView, NSDraggingSource {
+    var dragTitle = ""
+    var makePasteboardItem: (() -> NSPasteboardItem?)?
+    var onClick: ((NSEvent.ModifierFlags) -> Void)?
+    var onPressChanged: (Bool) -> Void = { _ in }
+
+    /// `payload` as JSON under `type`, which is how this app's drop targets
+    /// read it from a drag.
+    static func pasteboardItem(_ payload: some Encodable, type: UTType) -> NSPasteboardItem? {
+        guard let data = try? JSONEncoder().encode(payload) else { return nil }
+        let item = NSPasteboardItem()
+        item.setData(data, forType: NSPasteboard.PasteboardType(type.identifier))
+        return item
+    }
+
+    private var mouseDownLocation: NSPoint?
+    private var didBeginDrag = false
+    private static let dragThreshold: CGFloat = 4
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        // The row's own text is what VoiceOver should read.
+        setAccessibilityElement(false)
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setAccessibilityElement(false)
+    }
+
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override func mouseDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.control) {
+            // A Control-click asks for the row's menu, as a right-click does.
+            super.rightMouseDown(with: event)
+            return
+        }
+        mouseDownLocation = event.locationInWindow
+        didBeginDrag = false
+        if onClick != nil {
+            onPressChanged(true)
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        // A row with nothing to drag stays a button however the pointer moves.
+        guard let start = mouseDownLocation, !didBeginDrag, makePasteboardItem != nil else { return }
+        let location = event.locationInWindow
+        guard hypot(location.x - start.x, location.y - start.y) >= Self.dragThreshold else { return }
+        didBeginDrag = true
+        onPressChanged(false)
+        beginDrag(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer {
+            mouseDownLocation = nil
+            didBeginDrag = false
+        }
+        guard mouseDownLocation != nil, !didBeginDrag else { return }
+        onPressChanged(false)
+        guard let onClick, bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
+        onClick(event.modifierFlags)
+    }
+
+    private func beginDrag(with event: NSEvent) {
+        guard let pasteboardItem = makePasteboardItem?() else { return }
+
+        let image = dragImage()
+        let location = convert(event.locationInWindow, from: nil)
+        let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
+        draggingItem.setDraggingFrame(
+            NSRect(
+                x: location.x - 10,
+                y: location.y - image.size.height / 2,
+                width: image.size.width,
+                height: image.size.height
+            ),
+            contents: image
+        )
+        beginDraggingSession(with: [draggingItem], event: event, source: self)
+    }
+
+    /// The row's name on a small plate, drawn for the window's appearance.
+    private func dragImage() -> NSImage {
+        let text = NSAttributedString(string: dragTitle, attributes: [
+            .font: NSFont.systemFont(ofSize: NSFont.systemFontSize),
+            .foregroundColor: NSColor.labelColor
+        ])
+        let textSize = text.size()
+        let size = NSSize(width: ceil(textSize.width) + 16, height: ceil(textSize.height) + 6)
+        let scale = window?.backingScaleFactor ?? 2
+        let image = NSImage(size: size)
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(ceil(size.width * scale)),
+            pixelsHigh: Int(ceil(size.height * scale)),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ), let context = NSGraphicsContext(bitmapImageRep: bitmap) else {
+            return image
+        }
+        bitmap.size = size
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let plate = NSBezierPath(
+                roundedRect: NSRect(origin: .zero, size: size).insetBy(dx: 0.5, dy: 0.5),
+                xRadius: 6,
+                yRadius: 6
+            )
+            NSColor.windowBackgroundColor.withAlphaComponent(0.92).setFill()
+            plate.fill()
+            NSColor.separatorColor.setStroke()
+            plate.stroke()
+            text.draw(at: NSPoint(x: 8, y: 3))
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        image.addRepresentation(bitmap)
+        return image
+    }
+
+    func draggingSession(
+        _ session: NSDraggingSession,
+        sourceOperationMaskFor context: NSDraggingContext
+    ) -> NSDragOperation {
+        .copy
+    }
+}
+#elseif os(iOS)
+/// A tap that knows which modifier keys a hardware keyboard was holding.
+private struct SidebarTapGesture: UIGestureRecognizerRepresentable {
+    let action: (UIKeyModifierFlags) -> Void
+
+    func makeUIGestureRecognizer(context: Context) -> UITapGestureRecognizer {
+        UITapGestureRecognizer()
+    }
+
+    func handleUIGestureRecognizerAction(_ recognizer: UITapGestureRecognizer, context: Context) {
+        guard recognizer.state == .ended else { return }
+        action(recognizer.modifierFlags)
+    }
+}
+#endif
 
 private struct SidebarValueRowLayout: Layout {
     var labelMinimumWidth: CGFloat = sidebarInlineLabelMinimumWidth
@@ -10653,27 +11036,18 @@ private struct RpcRow: View, @MainActor Equatable {
         }
     }
 
-    @ViewBuilder
     private var settingNameControl: some View {
-        if rpc.isSliderSuitable {
-            Button {
-                onToggleSlider(rpc)
-            } label: {
-                settingNameText
-            }
-            .buttonStyle(.plain)
-            .settingDragSource([rpc])
-            .help(isSliderActive ? "Remove setting slider" : "Add setting slider — or drag it to the graphs")
+        settingNameText
+            .settingDragSource(
+                [rpc],
+                help: rpc.isSliderSuitable
+                    ? (isSliderActive ? "Remove setting slider" : "Add setting slider — or drag it to the graphs")
+                    : nil,
+                onClick: rpc.isSliderSuitable ? { onToggleSlider(rpc) } : nil
+            )
             .contextMenu {
                 settingNameMenu
             }
-        } else {
-            settingNameText
-                .settingDragSource([rpc])
-                .contextMenu {
-                    settingNameMenu
-                }
-        }
     }
 
     private var settingNameText: some View {
