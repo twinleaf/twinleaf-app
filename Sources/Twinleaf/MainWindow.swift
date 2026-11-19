@@ -9599,6 +9599,13 @@ private struct RPCSliderPanel: View {
         .padding(.trailing, Self.horizontalInset(clearing: cornerInsets.bottomTrailing))
         .padding(.vertical, Self.verticalPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Whatever the controls leave uncovered moves the panel, as its title
+        // strip does: the margins and the gaps between the fields.
+        .background {
+            Color.clear
+                .contentShape(Rectangle())
+                .panelReorderGrip()
+        }
         .background(.bar)
         .onGeometryChange(for: RectangleCornerInsets.self) { proxy in
             proxy.containerCornerInsets
