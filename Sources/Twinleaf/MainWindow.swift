@@ -3382,20 +3382,20 @@ private extension View {
 
     /// Makes a sidebar row plot its columns when clicked and lets it be
     /// dragged onto the graphs. `onClick` is told whether Command or Option
-    /// was held. `title` labels what is being dragged, and `leadingInset`
-    /// leaves the row's leading edge to a control of its own.
+    /// was held. `title` labels what is being dragged, and `trailingInset`
+    /// leaves the row's trailing edge to a control of its own.
     func sidebarPlotSource(
         keys: [ColumnKey],
         title: String,
         help: String,
-        leadingInset: CGFloat = 0,
+        trailingInset: CGFloat = 0,
         onClick: @escaping (_ addsToLowestGraph: Bool) -> Void
     ) -> some View {
         modifier(SidebarPlotSource(
             keys: keys,
             title: title,
             help: help,
-            leadingInset: leadingInset,
+            trailingInset: trailingInset,
             onClick: onClick
         ))
     }
@@ -7823,25 +7823,31 @@ private struct StreamSidebar: View {
                         TipView(DragStreamsTip())
                             .listRowSeparator(.hidden)
                             .listRowBackground(Color.clear)
-
-                        ForEach(streamDeviceEntries) { entry in
-                            switch entry {
-                            case .single(let device):
-                                singleDeviceStreamRows(device: device)
-                            case .unified(let name, let devices):
-                                UnifiedDeviceSectionHeader(name: name, devices: devices)
-                                    .listRowInsets(denseDeviceHeaderRowInsets)
-                                    .listRowSeparator(.hidden)
-                                    .listRowBackground(Color.clear)
-
-                                unifiedStreamRows(groupName: name, devices: devices)
-                            }
-                        }
                     }
                     header: {
                         SidebarGroupHeader(title: "Streams", systemImage: "waveform")
                     }
                     .listSectionSeparator(.hidden)
+
+                    // Each stream is a section of its own under its device,
+                    // so its name is a standard sidebar section header: the
+                    // list draws it and the disclosure control beside it.
+                    ForEach(streamDeviceEntries) { entry in
+                        switch entry {
+                        case .single(let device):
+                            singleDeviceStreamSections(device: device)
+                        case .unified(let name, let devices):
+                            Section {
+                                UnifiedDeviceSectionHeader(name: name, devices: devices)
+                                    .listRowInsets(denseDeviceHeaderRowInsets)
+                                    .listRowSeparator(.hidden)
+                                    .listRowBackground(Color.clear)
+                            }
+                            .listSectionSeparator(.hidden)
+
+                            unifiedStreamSections(groupName: name, devices: devices)
+                        }
+                    }
                 }
 
                 SettingsSidebarSections(
@@ -7884,28 +7890,29 @@ private struct StreamSidebar: View {
     }
 
     @ViewBuilder
-    private func singleDeviceStreamRows(device: DeviceInfo) -> some View {
+    private func singleDeviceStreamSections(device: DeviceInfo) -> some View {
         if let group = visibleStreamGroups.first(where: { $0.device.id == device.id }) {
-            DeviceSectionHeader(device: group.device)
-                .listRowInsets(denseDeviceHeaderRowInsets)
-                .listRowSeparator(.hidden)
-                .listRowBackground(Color.clear)
+            Section {
+                DeviceSectionHeader(device: group.device)
+                    .listRowInsets(denseDeviceHeaderRowInsets)
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+            }
+            .listSectionSeparator(.hidden)
 
             ForEach(group.rows) { row in
-                StreamHeaderRow(
-                    stream: row.stream,
-                    showDetails: showStreamDetails,
+                streamSection(
                     isExpanded: expansionBinding(for: row.id),
-                    bridge: bridge,
-                    plotState: plotState(for: row.stream.columns.map(\.key)),
-                    onOpenPlotWindow: onOpenPlotWindow
-                )
-                .listRowInsets(denseSidebarRowInsets)
-
-                if expandedStreamIDs.contains(row.id) {
+                    header: StreamHeaderRow(
+                        stream: row.stream,
+                        showDetails: showStreamDetails,
+                        bridge: bridge,
+                        plotState: plotState(for: row.stream.columns.map(\.key)),
+                        onOpenPlotWindow: onOpenPlotWindow
+                    )
+                ) {
                     if row.stream.columns.isEmpty {
                         StreamMetadataUnavailableRow(stream: row.stream)
-                            .padding(.leading, streamChildRowLeadingPadding)
                             .listRowInsets(denseSidebarRowInsets)
                     } else {
                         ForEach(row.stream.columns) { column in
@@ -7917,7 +7924,6 @@ private struct StreamSidebar: View {
                                 onOpenPlotWindow: onOpenPlotWindow
                             )
                             .equatable()
-                            .padding(.leading, streamChildRowLeadingPadding)
                             .listRowInsets(denseSidebarRowInsets)
 
                             ForEach(bridge.derivedChannels(from: column.key)) { spec in
@@ -7928,7 +7934,7 @@ private struct StreamSidebar: View {
                                     plotState: plotState(for: [spec.key]),
                                     onOpenPlotWindow: onOpenPlotWindow
                                 )
-                                .padding(.leading, streamChildRowLeadingPadding * 2)
+                                .padding(.leading, streamChildRowLeadingPadding)
                                 .listRowInsets(denseSidebarRowInsets)
                             }
                         }
@@ -7939,32 +7945,29 @@ private struct StreamSidebar: View {
     }
 
     @ViewBuilder
-    private func unifiedStreamRows(groupName: String, devices: [DeviceInfo]) -> some View {
+    private func unifiedStreamSections(groupName: String, devices: [DeviceInfo]) -> some View {
         let firstRows = visibleStreamGroups.first { $0.device.id == devices.first?.id }?.rows ?? []
         ForEach(firstRows) { row in
             let rowID = "unified:\(groupName)#\(row.stream.streamId)"
             let allKeys = unifiedStreamKeys(streamId: row.stream.streamId, devices: devices)
 
-            StreamHeaderRow(
-                stream: row.stream,
-                showDetails: showStreamDetails,
+            streamSection(
                 isExpanded: expansionBinding(for: rowID),
-                bridge: bridge,
-                plotState: plotState(for: allKeys),
-                onOpenPlotWindow: onOpenPlotWindow,
-                plotKeysOverride: allKeys
-            )
-            .listRowInsets(denseSidebarRowInsets)
-
-            if expandedStreamIDs.contains(rowID) {
+                header: StreamHeaderRow(
+                    stream: row.stream,
+                    showDetails: showStreamDetails,
+                    bridge: bridge,
+                    plotState: plotState(for: allKeys),
+                    onOpenPlotWindow: onOpenPlotWindow,
+                    plotKeysOverride: allKeys
+                )
+            ) {
                 if row.stream.columns.isEmpty {
                     StreamMetadataUnavailableRow(stream: row.stream)
-                        .padding(.leading, streamChildRowLeadingPadding)
                         .listRowInsets(denseSidebarRowInsets)
                 } else {
                     ForEach(row.stream.columns) { column in
                         unifiedColumnCaption(column: column, devices: devices)
-                            .padding(.leading, streamChildRowLeadingPadding)
                             .listRowInsets(denseSidebarRowInsets)
 
                         ForEach(devices) { device in
@@ -7982,7 +7985,7 @@ private struct StreamSidebar: View {
                                     labelOverride: unifiedDeviceKeyLabel(device)
                                 )
                                 .equatable()
-                                .padding(.leading, streamChildRowLeadingPadding * 2)
+                                .padding(.leading, streamChildRowLeadingPadding)
                                 .listRowInsets(denseSidebarRowInsets)
 
                                 ForEach(bridge.derivedChannels(from: deviceColumn.key)) { spec in
@@ -7993,7 +7996,7 @@ private struct StreamSidebar: View {
                                         plotState: plotState(for: [spec.key]),
                                         onOpenPlotWindow: onOpenPlotWindow
                                     )
-                                    .padding(.leading, streamChildRowLeadingPadding * 3)
+                                    .padding(.leading, streamChildRowLeadingPadding * 2)
                                     .listRowInsets(denseSidebarRowInsets)
                                 }
                             }
@@ -8002,6 +8005,54 @@ private struct StreamSidebar: View {
                 }
             }
         }
+    }
+
+    /// One stream and its columns, as a section. On the Mac the list draws
+    /// the header and the disclosure control beside it. Elsewhere a section
+    /// header takes neither a drag nor a context menu, so the header is the
+    /// section's first row and brings a disclosure control of its own.
+    @ViewBuilder
+    private func streamSection<Rows: View>(
+        isExpanded: Binding<Bool>,
+        header: StreamHeaderRow,
+        @ViewBuilder rows: () -> Rows
+    ) -> some View {
+#if os(macOS)
+        Section(isExpanded: isExpanded) {
+            rows()
+        } header: {
+            header
+        }
+        .listSectionSeparator(.hidden)
+#else
+        Section {
+            HStack(spacing: 8) {
+                header
+
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isExpanded.wrappedValue.toggle()
+                    }
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isExpanded.wrappedValue ? "Hide stream columns" : "Show stream columns")
+            }
+            .listRowInsets(denseSidebarRowInsets)
+            .listRowSeparator(.hidden)
+
+            if isExpanded.wrappedValue {
+                rows()
+            }
+        }
+        .listSectionSeparator(.hidden)
+#endif
     }
 
     private func unifiedColumnCaption(column: ColumnInfo, devices: [DeviceInfo]) -> some View {
@@ -8411,10 +8462,12 @@ private func formatNoiseFloorSeconds(_ value: Double) -> String {
     NumericDisplayPolicy.fixed(value, fractionDigits: value < 1 ? 2 : 0)
 }
 
+/// A stream's name, heading the sidebar section that holds its columns.
+/// Clicking it plots the stream and it can be dragged to the graphs; the
+/// disclosure control beside it comes from `streamSection`.
 private struct StreamHeaderRow: View {
     let stream: StreamInfo
     let showDetails: Bool
-    @Binding var isExpanded: Bool
     let bridge: BridgeClient
     let plotState: StreamPlotRowState
     let onOpenPlotWindow: (([ColumnKey]) -> Void)?
@@ -8426,7 +8479,6 @@ private struct StreamHeaderRow: View {
     init(
         stream: StreamInfo,
         showDetails: Bool,
-        isExpanded: Binding<Bool>,
         bridge: BridgeClient,
         plotState: StreamPlotRowState,
         onOpenPlotWindow: (([ColumnKey]) -> Void)?,
@@ -8434,7 +8486,6 @@ private struct StreamHeaderRow: View {
     ) {
         self.stream = stream
         self.showDetails = showDetails
-        self._isExpanded = isExpanded
         self.bridge = bridge
         self.plotState = plotState
         self.onOpenPlotWindow = onOpenPlotWindow
@@ -8442,67 +8493,52 @@ private struct StreamHeaderRow: View {
     }
 
     var body: some View {
-        // The whole row past the disclosure chevron plots and drags, not just
-        // the name: the name alone is a small thing to hit.
-        SidebarValueRowLayout() {
-            headerContent
-            Color.clear
-                .frame(width: streamValueColumnWidth, height: 1)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .sidebarPlotSource(
-            keys: plotKeys,
-            title: stream.name,
-            help: helpText,
-            leadingInset: streamDisclosureWidth + streamDisclosureSpacing
-        ) { addsToLowestGraph in
-            if addsToLowestGraph {
-                bridge.toggleColumnsInLowestPlot(plotKeys)
-            } else {
-                bridge.togglePlotPane(for: plotKeys)
+        labelContent
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .sidebarPlotSource(
+                keys: plotKeys,
+                title: stream.name,
+                help: helpText,
+                trailingInset: streamHeaderDisclosureInset
+            ) { addsToLowestGraph in
+                if addsToLowestGraph {
+                    bridge.toggleColumnsInLowestPlot(plotKeys)
+                } else {
+                    bridge.togglePlotPane(for: plotKeys)
+                }
             }
-        }
-        .contextMenu {
-            streamPlotMenu
-        }
-    }
-
-    private var headerContent: some View {
-        HStack(spacing: streamDisclosureSpacing) {
-            disclosureButton
-
-            labelContent
-                .frame(minWidth: sidebarInlineLabelMinimumWidth, alignment: .leading)
-        }
-    }
-
-    private var disclosureButton: some View {
-        Button {
-            isExpanded.toggle()
-        } label: {
-            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .frame(width: streamDisclosureWidth, height: 18, alignment: .center)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(isExpanded ? "Hide stream columns" : "Show stream columns")
+            .contextMenu {
+                streamPlotMenu
+            }
     }
 
     private var labelContent: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(stream.name)
-                .font(.body)
+            nameText
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .foregroundStyle(plotState.isPlottedInAnyPlot ? Color.accentColor : Color.primary)
+                .textCase(nil)
             if showDetails {
                 Text("\(NumericDisplayPolicy.fixed(stream.effectiveSamplingRate, fractionDigits: 0)) Hz")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .textCase(nil)
             }
         }
+    }
+
+    /// The name as a section header reads: small and grey, tinted while the
+    /// stream is plotted. On the Mac the list's own header style supplies
+    /// the first two.
+    private var nameText: Text {
+        let name = Text(stream.name)
+#if os(macOS)
+        return plotState.isPlottedInAnyPlot ? name.foregroundStyle(Color.accentColor) : name
+#else
+        return name
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(plotState.isPlottedInAnyPlot ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary))
+#endif
     }
 
     private var plotKeys: [ColumnKey] {
@@ -8916,8 +8952,10 @@ private struct DerivedColumnRow: View {
 private let streamValueColumnWidth: CGFloat = 96
 private let sidebarInlineLabelMinimumWidth: CGFloat = 96
 private let streamChildRowLeadingPadding: CGFloat = 20
-private let streamDisclosureWidth: CGFloat = 12
-private let streamDisclosureSpacing: CGFloat = 8
+/// On the Mac the list puts a section's disclosure control over the trailing
+/// end of its header when the pointer is there. A stream's header keeps its
+/// own clicks clear of it, with a little to spare.
+private let streamHeaderDisclosureInset: CGFloat = 30
 
 // MARK: - Sidebar plot source
 
@@ -8930,7 +8968,7 @@ private struct SidebarPlotSource: ViewModifier {
     let keys: [ColumnKey]
     let title: String
     let help: String
-    let leadingInset: CGFloat
+    let trailingInset: CGFloat
     let onClick: (Bool) -> Void
 
 #if os(macOS)
@@ -8960,7 +8998,7 @@ private struct SidebarPlotSource: ViewModifier {
                         },
                         isPressed: $isPressed
                     )
-                    .padding(.leading, leadingInset)
+                    .padding(.trailing, trailingInset)
                 }
                 .sidebarButtonAccessibility { onClick(false) }
 #else
