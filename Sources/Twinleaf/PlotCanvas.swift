@@ -452,36 +452,6 @@ struct PlotCanvas: View {
                     }
                     .disabled(series.isEmpty)
                 }
-                .onChange(of: plotDropEdge) { _, edge in
-                    onDropEdgeChange(edge, plotDropMovesGraph)
-                }
-                .onDrop(
-                    of: [PlotColumnDragPayload.contentType] + edgeOnlyDropTypes + otherDropTypes,
-                    delegate: PlotCanvasDropDelegate(
-                        // The bottom band runs from the lower part of the plot
-                        // down through the axis labels to the graph's edge.
-                        edgeBands: onPlotColumnsDroppedAtEdge == nil ? nil : (
-                            top: rect.minY + min(28, rect.height * 0.2),
-                            bottom: rect.maxY - min(28, rect.height * 0.2)
-                        ),
-                        middleY: rect.midY,
-                        edgeOnlyTypes: edgeOnlyDropTypes,
-                        otherTypes: otherDropTypes,
-                        isTargeted: $isPlotDropTargeted,
-                        edge: $plotDropEdge,
-                        edgeMovesGraph: $plotDropMovesGraph,
-                        onColumnsDropped: { payload, edge in
-                            if let edge, let onPlotColumnsDroppedAtEdge {
-                                onPlotColumnsDroppedAtEdge(payload, edge)
-                            } else {
-                                onPlotColumnsDropped(payload)
-                            }
-                        },
-                        onEdgeItemsDropped: onEdgeItemsDropped,
-                        onOtherItemsDropped: onOtherItemsDropped,
-                        onOtherItemsHover: onOtherItemsHover
-                    )
-                )
                 .onContinuousHover { phase in
                     switch phase {
                     case .active(let location):
@@ -514,6 +484,40 @@ struct PlotCanvas: View {
                         )
                     }
                 }
+                // The drop target goes on last, over the interaction layer. On
+                // iOS that layer takes touches across the whole graph, and a
+                // drop target beneath it is never offered the drag: the drop
+                // goes to the plot area instead, which opens a new graph.
+                .onChange(of: plotDropEdge) { _, edge in
+                    onDropEdgeChange(edge, plotDropMovesGraph)
+                }
+                .onDrop(
+                    of: [PlotColumnDragPayload.contentType] + edgeOnlyDropTypes + otherDropTypes,
+                    delegate: PlotCanvasDropDelegate(
+                        // The bottom band runs from the lower part of the plot
+                        // down through the axis labels to the graph's edge.
+                        edgeBands: onPlotColumnsDroppedAtEdge == nil ? nil : (
+                            top: rect.minY + min(28, rect.height * 0.2),
+                            bottom: rect.maxY - min(28, rect.height * 0.2)
+                        ),
+                        middleY: rect.midY,
+                        edgeOnlyTypes: edgeOnlyDropTypes,
+                        otherTypes: otherDropTypes,
+                        isTargeted: $isPlotDropTargeted,
+                        edge: $plotDropEdge,
+                        edgeMovesGraph: $plotDropMovesGraph,
+                        onColumnsDropped: { payload, edge in
+                            if let edge, let onPlotColumnsDroppedAtEdge {
+                                onPlotColumnsDroppedAtEdge(payload, edge)
+                            } else {
+                                onPlotColumnsDropped(payload)
+                            }
+                        },
+                        onEdgeItemsDropped: onEdgeItemsDropped,
+                        onOtherItemsDropped: onOtherItemsDropped,
+                        onOtherItemsHover: onOtherItemsHover
+                    )
+                )
             }
         }
     }
