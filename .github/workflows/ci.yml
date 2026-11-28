@@ -43,7 +43,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust/tio-bridge
+          workspaces: rust
       - name: Build
         run: cargo build --manifest-path rust/tio-bridge/Cargo.toml --features hdf5
       - name: Test
@@ -59,7 +59,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust/tio-bridge
+          workspaces: rust
       - name: Build macOS app
         run: |
           xcodebuild \
@@ -83,7 +83,7 @@ jobs:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust/tio-bridge
+          workspaces: rust
       - name: Build for iPad Simulator
         run: |
           xcodebuild \
